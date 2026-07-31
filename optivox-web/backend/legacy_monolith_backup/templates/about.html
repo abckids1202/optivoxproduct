@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}OptiVox — About{% endblock %}
+
+{% block content %}
+<section style="padding-top:5rem;">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="kicker">Why OptiVox Exists</span>
+      <h2 class="chrome">Surveillance should understand, not just record.</h2>
+      <p>Most camera systems are passive — they capture footage nobody watches until after
+        something has already gone wrong. OptiVox was built to close that gap.</p>
+    </div>
+
+    <div class="cards" style="grid-template-columns:1fr 1fr;">
+      <div class="card reveal">
+        <span class="tag">MISSION</span>
+        <h3>Make every camera intelligent</h3>
+        <p>Turn ordinary cameras into a perceptive system that recognizes people, detects threats,
+          tracks attendance, and reasons about behavior — in real time, on the edge.</p>
+      </div>
+      <div class="card reveal">
+        <span class="tag">VISION</span>
+        <h3>Security that respects privacy</h3>
+        <p>Intelligence shouldn't require surrendering your data to the cloud. OptiVox runs locally
+          so faces, footage, and analytics stay inside your walls by default.</p>
+      </div>
+    </div>
+
+    <div style="margin-top:4rem;" class="reveal">
+      <span class="kicker">The Problem</span>
+      <h2 class="chrome" style="font-size:clamp(1.6rem,3.5vw,2.3rem); margin:.8rem 0 1.5rem;">Why traditional systems fall short</h2>
+      <div class="cards">
+        <div class="card"><h3>Reactive, not proactive</h3><p>Footage is reviewed after incidents. By then the moment to intervene has passed.</p></div>
+        <div class="card"><h3>Human-bandwidth limited</h3><p>No operator can meaningfully watch dozens of feeds for hours without missing events.</p></div>
+        <div class="card"><h3>Cloud dependency</h3><p>Many "smart" systems stream sensitive video off-site, raising cost, latency, and privacy risk.</p></div>
+      </div>
+    </div>
+
+    <div style="margin-top:4rem;" class="reveal">
+      <span class="kicker">Built On</span>
+      <h2 class="chrome" style="font-size:clamp(1.6rem,3.5vw,2.3rem); margin:.8rem 0 1.5rem;">A modern computer-vision stack</h2>
+      <div class="panel" style="padding:2rem;">
+        <div class="form-grid" style="gap:1.5rem;">
+          {% for t, d in [
+            ('YOLOv8','Object, weapon, and fire detection'),
+            ('InsightFace','512-d face embeddings & recognition'),
+            ('MediaPipe','Pose, hand, and gesture analysis'),
+            ('FAISS','High-speed embedding search'),
+            ('OpenCV','Frame capture & rendering'),
+            ('SQLite','Local event & attendance store')
+          ] %}
+          <div>
+            <div class="neon-text" style="font-family:var(--font-display); font-weight:600; font-size:1.1rem;">{{ t }}</div>
+            <div style="color:var(--text-dim); font-size:.88rem;">{{ d }}</div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:4rem;" class="reveal">
+      <span class="kicker">Roadmap</span>
+      <h2 class="chrome" style="font-size:clamp(1.6rem,3.5vw,2.3rem); margin:.8rem 0 1.5rem;">Where OptiVox is going</h2>
+      <div class="panel" style="padding:2rem;">
+        {% for phase, item in [
+          ('NOW','Local single-camera intelligence with full detection suite & attendance'),
+          ('NEXT','Remote dashboard streaming (MJPEG / WebRTC) and multi-camera orchestration'),
+          ('LATER','Multi-organization SaaS, cloud-GPU inference, and edge-device deployment'),
+          ('FUTURE','Mobile apps, PostgreSQL + Redis scaling, and dockerized microservices')
+        ] %}
+        <div style="display:flex; gap:1.5rem; padding:1rem 0; border-bottom:1px solid var(--line);">
+          <span style="font-family:var(--font-mono); color:var(--neon); min-width:64px; font-size:.8rem;">{{ phase }}</span>
+          <span style="color:var(--text-dim);">{{ item }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="panel bracket reveal" style="margin-top:4rem; padding:2rem; background:rgba(255,181,71,.05); border-color:rgba(255,181,71,.25);">
+      <span class="kicker" style="color:var(--warn);"><span style="--neon:var(--warn)"></span>Ethics & Responsible Use</span>
+      <h3 class="chrome" style="margin:.8rem 0;">Powerful tools demand clear boundaries</h3>
+      <p style="color:var(--text-dim);">
+        Facial recognition and behavioral analysis carry real privacy and civil-liberties
+        implications. OptiVox is intended for legitimate security and attendance use with proper
+        consent, signage, and compliance with local laws (such as GDPR or equivalent). Operators
+        are responsible for lawful, transparent, and proportionate deployment.
+      </p>
+    </div>
+  </div>
+</section>
+{% endblock %}

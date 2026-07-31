@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}OptiVox — FAQ{% endblock %}
+
+{% block content %}
+<section style="padding-top:5rem;">
+  <div class="wrap" style="max-width:860px;">
+    <div class="section-head reveal">
+      <span class="kicker">Frequently Asked</span>
+      <h2 class="chrome">Questions, answered.</h2>
+      <p>How OptiVox works, what it stores, and what it needs to run.</p>
+    </div>
+
+    {% set faqs = [
+      ('How does the AI actually work?','OptiVox runs a layered pipeline per frame: YOLOv8 detects objects and threats, InsightFace generates face embeddings matched via FAISS, MediaPipe analyzes pose and hands, and a behavior engine scores movement over time. Results are drawn onto the frame and logged to a local database.'),
+      ('Is my data stored in the cloud?','No. By default everything — face embeddings, event logs, attendance, and snapshots — is stored locally in SQLite and on-disk folders. Nothing leaves your machine unless you explicitly configure alert channels (email/Telegram/webhook) or remote streaming.'),
+      ('Do I need an internet connection?','Not for core detection. The vision pipeline runs fully offline. Internet is only needed for optional features: the LLM-powered AI assistant, outbound alerts, or remote dashboard access via the web layer.'),
+      ('Can it tell a real face from a photo or screen?','Yes. The anti-spoofing module checks for liveness using blink detection, head-pose movement, and depth consistency, classifying each face as REAL, UNCERTAIN, or SUSPECT before trusting a recognition or attendance event.'),
+      ('What hardware / GPU do I need?','OptiVox runs on CPU out of the box (InsightFace uses the CPU execution provider by default). For smooth real-time multi-model performance, an NVIDIA GPU with CUDA is strongly recommended, especially when running danger detection and pose analysis together.'),
+      ('How reliable is the attendance system?','A person must be confidently recognized across several consecutive frames within a time window before being locked in, which suppresses false clock-ins. Late minutes are calculated against a configurable work-start hour and grace period.'),
+      ('What cameras are compatible?','Anything OpenCV can open: built-in webcams, USB cameras, and IP cameras via RTSP URLs. The system supports a multi-camera configuration array, with one primary camera enabled by default.'),
+      ('What is the difference between local and web architecture?','The local system is the Python application that does all AI processing on your machine. The web layer (this platform) wraps that system to stream the annotated feed to a browser and expose dashboards and APIs — without duplicating the heavy inference per viewer.'),
+      ('How does licensing / organization access work?','The public site is open to everyone. The private dashboard is gated behind credentials issued per organization. Contact us through the request form to provision access and onboard your deployment.'),
+      ('Can it scale to many cameras or locations?','The current release targets local single-camera intelligence, with multi-camera and multi-organization SaaS on the roadmap (cloud-GPU inference, PostgreSQL, Redis, and dockerized microservices).')
+    ] %}
+
+    {% for q, a in faqs %}
+    <div class="faq-item reveal">
+      <button class="faq-q">{{ q }}<span class="pm">+</span></button>
+      <div class="faq-a"><div class="faq-a-inner">{{ a }}</div></div>
+    </div>
+    {% endfor %}
+
+    <div class="panel bracket reveal" style="margin-top:2.5rem; padding:2rem; text-align:center;">
+      <h3 class="chrome" style="margin-bottom:.6rem;">Still have questions?</h3>
+      <p style="color:var(--text-dim); margin-bottom:1.4rem;">Reach the team for technical details, demos, or deployment guidance.</p>
+      <a href="{{ url_for('public.contact') }}" class="btn btn-primary">Contact Us</a>
+    </div>
+  </div>
+</section>
+{% endblock %}

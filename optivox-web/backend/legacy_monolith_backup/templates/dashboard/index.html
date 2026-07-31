@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OptiVox - Command Center</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/optivox.css') }}">
+</head>
+<body class="dash-body">
+  <div class="grid-fx"></div>
+  <div class="dash">
+    <aside class="dash-side">
+      <a href="{{ url_for('public.index') }}" class="brand"><span class="mark"></span><b>OPTI</b><span>VOX</span></a>
+      <nav class="dash-nav">
+        <a href="#live" class="active">Live Feed</a>
+        <a href="#detections">Detections</a>
+        <a href="#controls">Controls</a>
+        <a href="#attendance">Attendance</a>
+        <a href="#assistant">Assistant</a>
+        <a href="{{ url_for('auth.logout') }}">Sign out</a>
+      </nav>
+    </aside>
+    <main class="dash-main">
+      <div class="dash-topbar">
+        <div><span class="kicker">Command Center</span><h2 class="chrome">Live Monitoring</h2></div>
+        <span class="live-badge"><span class="dot"></span> <span id="bridgeMode">CONNECTING</span></span>
+      </div>
+
+      <div class="kpi-row">
+        <div class="kpi panel bracket"><div class="v" id="kFaces">-</div><div class="l">Enrolled Faces</div></div>
+        <div class="kpi panel bracket"><div class="v" id="kEvents">-</div><div class="l">Events Today</div></div>
+        <div class="kpi panel bracket"><div class="v" id="kAttend">-</div><div class="l">Clocked In</div></div>
+        <div class="kpi panel bracket"><div class="v" id="kStrangers">-</div><div class="l">Active Strangers</div></div>
+        <div class="kpi panel bracket"><div class="v" id="kProcess">-</div><div class="l">Process ms</div></div>
+      </div>
+
+      <section id="live" class="dash-grid">
+        <div class="stream-shell">
+          <img id="liveStream" src="{{ url_for('api.video_feed') }}" alt="Live OptiVox feed">
+          <div class="video-overlay"><div class="hud-corner tl"></div><div class="hud-corner tr"></div><div class="hud-corner bl"></div><div class="hud-corner br"></div></div>
+        </div>
+        <div id="detections" class="panel dash-panel">
+          <h4>Live Detections</h4>
+          <div class="split-lists">
+            <div><h5>Faces</h5><div id="faceFeed" class="det-feed"><div class="line">loading...</div></div></div>
+            <div><h5>Objects</h5><div id="objectFeed" class="det-feed"><div class="line">loading...</div></div></div>
+          </div>
+          <h5>Held Objects</h5><div id="heldFeed" class="det-feed short"><div class="line">none</div></div>
+        </div>
+      </section>
+
+      <section class="dash-grid lower">
+        <div id="controls" class="panel dash-panel">
+          <h4>Operator Controls</h4>
+          <div class="toggle-grid" id="toggleGrid"></div>
+          <div class="action-row">
+            <input id="enrollName" placeholder="Name visible unknown">
+            <button class="btn btn-primary compact" id="enrollBtn">Enroll Visible Face</button>
+          </div>
+          <p id="actionMsg" class="action-msg"></p>
+        </div>
+        <div class="panel dash-panel">
+          <h4>Event Timeline</h4>
+          <div id="eventFeed" class="det-feed tall"><div class="line">loading events...</div></div>
+        </div>
+      </section>
+
+      <section id="attendance" class="dash-grid lower">
+        <div class="panel dash-panel">
+          <h4>Today's Attendance</h4>
+          <div id="attendFeed" class="det-feed tall"><div class="line">loading...</div></div>
+        </div>
+        <div class="panel dash-panel">
+          <h4>People & Manual Attendance</h4>
+          <div class="action-row"><select id="peopleSelect"></select><button class="btn btn-ghost compact" id="clockInBtn">Clock In</button><button class="btn btn-ghost compact" id="clockOutBtn">Clock Out</button></div>
+          <div id="peopleFeed" class="det-feed tall"><div class="line">loading people...</div></div>
+        </div>
+      </section>
+
+      <section id="assistant" class="panel dash-panel assistant-panel">
+        <h4>AI Assistant</h4>
+        <div class="assistant-row"><input id="assistantQuestion" placeholder="Ask: who is visible, what objects do you see, who is clocked in?"><button class="btn btn-primary compact" id="askBtn">Ask</button></div>
+        <div id="assistantAnswer" class="assistant-answer">Assistant answers appear here when your vision module is configured.</div>
+      </section>
+    </main>
+  </div>
+  <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>

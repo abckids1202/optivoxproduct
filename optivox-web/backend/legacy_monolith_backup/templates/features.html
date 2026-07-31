@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}OptiVox — Features{% endblock %}
+
+{% block content %}
+<section style="padding-top:5rem;">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="kicker">Capability Breakdown</span>
+      <h2 class="chrome">Every module, explained.</h2>
+      <p>Each capability below maps to a real component in the OptiVox vision pipeline — the same
+        code that runs on your local machine.</p>
+    </div>
+
+    {% set features = [
+      {
+        'name':'Face Recognition & Enrollment',
+        'desc':'Faces are encoded into 512-dimensional embeddings by InsightFace (buffalo_l) and matched with FAISS for sub-millisecond lookups. Thresholds auto-calibrate per person from enrollment variance.',
+        'points':['Multi-angle passive enrollment wizard','Per-identity auto-threshold tuning','Majority-vote smoothing across frames','Image-quality gating before enrollment'],
+        'label':'FACE_ANALYZER · FAISSIndexer',
+        'boxes':[('Known · 0.94','28%','24%','24%','44%','var(--ok)')]
+      },
+      {
+        'name':'Anti-Spoofing & Liveness',
+        'desc':'Before a face is trusted, OptiVox confirms it is a living person — not a photo, video, or mask — using blink detection, head-pose variance, and monocular depth consistency.',
+        'points':['EAR-based blink detection','Head-pose movement variance','Depth-consistency estimation','REAL / UNCERTAIN / SUSPECT states'],
+        'label':'AntiSpoofDetector',
+        'boxes':[('LIVE · REAL','30%','30%','30%','42%','var(--ok)')]
+      },
+      {
+        'name':'Weapon, Fire & Smoke Detection',
+        'desc':'Dedicated danger models scan for guns, knives, fire, and smoke. Detections require multi-frame confirmation and per-class confidence floors to suppress false alarms.',
+        'points':['Custom YOLO danger models','Per-class confidence thresholds','Multi-frame confirmation logic','Instant voice + multi-channel alert'],
+        'label':'DangerDetector · CRITICAL',
+        'boxes':[('WEAPON · 0.71','40%','45%','28%','30%','var(--danger)')]
+      },
+      {
+        'name':'Behavior & Suspicion Analysis',
+        'desc':'A centroid tracker follows every person and scores behaviors over time — loitering, pacing, hesitation, scanning, and spatial anomalies — into a decaying suspicion level.',
+        'points':['Per-track suspicion scoring','Loitering & pacing detection','Spatial-anomaly heatmaps','Stress-level classification'],
+        'label':'BehaviorAnalyzer · SuspicionScorer',
+        'boxes':[('ID_4 · STRESS:HIGH','35%','35%','24%','46%','var(--warn)')]
+      },
+      {
+        'name':'Crowd Intelligence',
+        'desc':'Density heatmaps and congestion grids reveal how people move through a space, flag crowd formation, and surface evacuation-speed anomalies.',
+        'points':['Gaussian density heatmaps','Congestion-zone alerts','Crowd-formation detection','Configurable grid resolution'],
+        'label':'CrowdIntelligence',
+        'boxes':[('CROWD · 6 PEOPLE','20%','20%','60%','60%','var(--warn)')]
+      },
+      {
+        'name':'Pose & Fall Detection',
+        'desc':'MediaPipe Pose analyzes body geometry to detect falls (horizontal torso) and raised-hands / surrender postures — critical for safety and duress signalling.',
+        'points':['Fall detection via torso vector','Hands-raised / surrender detection','Per-frame skeletal analysis','Feeds the alert + voice pipeline'],
+        'label':'PoseDetector',
+        'boxes':[('FALL DETECTED','30%','25%','50%','24%','var(--danger)')]
+      },
+      {
+        'name':'Attendance Automation',
+        'desc':'Recognized faces are converted into attendance records. A person must be confidently recognized across several frames before being locked in, with automatic late calculation.',
+        'points':['Hands-free clock-in / out','Late-arrival grace windows','12-hour auto clock-out','CSV / report export'],
+        'label':'AttendanceManager',
+        'boxes':[('CLOCK-IN · Mikha','30%','28%','26%','44%','var(--ok)')]
+      },
+      {
+        'name':'AI Assistant & Alerts',
+        'desc':'An LLM-backed assistant answers natural-language questions over the live state and event history, while a multi-channel notifier dispatches rate-limited alerts with snapshots.',
+        'points':['13 database query tools','Live camera context injection','Email / Telegram / Webhook alerts','Priority voice announcements'],
+        'label':'AIAssistant · AlertManager',
+        'boxes':[('ASSISTANT · ONLINE','25%','25%','50%','30%','var(--neon)')]
+      }
+    ] %}
+
+    {% for f in features %}
+    <div class="frow reveal">
+      <div class="fvis">
+        <span class="hud-label">◉ {{ f.label }}</span>
+        {% for l, t, lft, w, h, c in f.boxes %}
+        <div class="detbox" data-l="{{ l }}" style="top:{{t}}; left:{{lft}}; width:{{w}}; height:{{h}}; border-color:{{c}};"></div>
+        {% endfor %}
+        <div class="scanline" style="position:absolute;"></div>
+      </div>
+      <div class="ftxt">
+        <h3>{{ f.name }}</h3>
+        <p>{{ f.desc }}</p>
+        <ul>{% for p in f.points %}<li>{{ p }}</li>{% endfor %}</ul>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

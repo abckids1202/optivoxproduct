@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}OptiVox — Request Access{% endblock %}
+
+{% block content %}
+<section style="padding-top:5rem;">
+  <div class="wrap" style="max-width:920px;">
+    <div class="section-head reveal">
+      <span class="kicker">Get Started</span>
+      <h2 class="chrome">Request access or a demo.</h2>
+      <p>Tell us about your deployment. We'll follow up with enterprise access, installation help,
+        or API onboarding for your organization.</p>
+    </div>
+
+    <div class="panel reveal" style="padding:2.2rem;">
+      <form id="contactForm">
+        <div class="form-grid">
+          <div class="field"><label>Full name</label><input type="text" name="name" required placeholder="Jane Operator"></div>
+          <div class="field"><label>Work email</label><input type="email" name="email" required placeholder="jane@org.com"></div>
+          <div class="field"><label>Organization</label><input type="text" name="org" placeholder="Acme Security Co."></div>
+          <div class="field">
+            <label>Request type</label>
+            <select name="type">
+              <option>Enterprise access</option>
+              <option>Live demo</option>
+              <option>Installation support</option>
+              <option>API access</option>
+            </select>
+          </div>
+          <div class="field full">
+            <label>Deployment details</label>
+            <textarea name="message" placeholder="How many cameras? What environment (office, retail, factory)? Any GPU available?"></textarea>
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:.5rem;">Submit Request</button>
+        <p id="formMsg" style="margin-top:1rem; font-family:var(--font-mono); font-size:.85rem;"></p>
+      </form>
+    </div>
+
+    <div class="cards" style="grid-template-columns:repeat(3,1fr); margin-top:2rem;">
+      <div class="card reveal"><span class="tag">DEMO</span><h3>See it live</h3><p>Walk through the full detection suite on real footage with our team.</p></div>
+      <div class="card reveal"><span class="tag">INSTALL</span><h3>On-site setup</h3><p>Guidance on cameras, GPU, models, and tuning for your space.</p></div>
+      <div class="card reveal"><span class="tag">API</span><h3>Integrate</h3><p>Connect OptiVox events and attendance into your own systems.</p></div>
+    </div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('contactForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('formMsg');
+  const data = Object.fromEntries(new FormData(e.target));
+  msg.style.color = 'var(--text-dim)';
+  msg.textContent = '› transmitting request...';
+  try {
+    const res = await fetch('{{ url_for("api.contact") }}', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)
+    });
+    const out = await res.json();
+    msg.style.color = 'var(--ok)';
+    msg.textContent = '✓ ' + (out.message || 'Request received. We will be in touch.');
+    e.target.reset();
+  } catch (err) {
+    msg.style.color = 'var(--danger)';
+    msg.textContent = '✕ Could not submit. Please email us directly.';
+  }
+});
+</script>
+{% endblock %}

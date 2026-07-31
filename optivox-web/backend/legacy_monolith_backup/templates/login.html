@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}OptiVox — Organization Login{% endblock %}
+
+{% block content %}
+<section style="padding-top:6rem; min-height:70vh; display:grid; place-items:center;">
+  <div class="wrap" style="max-width:420px;">
+    <div class="panel bracket reveal" style="padding:2.5rem;">
+      <div style="text-align:center; margin-bottom:1.8rem;">
+        <span class="kicker" style="justify-content:center;">Restricted</span>
+        <h2 class="chrome" style="font-size:1.6rem; margin-top:.6rem;">Command Center Access</h2>
+        <p style="color:var(--text-dim); font-size:.9rem; margin-top:.5rem;">Authorized organizations only.</p>
+      </div>
+      <form method="POST" action="{{ url_for('auth.login') }}">
+        <div class="field"><label>Username</label><input type="text" name="username" required autofocus></div>
+        <div class="field"><label>Password</label><input type="password" name="password" required></div>
+        {% if error %}<p style="color:var(--danger); font-family:var(--font-mono); font-size:.82rem; margin-bottom:1rem;">✕ {{ error }}</p>{% endif %}
+        <button type="submit" class="btn btn-primary" style="width:100%; justify-content:center;">Authenticate →</button>
+      </form>
+      <p style="color:var(--text-faint); font-size:.78rem; margin-top:1.4rem; text-align:center; font-family:var(--font-mono);">
+        Demo credentials: <span class="neon-text">admin / optivox</span>
+      </p>
+    </div>
+  </div>
+</section>
+{% endblock %}

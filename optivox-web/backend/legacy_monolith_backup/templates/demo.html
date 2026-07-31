@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}OptiVox — Live Demo{% endblock %}
+
+{% block content %}
+<section style="padding-top:4rem;">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="kicker">Sandbox Environment</span>
+      <h2 class="chrome">See the HUD in action.</h2>
+      <p>This is a browser-side marketing sandbox. It uses <strong>your webcam locally</strong> to
+        render the OptiVox detection overlay — nothing is uploaded, stored, or sent to any server.
+        The real product runs this pipeline with live AI models on your hardware.</p>
+    </div>
+
+    <div class="demo-stage">
+      <div class="video-shell" id="videoShell">
+        <video id="demoVideo" autoplay muted playsinline></video>
+        <canvas id="demoCanvas"></canvas>
+        <div class="video-overlay">
+          <div class="hud-corner tl"></div><div class="hud-corner tr"></div>
+          <div class="hud-corner bl"></div><div class="hud-corner br"></div>
+          <div class="hud-top">
+            <span id="hudClock">--:--:--</span>
+            <span class="rec"><span class="dot"></span> SANDBOX</span>
+          </div>
+        </div>
+        <div class="demo-prompt" id="demoPrompt">
+          <div>
+            <h3 class="chrome" style="font-size:1.4rem; margin-bottom:.8rem;">Camera Access Required</h3>
+            <p style="color:var(--text-dim); margin-bottom:1.4rem; max-width:320px;">
+              Grant camera permission to preview the OptiVox detection overlay on your own feed.
+            </p>
+            <button class="btn btn-primary" id="startBtn">▶ Start Sandbox</button>
+            <p id="camError" style="color:var(--danger); font-size:.82rem; margin-top:1rem;"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="demo-side">
+        <div class="panel">
+          <h4 style="font-family:var(--font-mono); font-size:.72rem; letter-spacing:.16em; color:var(--text-faint); text-transform:uppercase; margin-bottom:.8rem;">System Telemetry</h4>
+          <div class="metric-row"><span>Pipeline FPS</span><span class="v" id="mFps">0.0</span></div>
+          <div class="metric-row"><span>Faces in frame</span><span class="v" id="mFaces">0</span></div>
+          <div class="metric-row"><span>Objects tracked</span><span class="v" id="mObjects">0</span></div>
+          <div class="metric-row"><span>Liveness</span><span class="v" id="mLive">—</span></div>
+          <div class="metric-row"><span>Threat level</span><span class="v" id="mThreat" style="color:var(--ok)">NOMINAL</span></div>
+        </div>
+        <div class="panel">
+          <h4 style="font-family:var(--font-mono); font-size:.72rem; letter-spacing:.16em; color:var(--text-faint); text-transform:uppercase; margin-bottom:.8rem;">Detection Feed</h4>
+          <div class="det-feed" id="detFeed">
+            <div class="line"><span class="t">--:--:--</span> · awaiting sandbox start</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p style="color:var(--text-faint); font-size:.82rem; margin-top:1.5rem; font-family:var(--font-mono);">
+      ⓘ The overlay here is a simulated visualization for demonstration. Production OptiVox uses
+      YOLOv8, InsightFace, and MediaPipe for true detection — see the
+      <a href="{{ url_for('public.features') }}" class="neon-text">Features</a> page.
+    </p>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/demo.js') }}"></script>
+{% endblock %}
