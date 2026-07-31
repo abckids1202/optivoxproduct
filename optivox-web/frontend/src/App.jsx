@@ -4,6 +4,7 @@ import { apiRequest, apiUrl } from "./services/api";
 import IntelligenceMap from "./components/IntelligenceMap";
 import FeatureNavigator from "./components/FeatureNavigator";
 import BrowserFaceDemo from "./components/BrowserFaceDemo";
+import CinematicHero from "./components/CinematicHero";
 import { featureContent } from "./content/features";
 
 const year = new Date().getFullYear();
@@ -175,7 +176,8 @@ function DetectionVisual({ label, boxes }) {
 function HomePage() {
   return (
     <Layout>
-      <section className="hero">
+      <CinematicHero />
+      <section className="hero legacy-home-hero">
         <div className="wrap">
           <div className="hero-grid">
             <div className="hero-copy">
