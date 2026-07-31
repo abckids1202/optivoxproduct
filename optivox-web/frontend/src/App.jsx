@@ -2,19 +2,21 @@ import { useEffect, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { apiRequest, apiUrl } from "./services/api";
 import IntelligenceMap from "./components/IntelligenceMap";
+import FeatureNavigator from "./components/FeatureNavigator";
+import BrowserFaceDemo from "./components/BrowserFaceDemo";
+import { featureContent } from "./content/features";
 
 const year = new Date().getFullYear();
 
 const capabilities = [
-  ["Face Recognition", "InsightFace embeddings with FAISS search, auto-tuned thresholds, and multi-angle enrollment.", "RECOGNITION"],
-  ["Attendance", "Hands-free clock-in / clock-out from a glance, with late detection and exportable logs.", "TIME-TRACKING"],
-  ["Anti-Spoofing", "Blink, head-pose, and depth liveness checks reject photos, screens, and masks.", "LIVENESS"],
-  ["Weapon & Fire", "Dedicated YOLO models flag guns, knives, fire and smoke with multi-frame confirmation.", "THREAT"],
-  ["Crowd Intelligence", "Density heatmaps, congestion zones, and crowd-formation alerts.", "ANALYTICS"],
-  ["Behavior Analysis", "Suspicion scoring from loitering, pacing, hesitation, and spatial anomalies.", "BEHAVIOR"],
-  ["Pose Detection", "MediaPipe pose spots falls and raised-hands / surrender postures.", "POSE"],
-  ["AI Assistant", "Ask the system anything. It queries events, attendance, and live state for you.", "ASSISTANT"],
-  ["Multi-Channel Alerts", "Email, Telegram, and webhook notifications with snapshots and rate limiting.", "ALERTS"],
+  ["Face Recognition", "Locally compares enrolled identity profiles after repeated confirmation across frames.", "IDENTITY"],
+  ["Automated Attendance", "Records attendance after a confirmed enrolled identity and helps prevent duplicate entries.", "RECORDS"],
+  ["Unknown-Person Monitoring", "Tracks unresolved presence as context without treating unknown as dangerous.", "CONTEXT"],
+  ["Anti-Spoofing", "Experimental liveness checks look for observable facial movement before trusting a match.", "EXPERIMENTAL"],
+  ["Object and Safety Events", "Selected objects, pose signals, and congestion rules can become reviewable events.", "OBSERVATION"],
+  ["Local Data and Reports", "Attendance, events, profiles, alerts, and snapshots stay organised in local storage.", "MEMORY"],
+  ["Dashboard and Assistant", "A web interface turns structured runtime data into operational context.", "INTERFACE"],
+  ["Alerts and Evidence", "Configured channels can receive event notifications with relevant snapshots.", "RESPONSE"],
 ];
 
 const featureRows = [
@@ -123,7 +125,7 @@ function Layout({ children }) {
           <Brand />
           <nav className={`nav-links ${open ? "open" : ""}`} id="navLinks">
             {links.map(([to, label]) => <NavLink key={to} to={to} onClick={() => setOpen(false)}>{label}</NavLink>)}
-            <Link to="/login" className="btn btn-ghost" style={{ padding: ".5rem 1rem" }}>Org Login</Link>
+            <Link to="/login" className="btn btn-ghost" style={{ padding: ".5rem 1rem" }}>Open Dashboard</Link>
           </nav>
           <button className="nav-toggle" aria-label="Menu" onClick={() => setOpen((value) => !value)}>Menu</button>
         </div>
@@ -146,7 +148,7 @@ function Footer() {
             </p>
           </div>
           <div><h4>Product</h4><Link to="/features">Features</Link><Link to="/demo">Live Demo</Link><Link to="/contact">Request Access</Link></div>
-          <div><h4>Company</h4><Link to="/about">About</Link><Link to="/faq">FAQ</Link><Link to="/login">Dashboard</Link></div>
+          <div><h4>Company</h4><Link to="/about">About</Link><Link to="/faq">FAQ</Link><Link to="/login">Open Dashboard</Link></div>
           <div><h4>System</h4><span>YOLOv8</span><span>InsightFace</span><span>Edge / On-Premise</span></div>
         </div>
         <div className="footer-bottom">
@@ -184,7 +186,7 @@ function HomePage() {
               <div className="hero-proof reveal"><span><i></i> Core processing can run locally</span><span><i></i> Built for human review</span></div>
             </div>
             <div className="hero-visual reveal">
-              <div className="hero-network"><span className="hero-network-core">OPTIVOX<br /><b>CORE</b></span><span className="hero-network-node node-a">PERCEPTION</span><span className="hero-network-node node-b">IDENTITY</span><span className="hero-network-node node-c">ATTENDANCE</span><span className="hero-network-node node-d">RESPONSE</span><span className="hero-network-line line-a"></span><span className="hero-network-line line-b"></span><span className="hero-network-line line-c"></span><span className="hero-network-line line-d"></span></div>
+              <div className="hero-network"><span className="hero-network-core">OPTIVOX<br /><b>CORE</b></span>{featureContent.map((feature, index) => <Link key={feature.id} to={`/features#${feature.id}`} className={`hero-feature-node hero-feature-node-${index + 1}`} style={{ "--feature-color": feature.color }}><i></i><span>{feature.title}</span></Link>)}{featureContent.map((feature, index) => <span key={`${feature.id}-line`} className={`hero-network-line feature-line-${index + 1}`} style={{ "--feature-color": feature.color }}></span>)}</div>
             </div>
           </div>
           <Stats />
@@ -235,16 +237,7 @@ function Capabilities() {
 }
 
 function FeaturesPage() {
-  return (
-    <Layout>
-      <section style={{ paddingTop: "5rem" }}>
-        <div className="wrap">
-          <div className="section-head reveal"><span className="kicker">Capability Breakdown</span><h2 className="chrome">Every module, explained.</h2><p>Each capability maps to a component in the OptiVox vision pipeline.</p></div>
-          {featureRows.map((feature) => <div className="frow reveal" key={feature.name}><DetectionVisual label={feature.label} boxes={feature.boxes} /><div className="ftxt"><h3>{feature.name}</h3><p>{feature.desc}</p><ul>{feature.points.map((point) => <li key={point}>{point}</li>)}</ul></div></div>)}
-        </div>
-      </section>
-    </Layout>
-  );
+  return <Layout><section className="page-intro features-intro"><div className="wrap"><span className="kicker reveal">Capability guide</span><h1 className="chrome reveal">Eight ways OptiVox turns vision into useful context.</h1><p className="intro-lead reveal">Start with the human explanation, then open the mechanism, status, and limitation behind each capability.</p></div></section><section className="features-navigator-section"><div className="wrap"><FeatureNavigator /></div></section><section className="feature-details"><div className="wrap">{featureContent.map((feature, index) => <article className="feature-detail reveal" id={feature.id} key={feature.id}><div className="feature-detail-number" style={{ color: feature.color }}>0{index + 1}</div><div className="feature-detail-copy"><span className="tag" style={{ color: feature.color, borderColor: `${feature.color}55` }}>{feature.tag}</span><h2 className="chrome">{feature.title}</h2><p className="feature-plain">{feature.plain}</p><div className="feature-detail-grid"><div><h4>Why it matters</h4><p>{feature.why}</p></div><div><h4>How it works</h4><p>{feature.how}</p></div><div><h4>Input <span>→</span> Process <span>→</span> Output</h4><p className="feature-mono">{feature.input}<br />{feature.process}<br />{feature.output}</p></div><div><h4>Technology and status</h4><p className="feature-mono">{feature.tech}<br /><span style={{ color: feature.color }}>{feature.status}</span></p></div></div><div className="feature-limitation"><strong>Limitation</strong><span>{feature.limitation}</span></div><p className="feature-related">Related capability: <a href={`#${featureContent.find((item) => item.title === feature.related)?.id || feature.id}`}>{feature.related}</a></p></div><div className="feature-evidence"><DetectionVisual label={feature.tag} boxes={[[feature.status.toUpperCase(), "30%", "24%", "48%", "38%", feature.color]]} /><span>{feature.status}</span></div></article>)}</div></section><section className="feature-final"><div className="wrap"><span className="kicker">See the system in motion</span><h2 className="chrome">A capability is only useful when you can follow its path.</h2><Link to="/how-it-works" className="btn btn-primary">Open the Intelligence Map <span>→</span></Link></div></section></Layout>;
 }
 
 function DemoPage() {
@@ -319,7 +312,7 @@ function DemoPage() {
       if (frameN % 4 === 0) boxes = detectMotion();
       boxes.forEach((box, index) => drawBox(box, `TRACK_${index + 1} ${box.conf.toFixed(2)}`));
       setMetrics({ fps: fps.toFixed(1), faces: boxes.length ? 1 : 0, objects: boxes.length, live: boxes.length ? "CHECKING" : "-", threat: "NOMINAL" });
-      if (frameN % 100 === 0 && boxes.length) setFeed((items) => [`${new Date().toLocaleTimeString("en-GB")} - MOTION TRACKING`, ...items].slice(0, 12));
+      if (frameN % 100 === 0 && boxes.length) setFeed((items) => [`${new Date().toLocaleTimeString("en-GB")} - LEGACY FALLBACK`, ...items].slice(0, 12));
       requestAnimationFrame(loop);
     }
 
@@ -545,6 +538,36 @@ function AssistantAsk({ onAsk }) {
   return <div className="assistant-row"><input value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && question.trim()) onAsk(question.trim()); }} placeholder="Ask: who is visible, what objects do you see, who is clocked in?" /><button className="btn btn-primary compact" onClick={() => question.trim() && onAsk(question.trim())}>Ask</button></div>;
 }
 
+function PublicDemoPage() {
+  return <Layout><section className="page-intro demo-intro"><div className="wrap"><span className="kicker reveal">Public browser demonstration</span><h1 className="chrome reveal">See the visual input layer.</h1><p className="intro-lead reveal">This lightweight browser demo detects visible faces locally. It is intentionally separate from the complete local OptiVox application, which includes enrollment, recognition, attendance, event storage, and alerts.</p><div className="intro-meta reveal"><span>Browser local</span><span>Nothing uploaded</span><span>Temporary tracks only</span></div></div></section><section className="demo-section"><div className="wrap"><BrowserFaceDemo /><div className="demo-explanation"><div><span className="kicker">What this proves</span><h2 className="chrome">A browser can show perception. The full system adds memory and action.</h2></div><div className="demo-explanation-grid"><div><strong>Public demo</strong><p>Web-compatible face detection, temporary labels, camera telemetry, and a privacy-first session.</p></div><div><strong>Local OptiVox application</strong><p>InsightFace recognition, enrollment, attendance, events, snapshots, alerts, and the operational dashboard.</p></div><div><strong>Important limitation</strong><p>Face detection is not identity recognition. This page does not enroll you or create an official attendance record.</p></div></div></div></div></section></Layout>;
+}
+
+function ExpandedAboutPage() {
+  const stack = [["InsightFace", "Face detection, landmarks, and recognition embeddings"], ["FAISS", "Fast similarity search across enrolled identities"], ["YOLO", "Selected object and safety-event detection"], ["MediaPipe", "Pose and hand landmark analysis"], ["OpenCV", "Camera capture, frame processing, and overlays"], ["SQLite", "Local people, attendance, events, and alerts"], ["Flask API", "Structured bridge between the local engine and web interface"], ["React", "Dashboard and public explanation layer"]];
+  const milestones = ["Problem discovery", "Research and architecture", "Database foundation", "Face recognition", "Attendance automation", "Security modules", "Web dashboard", "Exhibition integration"];
+  return <Layout><section className="page-intro about-intro"><div className="wrap"><span className="kicker reveal">Project story</span><h1 className="chrome reveal">Surveillance should understand, not just record.</h1><p className="intro-lead reveal">OptiVox explores how an ordinary camera can become a local operational system that recognises enrolled people, automates attendance, and surfaces observable events for human review.</p></div></section><section className="about-story"><div className="wrap"><div className="about-lead reveal"><span className="kicker">Why OptiVox exists</span><h2 className="chrome">Observation is incomplete when it produces only footage.</h2><p>Attendance and security systems are often separated, even though both begin with the same question: who is present, what is happening, and what response is required? OptiVox was developed around the idea that perception becomes useful when it can be interpreted, remembered, and transformed into responsible action.</p></div><div className="about-principles"><div className="about-principle reveal"><span>01</span><h3>Local first</h3><p>Core processing and records can stay inside the environment that produces them.</p></div><div className="about-principle reveal"><span>02</span><h3>Human review</h3><p>Observable signals support people; they do not decide intent or danger.</p></div><div className="about-principle reveal"><span>03</span><h3>Transparent limits</h3><p>Core, prototype, experimental, and planned features are labelled honestly.</p></div></div></div></section><section className="about-architecture"><div className="wrap"><div className="section-head reveal"><span className="kicker">System architecture</span><h2 className="chrome">One flow, from camera to response.</h2></div><div className="architecture-flow reveal">{[["01", "Camera", "Live scene"], ["02", "Vision engine", "Detection and embeddings"], ["03", "Decision logic", "Thresholds and event rules"], ["04", "Local memory", "SQLite records"], ["05", "Web interface", "Dashboard and reports"]].map(([number, title, description]) => <div className="architecture-stage" key={title}><span>{number}</span><strong>{title}</strong><small>{description}</small></div>)}</div></div></section><section className="about-development"><div className="wrap"><div className="section-head reveal"><span className="kicker">Development journey</span><h2 className="chrome">Built in layers, tested through constraints.</h2></div><div className="milestone-grid">{milestones.map((milestone, index) => <div className="milestone reveal" key={milestone}><span>0{index + 1}</span><strong>{milestone}</strong></div>)}</div></div></section><section className="about-stack"><div className="wrap"><div className="section-head reveal"><span className="kicker">Technology choices</span><h2 className="chrome">Open tools, connected carefully.</h2></div><div className="stack-grid">{stack.map(([name, description]) => <div className="stack-item reveal" key={name}><strong>{name}</strong><p>{description}</p></div>)}</div></div></section><section className="about-impact"><div className="wrap"><div className="about-impact-copy reveal"><span className="kicker">SDG 9 / Industry, innovation, and infrastructure</span><h2 className="chrome">Intelligent infrastructure should be more accessible.</h2><p>OptiVox aligns with SDG 9 by demonstrating that useful AI infrastructure can be assembled from open-source software, a standard webcam, and a personal computer. Its value is not only automation, but making experimentation with intelligent infrastructure possible in environments that cannot depend on expensive proprietary systems.</p></div><div className="about-impact-facts reveal"><span>Open-source building blocks</span><span>Standard camera input</span><span>Local processing option</span><span>Designed for learning</span></div></div></section><section className="about-privacy" id="privacy"><div className="wrap"><div className="section-head reveal"><span className="kicker">Privacy and limitations</span><h2 className="chrome">Useful systems need boundaries.</h2></div><div className="limitation-grid"><div className="limitation-item reveal"><strong>Consent and access</strong><p>Enrollment should be consent-based, and biometric representations need access control and retention rules.</p></div><div className="limitation-item reveal"><strong>Recognition conditions</strong><p>Lighting, angle, occlusion, camera placement, and enrollment quality affect performance.</p></div><div className="limitation-item reveal"><strong>Experimental signals</strong><p>Liveness and pose-based events can produce false positives and remain subject to human review.</p></div><div className="limitation-item reveal"><strong>Evaluation scope</strong><p>The current project is a small-scale prototype that needs broader testing before unrestricted deployment.</p></div></div></div></section><section className="about-roadmap"><div className="wrap"><span className="kicker">Future direction</span><h2 className="chrome">The next questions are practical.</h2><div className="roadmap-list"><span>Stronger liveness safeguards</span><span>Multi-camera operation</span><span>Role-based access</span><span>Larger-scale evaluation</span><span>Formal privacy policies</span><span>Better report generation</span></div></div></section></Layout>;
+}
+
+const publicFaqs = [
+  ["Product", "What does OptiVox do?", "OptiVox connects local computer vision with attendance records, observable event handling, snapshots, alerts, and a web dashboard."],
+  ["Product", "Is it an attendance system or a security system?", "Both workflows begin with the same camera input. Enrolled identities can become attendance, while unresolved identities and selected observable events can become reviewable security context."],
+  ["Product", "What happens when someone is unknown?", "They receive a temporary tracking identity rather than being counted as attendance. Unknown does not mean dangerous."],
+  ["Technology", "Does it require internet?", "Core local detection and storage can run without internet. Optional alerts, remote access, and assistant integrations may need connectivity."],
+  ["Technology", "What hardware is required?", "The prototype can run with a standard webcam and computer. A stronger CPU or compatible GPU can improve real-time performance."],
+  ["Technology", "Why does recognition require several frames?", "One frame can be blurred, obstructed, or misaligned. Repeated confirmation makes the decision less dependent on a single moment."],
+  ["Privacy", "Where is biometric data stored?", "The local prototype stores identity profiles and embeddings in its local data layer. Each deployment still needs its own consent, access, retention, and backup policy."],
+  ["Privacy", "Is camera footage uploaded?", "The public browser demo processes frames in the browser session. The local application can keep core processing and records on the local machine unless remote channels are configured."],
+  ["Reliability", "Can a photograph fool the system?", "The prototype includes experimental liveness safeguards, but they are not definitive protection and should not be presented as infallible."],
+  ["Reliability", "Is it ready for full school deployment?", "It is a working project prototype. Broader evaluation, formal privacy policies, access controls, and operational testing are still required."],
+  ["Demonstration", "Is the website demo the complete OptiVox system?", "No. The website demo shows browser face detection. The complete local prototype adds enrollment, identity recognition, attendance, events, storage, alerts, and the dashboard."],
+  ["Demonstration", "Where can I see the operational dashboard?", "Use Open Dashboard in the navigation to access the configured demonstration application. It may use sample or live data depending on the deployment."],
+];
+
+function AccessibleFaqPage() {
+  const [open, setOpen] = useState(null); const [category, setCategory] = useState("All"); const categories = ["All", ...new Set(publicFaqs.map(([group]) => group))]; const filtered = publicFaqs.filter(([group]) => category === "All" || category === group);
+  return <Layout><section className="page-intro faq-intro"><div className="wrap"><span className="kicker reveal">Questions, answered</span><h1 className="chrome reveal">A clear answer is part of the product.</h1><p className="intro-lead reveal">Learn what OptiVox does, how the prototype works, where data stays, and what still needs further validation.</p></div></section><section className="faq-section"><div className="wrap"><div className="faq-categories" role="group" aria-label="FAQ categories">{categories.map((item) => <button type="button" className={category === item ? "active" : ""} key={item} onClick={() => { setCategory(item); setOpen(null); }}>{item}</button>)}</div><div className="faq-list">{filtered.map(([group, question, answer], index) => { const id = `${category}-${index}`; const expanded = open === id; return <div className={`faq-item faq-item-repaired ${expanded ? "open" : ""}`} key={question}><button type="button" className="faq-q" aria-expanded={expanded} aria-controls={`answer-${id}`} onClick={() => setOpen(expanded ? null : id)}><span><small>{group}</small>{question}</span><span className="pm" aria-hidden="true">{expanded ? "−" : "+"}</span></button><div className="faq-a" id={`answer-${id}`} role="region"><div className="faq-a-inner">{answer}</div></div></div>; })}</div><div className="faq-action"><h2 className="chrome">Still have a project question?</h2><Link to="/contact" className="btn btn-primary">Contact the OptiVox team</Link></div></div></section></Layout>;
+}
+
 function timeAgo(iso) {
   if (!iso) return "-";
   const clean = String(iso).endsWith("Z") ? iso : `${iso}Z`;
@@ -565,9 +588,9 @@ export default function App() {
       <Route path="/" element={<HomePage />} />
       <Route path="/how-it-works" element={<HowItWorksPage />} />
       <Route path="/features" element={<FeaturesPage />} />
-      <Route path="/demo" element={<DemoPage />} />
-      <Route path="/about" element={<AboutPage />} />
-      <Route path="/faq" element={<FaqPage />} />
+      <Route path="/demo" element={<PublicDemoPage />} />
+      <Route path="/about" element={<ExpandedAboutPage />} />
+      <Route path="/faq" element={<AccessibleFaqPage />} />
       <Route path="/contact" element={<ContactPage />} />
       <Route path="/login" element={<LoginPage />} />
       <Route path="/dashboard" element={<DashboardPage />} />
