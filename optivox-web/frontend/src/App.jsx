@@ -113,6 +113,17 @@ function Brand() {
   return <Link to="/" className="brand"><span className="mark"></span><b>OPTI</b><span>VOX</span></Link>;
 }
 
+function BackToTop() {
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const onScroll = () => setVisible(window.scrollY > 420);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  return <button type="button" className={`back-to-top ${visible ? "visible" : ""}`} onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })} aria-label="Back to top">↑ <span>Top</span></button>;
+}
+
 function Layout({ children }) {
   const [open, setOpen] = useState(false);
   useReveal();
@@ -132,6 +143,7 @@ function Layout({ children }) {
         </div>
       </header>
       <main id="main">{children}</main>
+      <BackToTop />
       <Footer />
     </>
   );
@@ -494,6 +506,7 @@ function DashboardPage() {
           <section id="assistant" className="panel dash-panel assistant-panel"><h4>AI Assistant</h4><AssistantAsk onAsk={(question) => postAction("/api/v1/assistant/ask", { question }, (out) => { setAssistantAnswer(out.answer || "No answer."); return "assistant answered"; })} /><div className="assistant-answer">{assistantAnswer}</div></section>
         </main>
       </div>
+      <BackToTop />
     </div>
   );
 }
