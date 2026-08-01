@@ -1,8 +1,11 @@
 import { Clock, Download, Search } from "lucide-react";
+import { useMemo, useState } from "react";
 import StatCard from "../components/StatCard";
 
 export default function Attendance({ state }) {
+  const [query, setQuery] = useState("");
   const rows = state.attendance?.length ? state.attendance : [];
+  const filteredRows = useMemo(() => rows.filter((person) => `${person.name} ${person.role} ${person.className}`.toLowerCase().includes(query.toLowerCase())), [rows, query]);
   const present = rows.filter((p) => p.status === "Present" || p.status === "Late").length;
   const late = rows.filter((p) => p.status === "Late").length;
   const left = rows.filter((p) => p.status === "Left").length;
@@ -26,9 +29,9 @@ export default function Attendance({ state }) {
           <div className="toolbar">
             <label className="search-box">
               <Search size={16} />
-              <input placeholder="Search person" />
+              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search person" aria-label="Search attendance" />
             </label>
-            <button type="button">
+            <button type="button" onClick={() => exportAttendance(filteredRows)}>
               <Download size={16} />
               Export CSV
             </button>
@@ -49,7 +52,7 @@ export default function Attendance({ state }) {
               </tr>
             </thead>
             <tbody>
-              {rows.map((person) => (
+              {filteredRows.map((person) => (
                 <tr key={person.id}>
                   <td>
                     <strong>{person.name}</strong>
@@ -65,10 +68,23 @@ export default function Attendance({ state }) {
               ))}
             </tbody>
           </table>
+          {!filteredRows.length && <p className="empty-copy table-empty">No attendance records match this search.</p>}
         </div>
       </section>
     </div>
   );
+}
+
+function exportAttendance(rows) {
+  const header = ["Name", "Role", "Class", "Status", "Clock in", "Clock out", "Method", "Confidence"];
+  const lines = rows.map((person) => [person.name, person.role, person.className, person.status, person.clockIn || "", person.clockOut || "", person.method, person.confidence ? `${Math.round(person.confidence * 100)}%` : ""]);
+  const csv = [header, ...lines].map((line) => line.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `optivox-attendance-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function statusClass(status) {

@@ -1,11 +1,12 @@
-import { Bell, Gauge, ShieldCheck, UserCheck, UserRoundX, Users } from "lucide-react";
+import { AlertCircle, Bell, ClipboardCheck, Gauge, ShieldCheck, UserCheck, UserPlus, UserRoundX, Users } from "lucide-react";
 import EventList from "../components/EventList";
 import LiveFrame from "../components/LiveFrame";
 import PersonCard from "../components/PersonCard";
 import StatCard from "../components/StatCard";
 
-export default function Overview({ state, connection }) {
+export default function Overview({ state, connection, onNavigate }) {
   const summary = state.summary;
+  const attention = state.events.filter((event) => event.reviewed === false || event.severity === "Critical");
 
   return (
     <div className="page-stack">
@@ -16,6 +17,33 @@ export default function Overview({ state, connection }) {
         <StatCard label="Security events" value={summary.securityEvents} detail="Needs review" icon={ShieldCheck} tone="danger" />
         <StatCard label="Alerts sent" value={summary.alertsSent} detail="Configured channels" icon={Bell} tone="neutral" />
         <StatCard label="Processing FPS" value={state.engine.fps} detail={state.engine.uptime} icon={Gauge} tone="neutral" />
+      </div>
+
+      <div className="command-row">
+        <section className="panel attention-panel">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Operator queue</p>
+              <h2>Requires attention <span className="count-badge">{attention.length}</span></h2>
+            </div>
+            <AlertCircle size={20} className="attention-icon" />
+          </div>
+          {attention.length ? attention.slice(0, 3).map((event) => (
+            <button className="attention-item" key={event.id} type="button" onClick={() => onNavigate("security")}>
+              <span className={`attention-dot ${event.severity === "Critical" ? "critical" : "warning"}`} />
+              <span><strong>{event.type.replaceAll("_", " ")}</strong><small>{event.person} · {event.time}</small></span>
+              <span className="attention-arrow">View</span>
+            </button>
+          )) : <p className="empty-copy">No unresolved events in the current feed.</p>}
+        </section>
+        <section className="panel quick-panel">
+          <div className="section-heading"><div><p className="eyebrow">Shortcuts</p><h2>Demo controls</h2></div></div>
+          <div className="quick-actions">
+            <button type="button" onClick={() => onNavigate("people")}><UserPlus size={16} /> Register person</button>
+            <button type="button" onClick={() => onNavigate("attendance")}><ClipboardCheck size={16} /> Open attendance</button>
+            <button type="button" onClick={() => onNavigate("security")}><ShieldCheck size={16} /> Review security</button>
+          </div>
+        </section>
       </div>
 
       <div className="overview-grid">

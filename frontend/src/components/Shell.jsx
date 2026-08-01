@@ -76,7 +76,7 @@ export default function Shell({ activePage, onNavigate, connection, state, child
           </div>
         </header>
 
-        {connection !== "live" && (
+        {connection !== "live" && (activePage === "overview" || activePage === "system") && (
           <div className="banner">
             {offlineMessage(connection)}
           </div>

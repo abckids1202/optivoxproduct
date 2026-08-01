@@ -30,7 +30,7 @@ export default function App() {
       connection={connection}
       state={state}
     >
-      {activePage === "overview" && <Overview state={state} connection={connection} />}
+      {activePage === "overview" && <Overview state={state} connection={connection} onNavigate={setActivePage} />}
       {activePage === "attendance" && <Attendance state={state} />}
       {activePage === "security" && <Security state={state} />}
       {activePage === "people" && <People state={state} />}
