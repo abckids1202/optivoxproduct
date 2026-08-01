@@ -22,6 +22,11 @@ def summary():
     return svc.attendance_summary()
 
 
+@router.get("/calendar")
+def calendar(year: int | None = None, month: int | None = None):
+    return svc.attendance_calendar(year=year, month=month)
+
+
 @router.get("/person/{person_id}")
 def person(person_id: int):
     return svc.person_attendance(person_id)

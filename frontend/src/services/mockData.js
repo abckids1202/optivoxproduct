@@ -12,6 +12,7 @@ export const people = [
     lastSeen: "Now",
     samples: 8,
     active: true,
+    subjects: ["Computer Vision", "Mathematics"],
   },
   {
     id: 2,
@@ -26,6 +27,7 @@ export const people = [
     lastSeen: "2 min ago",
     samples: 10,
     active: true,
+    subjects: ["Computer Vision"],
   },
   {
     id: 3,
@@ -40,6 +42,7 @@ export const people = [
     lastSeen: "12 min ago",
     samples: 6,
     active: true,
+    subjects: ["Science", "Mathematics"],
   },
   {
     id: 4,
@@ -54,6 +57,7 @@ export const people = [
     lastSeen: "1 hour ago",
     samples: 7,
     active: true,
+    subjects: ["Computer Vision"],
   },
   {
     id: 5,
@@ -68,6 +72,7 @@ export const people = [
     lastSeen: "Yesterday",
     samples: 5,
     active: true,
+    subjects: [],
   },
 ];
 

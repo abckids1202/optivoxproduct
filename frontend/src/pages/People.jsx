@@ -1,7 +1,10 @@
-import { Play, UserPlus } from "lucide-react";
+import { Search, Play, UserPlus, Users } from "lucide-react";
+import { useMemo, useState } from "react";
 import { sendCommand } from "../services/api";
 
 export default function People({ state }) {
+  const [query, setQuery] = useState("");
+  const people = useMemo(() => (state.people || []).filter((person) => `${person.name} ${person.role || ""} ${person.className || ""} ${(person.subjects || []).join(" ")}`.toLowerCase().includes(query.toLowerCase())), [state.people, query]);
   async function startEnrollment(mode) {
     const name = window.prompt("Enter the person's name for local enrollment");
     if (!name) return;
@@ -51,20 +54,24 @@ export default function People({ state }) {
             <p className="eyebrow">Face database</p>
             <h2>Registered people</h2>
           </div>
+          <label className="search-box"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search full roster" aria-label="Search people" /></label>
         </div>
+        <div className="roster-strip"><span><Users size={15} /> <strong>{state.people?.length || 0}</strong> registered</span><span><strong>{state.people?.filter((person) => person.active !== false).length || 0}</strong> active profiles</span><span><strong>{state.people?.filter((person) => person.status !== "Not Yet Detected").length || 0}</strong> seen today</span></div>
         <div className="people-grid">
-          {state.people.map((person) => (
+          {people.map((person) => (
             <article className="profile-card" key={person.id}>
               <div className="avatar">{person.name.slice(0, 1)}</div>
               <div>
                 <strong>{person.name}</strong>
-                <span>{person.role} / {person.className}</span>
-                <small>{person.samples} samples, last seen {person.lastSeen}</small>
+                <span>{person.role || "Not assigned"}{person.className ? ` · ${person.className}` : ""}</span>
+                <small>{person.samples} samples · last seen {person.lastSeen || "Never"}</small>
+                <div className="profile-subjects">{(person.subjects || []).length ? person.subjects.map((subject) => <span key={subject}>{subject}</span>) : <em>No subjects assigned</em>}</div>
               </div>
               <em>{person.status}</em>
             </article>
           ))}
         </div>
+        {!people.length && <p className="empty-copy">No registered people match this search.</p>}
       </section>
     </div>
   );

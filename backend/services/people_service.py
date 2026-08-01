@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import json
 
 from fastapi import HTTPException
 
@@ -9,6 +10,7 @@ from .attendance_service import attendance_status
 
 
 def normalize_person(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = parse_metadata(row.get("metadata_json"))
     active = True
     if row.get("metadata_json") and '"active": false' in str(row.get("metadata_json")).lower():
         active = False
@@ -16,7 +18,8 @@ def normalize_person(row: dict[str, Any]) -> dict[str, Any]:
         "id": row["id"],
         "name": row["name"],
         "role": row.get("role"),
-        "className": None,
+        "className": metadata.get("class") or metadata.get("class_name"),
+        "subjects": metadata.get("subjects", []) if isinstance(metadata.get("subjects", []), list) else [metadata.get("subjects")],
         "active": active,
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
@@ -70,9 +73,16 @@ def update_person(person_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     return get_person(person_id)
 
 
+def parse_metadata(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
 def set_enabled(person_id: int, enabled: bool) -> dict[str, Any]:
     if not fetch_one("select id from people where id=?", [person_id]):
         raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
     execute("update people set metadata_json=?, updated_at=datetime('now') where id=?", [f'{{"active": {str(enabled).lower()}}}', person_id])
     return get_person(person_id)
-

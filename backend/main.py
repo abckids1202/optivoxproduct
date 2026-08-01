@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import FRONTEND_ORIGINS
-from .routes import analytics, attendance, commands, events, health, live, people, system
+from .routes import academic, analytics, attendance, commands, events, health, live, people, system
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("optivox.backend")
@@ -34,6 +34,7 @@ for router in [
     analytics.router,
     commands.router,
     system.router,
+    academic.router,
 ]:
     app.include_router(router)
 
@@ -46,4 +47,3 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("OptiVox backend stopped")
-

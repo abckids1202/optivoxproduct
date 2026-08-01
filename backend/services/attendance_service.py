@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import date
+from calendar import monthrange
+from datetime import date, datetime
 from typing import Any
 
 from fastapi import HTTPException
@@ -98,6 +99,52 @@ def person_attendance(person_id: int) -> list[dict[str, Any]]:
     return list_attendance(person_id=person_id)
 
 
+def attendance_calendar(year: int | None = None, month: int | None = None) -> dict[str, Any]:
+    """Return a complete roster matrix, including people with no attendance row."""
+    today = date.today()
+    year = year or today.year
+    month = month or today.month
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="Month must be between 1 and 12.")
+    days_in_month = monthrange(year, month)[1]
+    start = f"{year:04d}-{month:02d}-01"
+    end = f"{year:04d}-{month:02d}-{days_in_month:02d}"
+    people = fetch_all("select id, name, role, metadata_json from people order by name")
+    rows = fetch_all(
+        """
+        select a.*, p.name, p.role, p.metadata_json
+        from attendance a join people p on p.id=a.person_id
+        where a.date between ? and ? order by a.date, p.name
+        """,
+        [start, end],
+    )
+    records: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        normalized = normalize_attendance(row)
+        records[f"{row['person_id']}:{row['date']}"] = normalized
+    days = [f"{year:04d}-{month:02d}-{day:02d}" for day in range(1, days_in_month + 1)]
+    roster = [{
+        "id": person["id"],
+        "name": person["name"],
+        "role": person.get("role"),
+        "subjects": metadata_subjects(person.get("metadata_json")),
+        "records": {day: records.get(f"{person['id']}:{day}") for day in days},
+    } for person in people]
+    return {"year": year, "month": month, "days": days, "people": roster}
+
+
+def metadata_subjects(value: Any) -> list[str]:
+    import json
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return []
+    subjects = parsed.get("subjects", []) if isinstance(parsed, dict) else []
+    if isinstance(subjects, str):
+        subjects = [subjects]
+    return [str(subject) for subject in subjects if str(subject).strip()]
+
+
 def clock_in(person_id: int) -> dict[str, Any]:
     person = fetch_one("select id from people where id=?", [person_id])
     if not person:
@@ -138,4 +185,3 @@ def export_csv() -> StreamingResponse:
         writer.writerow({k: row.get(k) for k in writer.fieldnames})
     stream.seek(0)
     return StreamingResponse(iter([stream.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=optivox_attendance.csv"})
-

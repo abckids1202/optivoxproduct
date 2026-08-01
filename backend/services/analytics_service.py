@@ -32,7 +32,29 @@ def attendance(days: int = 7) -> dict:
         """,
         [days],
     )
-    return {"attendanceByDay": list(reversed(by_day)), "summary": attendance_summary()}
+    status_rows = fetch_all(
+        """
+        select case when clock_out is not null then 'Left'
+                    when late_minutes > 0 then 'Late'
+                    when clock_in is not null then 'Present'
+                    else 'Not Yet Detected' end as name, count(*) as value
+        from attendance group by name order by value desc
+        """
+    )
+    methods = fetch_all(
+        "select case when lower(coalesce(notes,'')) like '%manual%' then 'Manual' else 'Automatic' end as name, count(*) as value from attendance group by name"
+    )
+    roster = fetch_one("select count(*) as registered, sum(case when lower(coalesce(metadata_json,'')) not like '%\"active\": false%' then 1 else 0 end) as active from people") or {}
+    seen = fetch_one("select count(distinct person_id) as seen from attendance where date=date('now','localtime')") or {}
+    event_total = fetch_one("select count(*) as total from events") or {}
+    return {
+        "attendanceByDay": list(reversed(by_day)),
+        "summary": attendance_summary(),
+        "byStatus": status_rows,
+        "methodSplit": methods,
+        "rosterTotals": {"registered": roster.get("registered", 0) or 0, "active": roster.get("active", 0) or 0, "seenToday": seen.get("seen", 0) or 0},
+        "totalEvents": event_total.get("total", 0) or 0,
+    }
 
 
 def security() -> dict:
@@ -53,4 +75,3 @@ def objects() -> dict:
         """
     )
     return {"objects": rows}
-
