@@ -3,7 +3,6 @@ import { Link, NavLink, Route, Routes, useLocation, useNavigate } from "react-ro
 import { apiRequest, apiUrl } from "./services/api";
 import IntelligenceMap from "./components/IntelligenceMap";
 import FeatureNavigator from "./components/FeatureNavigator";
-import BrowserFaceDemo from "./components/BrowserFaceDemo";
 import CinematicHero from "./components/CinematicHero";
 import { featureContent } from "./content/features";
 
@@ -127,7 +126,7 @@ function BackToTop() {
 function Layout({ children }) {
   const [open, setOpen] = useState(false);
   useReveal();
-  const links = [["/", "Home"], ["/how-it-works", "How It Works"], ["/features", "Features"], ["/demo", "Live Demo"], ["/about", "About"], ["/faq", "FAQ"], ["/contact", "Contact"]];
+  const links = [["/", "Home"], ["/how-it-works", "How It Works"], ["/features", "Features"], ["/about", "About"], ["/faq", "FAQ"], ["/contact", "Contact"]];
   return (
     <>
       <a className="skip-link" href="#main">Skip to content</a>
@@ -160,7 +159,7 @@ function Footer() {
               Next-generation intelligent security infrastructure. Surveillance, analytics, and attendance powered by on-device AI.
             </p>
           </div>
-          <div><h4>Product</h4><Link to="/features">Features</Link><Link to="/demo">Live Demo</Link><Link to="/contact">Request Access</Link></div>
+          <div><h4>Product</h4><Link to="/features">Features</Link><Link to="/contact">Request Access</Link></div>
           <div><h4>Company</h4><Link to="/about">About</Link><Link to="/faq">FAQ</Link><Link to="/login">Open Dashboard</Link></div>
           <div><h4>System</h4><span>YOLOv8</span><span>InsightFace</span><span>Edge / On-Premise</span></div>
         </div>
@@ -196,7 +195,7 @@ function HomePage() {
               <span className="kicker reveal">Local-first computer vision</span>
               <h1 className="reveal"><span className="chrome">Observation becomes</span><span className="line2 neon-text">understanding.</span></h1>
               <p className="lead reveal">OptiVox connects perception, recognition, attendance, security events, and human response into one explainable intelligence system for real spaces.</p>
-              <div className="hero-cta reveal"><Link to="/how-it-works" className="btn btn-primary">Explore the Intelligence Map <span>→</span></Link><Link to="/demo" className="btn btn-ghost">Try the Live Demo</Link></div>
+              <div className="hero-cta reveal"><Link to="/how-it-works" className="btn btn-primary">Explore the Intelligence Map <span>→</span></Link><Link to="/features" className="btn btn-ghost">Explore Features</Link></div>
               <div className="hero-proof reveal"><span><i></i> Core processing can run locally</span><span><i></i> Built for human review</span></div>
             </div>
             <div className="hero-visual reveal">
@@ -553,10 +552,6 @@ function AssistantAsk({ onAsk }) {
   return <div className="assistant-row"><input value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && question.trim()) onAsk(question.trim()); }} placeholder="Ask: who is visible, what objects do you see, who is clocked in?" /><button className="btn btn-primary compact" onClick={() => question.trim() && onAsk(question.trim())}>Ask</button></div>;
 }
 
-function PublicDemoPage() {
-  return <Layout><section className="page-intro demo-intro"><div className="wrap"><span className="kicker reveal">Public browser demonstration</span><h1 className="chrome reveal">See the visual input layer.</h1><p className="intro-lead reveal">This lightweight browser demo detects visible faces locally. It is intentionally separate from the complete local OptiVox application, which includes enrollment, recognition, attendance, event storage, and alerts.</p><div className="intro-meta reveal"><span>Browser local</span><span>Nothing uploaded</span><span>Temporary tracks only</span></div></div></section><section className="demo-section"><div className="wrap"><BrowserFaceDemo /><div className="demo-explanation"><div><span className="kicker">What this proves</span><h2 className="chrome">A browser can show perception. The full system adds memory and action.</h2></div><div className="demo-explanation-grid"><div><strong>Public demo</strong><p>Web-compatible face detection, temporary labels, camera telemetry, and a privacy-first session.</p></div><div><strong>Local OptiVox application</strong><p>InsightFace recognition, enrollment, attendance, events, snapshots, alerts, and the operational dashboard.</p></div><div><strong>Important limitation</strong><p>Face detection is not identity recognition. This page does not enroll you or create an official attendance record.</p></div></div></div></div></section></Layout>;
-}
-
 function ExpandedAboutPage() {
   const stack = [["InsightFace", "Face detection, landmarks, and recognition embeddings"], ["FAISS", "Fast similarity search across enrolled identities"], ["YOLO", "Selected object and safety-event detection"], ["MediaPipe", "Pose and hand landmark analysis"], ["OpenCV", "Camera capture, frame processing, and overlays"], ["SQLite", "Local people, attendance, events, and alerts"], ["Flask API", "Structured bridge between the local engine and web interface"], ["React", "Dashboard and public explanation layer"]];
   const milestones = ["Problem discovery", "Research and architecture", "Database foundation", "Face recognition", "Attendance automation", "Security modules", "Web dashboard", "Exhibition integration"];
@@ -571,11 +566,10 @@ const publicFaqs = [
   ["Technology", "What hardware is required?", "The prototype can run with a standard webcam and computer. A stronger CPU or compatible GPU can improve real-time performance."],
   ["Technology", "Why does recognition require several frames?", "One frame can be blurred, obstructed, or misaligned. Repeated confirmation makes the decision less dependent on a single moment."],
   ["Privacy", "Where is biometric data stored?", "The local prototype stores identity profiles and embeddings in its local data layer. Each deployment still needs its own consent, access, retention, and backup policy."],
-  ["Privacy", "Is camera footage uploaded?", "The public browser demo processes frames in the browser session. The local application can keep core processing and records on the local machine unless remote channels are configured."],
+  ["Privacy", "Is camera footage uploaded?", "The local application can keep core processing and records on the local machine unless remote channels are configured."],
   ["Reliability", "Can a photograph fool the system?", "The prototype includes experimental liveness safeguards, but they are not definitive protection and should not be presented as infallible."],
   ["Reliability", "Is it ready for full school deployment?", "It is a working project prototype. Broader evaluation, formal privacy policies, access controls, and operational testing are still required."],
-  ["Demonstration", "Is the website demo the complete OptiVox system?", "No. The website demo shows browser face detection. The complete local prototype adds enrollment, identity recognition, attendance, events, storage, alerts, and the dashboard."],
-  ["Demonstration", "Where can I see the operational dashboard?", "Use Open Dashboard in the navigation to access the configured demonstration application. It may use sample or live data depending on the deployment."],
+  ["Product", "Where can I see the operational dashboard?", "Use Open Dashboard in the navigation to access the configured application. It may use sample or live data depending on the deployment."],
 ];
 
 function AccessibleFaqPage() {
@@ -603,7 +597,6 @@ export default function App() {
       <Route path="/" element={<HomePage />} />
       <Route path="/how-it-works" element={<HowItWorksPage />} />
       <Route path="/features" element={<FeaturesPage />} />
-      <Route path="/demo" element={<PublicDemoPage />} />
       <Route path="/about" element={<ExpandedAboutPage />} />
       <Route path="/faq" element={<AccessibleFaqPage />} />
       <Route path="/contact" element={<ContactPage />} />
