@@ -290,6 +290,11 @@ CONFIG: Dict[str, Any] = {
         "RECOGNITION_WINDOW_SEC": 5.0,
         "CENTER_MODE_DWELL_SEC": 3.0,
         "CENTER_MODE_STABLE_FRAMES": 6,
+        "CENTER_MODE_REQUIRE_LIVENESS": True,
+        "CENTER_MODE_YAW_THRESHOLD": 0.12,
+        "CENTER_MODE_NEUTRAL_THRESHOLD": 0.07,
+        "CENTER_MODE_TURN_HOLD_SEC": 0.35,
+        "CENTER_MODE_CHALLENGE_TIMEOUT_SEC": 15.0,
         "CENTER_MODE_X_MIN": 0.34,
         "CENTER_MODE_X_MAX": 0.66,
         "CENTER_MODE_Y_MIN": 0.12,
@@ -1531,6 +1536,17 @@ class FaceAnalyzer:
                 if kps.ndim == 1: kps = kps.reshape(-1, 2)
                 return kps[:, :2]   # drop z if 3d
         return None
+    def get_pose_keypoints(self, face):
+        """Return InsightFace's stable 5-point eye/nose/mouth landmarks."""
+        for attr in ("kps", "landmark_2d_106"):
+            kps = getattr(face, attr, None)
+            if kps is not None:
+                kps = np.asarray(kps, dtype=np.float32)
+                if kps.ndim == 1:
+                    kps = kps.reshape(-1, 2)
+                if len(kps) >= 5:
+                    return kps[:, :2]
+        return None
     def get_age(self, face): return int(face.age) if getattr(face, "age", None) else None
     def get_gender(self, face): 
         g = getattr(face, "gender", None)
@@ -1897,6 +1913,27 @@ class HeadPoseEstimator:
         arr = np.array(self.history)
         return float(np.mean(np.var(arr, axis=0)))
 
+    @staticmethod
+    def estimate_yaw(keypoints):
+        """Estimate horizontal head turn from five InsightFace keypoints.
+
+        The result is normalized by eye distance: near zero is frontal,
+        negative/positive values are opposite head-turn directions.
+        """
+        if keypoints is None or len(keypoints) < 5:
+            return None
+        pts = np.asarray(keypoints, dtype=np.float32)
+        left_eye, right_eye = pts[0], pts[1]
+        eye_distance = float(np.linalg.norm(right_eye - left_eye))
+        if eye_distance < 1.0:
+            return None
+        eye_mid_x = float((left_eye[0] + right_eye[0]) * 0.5)
+        nose_x = float(pts[2][0])
+        mouth_mid_x = float((pts[3][0] + pts[4][0]) * 0.5)
+        nose_offset = (nose_x - eye_mid_x) / eye_distance
+        mouth_offset = (mouth_mid_x - eye_mid_x) / eye_distance
+        return float(0.75 * nose_offset + 0.25 * mouth_offset)
+
 
 class DepthEstimator:
     def __init__(self, cfg=None):
@@ -1934,12 +1971,17 @@ class AntiSpoofDetector:
         self.depth = DepthEstimator(cfg)
         self._frames_seen = 0
 
-    def analyze(self, face_crop, frame_shape, landmarks=None, bbox=None) -> Tuple[str, dict]:
+    def analyze(self, face_crop, frame_shape, landmarks=None, bbox=None,
+                pose_keypoints=None) -> Tuple[str, dict]:
         if not self.enabled:
             return self.REAL, {"method": "disabled", "status": self.REAL}
 
         self._frames_seen += 1
         details = {"frames_seen": self._frames_seen}
+
+        yaw = self.pose.estimate_yaw(pose_keypoints)
+        if yaw is not None:
+            details["yaw"] = yaw
 
         if landmarks is not None:
             self.pose.update(landmarks)
@@ -2679,13 +2721,18 @@ class VisionSystem:
             spoof_status = AntiSpoofDetector.REAL
             spoof_details = {}
             spoof_confirmed = False
+            landmarks = self.face_analyzer.get_landmarks(fobj)
+            pose_keypoints = self.face_analyzer.get_pose_keypoints(fobj)
+            yaw = self.anti_spoof.pose.estimate_yaw(pose_keypoints)
 
             if self.anti_spoof.enabled:
-                landmarks = self.face_analyzer.get_landmarks(fobj)
                 crop = frame[max(0, y1):min(frame.shape[0], y2),
                              max(0, x1):min(frame.shape[1], x2)]
                 spoof_status, spoof_details = self.anti_spoof.analyze(
-                    crop, frame.shape, landmarks=landmarks, bbox=(x1, y1, x2, y2))
+                    crop, frame.shape, landmarks=landmarks,
+                    bbox=(x1, y1, x2, y2), pose_keypoints=pose_keypoints)
+            if yaw is not None:
+                spoof_details["yaw"] = yaw
 
                 if oid > 0:
                     self._spoof_history[oid].append(spoof_status)
@@ -2703,7 +2750,8 @@ class VisionSystem:
                 info.append({"oid": oid, "name": "SPOOF", "confidence": 0.0,
                              "bbox": (x1, y1, x2, y2), "is_real": False,
                              "spoof_status": spoof_status,
-                             "spoof_details": spoof_details})
+                             "spoof_details": spoof_details,
+                             "yaw": yaw})
                 continue
 
             perf = self.cfg.get("PERFORMANCE", {})
@@ -2760,7 +2808,9 @@ class VisionSystem:
 
             info.append({"oid": oid, "name": name, "confidence": conf,
                          "bbox": (x1, y1, x2, y2), "is_real": is_real,
-                         "reason": reason, "age": age, "gender": gender})
+                         "reason": reason, "age": age, "gender": gender,
+                         "yaw": yaw, "liveness_status": spoof_status,
+                         "liveness_details": spoof_details})
         return info
 
     def _reid_stranger(self, embedding) -> Optional[str]:
@@ -2989,6 +3039,8 @@ class VisionSystem:
                 "name": fi.get("name"),
                 "confidence": float(fi.get("confidence", 0.0)),
                 "is_real": bool(fi.get("is_real", True)),
+                "yaw": fi.get("yaw"),
+                "liveness_status": fi.get("liveness_status"),
                 "bbox": fi.get("bbox"),
                 "shirt_color": shirt_color,
             })
@@ -4322,6 +4374,12 @@ def main():
             "started_at": None,
             "progress": 0.0,
             "completed_name": None,
+            "liveness_phase": "CENTER",
+            "liveness_started_at": None,
+            "liveness_hold_started_at": None,
+            "liveness_passed": False,
+            "liveness_first_turn": None,
+            "liveness_yaw": None,
         },
         "show_details": True,
         "roster": [],
@@ -4367,6 +4425,12 @@ def main():
             "started_at": None,
             "progress": 0.0,
             "completed_name": None,
+            "liveness_phase": "CENTER",
+            "liveness_started_at": None,
+            "liveness_hold_started_at": None,
+            "liveness_passed": False,
+            "liveness_first_turn": None,
+            "liveness_yaw": None,
         })
         ui["message"] = ("Center Attendance ON: one person, centered, hold still."
                           if state["enabled"] else "Center Attendance OFF.")
@@ -4406,7 +4470,14 @@ def main():
                 "stable_frames": 0,
                 "started_at": None,
                 "progress": 0.0,
+                "liveness_phase": "CENTER",
+                "liveness_started_at": None,
+                "liveness_hold_started_at": None,
+                "liveness_passed": False,
+                "liveness_first_turn": None,
+                "liveness_yaw": None,
             })
+            ui["message"] = state["status"]
             return
 
         face = valid[0]
@@ -4419,11 +4490,103 @@ def main():
             state["completed_name"] = None
 
         if state.get("candidate") != name:
-            state["candidate"] = name
-            state["stable_frames"] = 1
-            state["started_at"] = now
+            state.update({
+                "candidate": name,
+                "stable_frames": 1,
+                "started_at": now,
+                "liveness_phase": "CENTER",
+                "liveness_started_at": now,
+                "liveness_hold_started_at": None,
+                "liveness_passed": not cfg.get("CENTER_MODE_REQUIRE_LIVENESS", True),
+                "liveness_first_turn": None,
+            })
         else:
             state["stable_frames"] += 1
+
+        yaw = face.get("yaw")
+        state["liveness_yaw"] = yaw
+        require_liveness = bool(cfg.get("CENTER_MODE_REQUIRE_LIVENESS", True))
+        neutral_threshold = float(cfg.get("CENTER_MODE_NEUTRAL_THRESHOLD", 0.07))
+        turn_threshold = float(cfg.get("CENTER_MODE_YAW_THRESHOLD", 0.12))
+        turn_hold = float(cfg.get("CENTER_MODE_TURN_HOLD_SEC", 0.35))
+        challenge_timeout = float(cfg.get("CENTER_MODE_CHALLENGE_TIMEOUT_SEC", 15.0))
+
+        if require_liveness and not state.get("liveness_passed"):
+            challenge_elapsed = now - float(state.get("liveness_started_at") or now)
+            if challenge_elapsed > challenge_timeout:
+                state.update({
+                    "liveness_phase": "CENTER",
+                    "liveness_started_at": now,
+                    "liveness_hold_started_at": None,
+                    "liveness_first_turn": None,
+                    "liveness_yaw": yaw,
+                    "stable_frames": 0,
+                    "status": "Challenge timed out. Face forward to restart.",
+                })
+                ui["message"] = state["status"]
+                return
+
+            phase = state.get("liveness_phase", "CENTER")
+            hold_started = state.get("liveness_hold_started_at")
+
+            def held(condition):
+                nonlocal hold_started
+                if not condition:
+                    hold_started = None
+                    state["liveness_hold_started_at"] = None
+                    return False
+                if hold_started is None:
+                    hold_started = now
+                    state["liveness_hold_started_at"] = now
+                    return False
+                return now - hold_started >= turn_hold
+
+            if yaw is None:
+                state["status"] = "Liveness landmarks unavailable. Keep one clear face visible."
+            elif phase == "CENTER":
+                if held(abs(yaw) <= neutral_threshold):
+                    state["liveness_phase"] = "TURN_1"
+                    state["liveness_hold_started_at"] = None
+                    state["status"] = "Now turn your head to the LEFT."
+                else:
+                    state["status"] = "Face forward and hold still."
+            elif phase == "TURN_1":
+                if abs(yaw) >= turn_threshold:
+                    if state.get("liveness_first_turn") is None:
+                        state["liveness_first_turn"] = "NEG" if yaw < 0 else "POS"
+                    if held(True):
+                        state["liveness_phase"] = "TURN_2"
+                        state["liveness_hold_started_at"] = None
+                        state["status"] = "Good. Now turn your head to the RIGHT."
+                    else:
+                        state["status"] = "Hold the LEFT turn."
+                else:
+                    state["status"] = "Turn your head to the LEFT."
+            elif phase == "TURN_2":
+                first_turn = state.get("liveness_first_turn")
+                opposite = ((first_turn == "NEG" and yaw >= turn_threshold)
+                            or (first_turn == "POS" and yaw <= -turn_threshold))
+                if held(opposite):
+                    state["liveness_phase"] = "RETURN"
+                    state["liveness_hold_started_at"] = None
+                    state["status"] = "Return to the center and face forward."
+                else:
+                    state["status"] = "Turn to the opposite side."
+            elif phase == "RETURN":
+                if held(abs(yaw) <= neutral_threshold):
+                    state["liveness_phase"] = "PASSED"
+                    state["liveness_passed"] = True
+                    state["liveness_hold_started_at"] = None
+                    state["status"] = "Liveness passed. Finalizing attendance."
+                else:
+                    state["status"] = "Return to the center and face forward."
+
+            if not state.get("liveness_passed"):
+                phase_index = {"CENTER": 0, "TURN_1": 1, "TURN_2": 2, "RETURN": 3}.get(
+                    state.get("liveness_phase"), 0)
+                state["progress"] = min(0.9, (phase_index + 0.25) / 4.0)
+                ui["message"] = state["status"]
+                return
 
         dwell = float(cfg.get("CENTER_MODE_DWELL_SEC", 3.0))
         stable_needed = int(cfg.get("CENTER_MODE_STABLE_FRAMES", 6))
@@ -4431,9 +4594,11 @@ def main():
         progress = min(1.0, elapsed / max(dwell, 0.1))
         state["progress"] = progress
         state["phase"] = "VERIFYING"
-        state["status"] = f"Verifying {name}: {elapsed:.1f}/{dwell:.1f}s"
+        if state.get("liveness_passed"):
+            state["status"] = f"Verified {name}: {elapsed:.1f}/{dwell:.1f}s"
 
         if elapsed < dwell or state["stable_frames"] < stable_needed:
+            ui["message"] = state["status"]
             return
 
         result = attendance.clock_in_verified(
