@@ -4396,6 +4396,6 @@ def main():
         except Exception as e: print(f"[WARN] Face DB save: {e}")
         print("[INFO] Done.")
 
-
+#Main loop
 if __name__ == "__main__":
     main()
