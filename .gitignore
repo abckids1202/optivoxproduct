@@ -12,6 +12,8 @@ mykeys/
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
+backend/.pytest-temp/
 
 # Local databases and generated data
 *.db

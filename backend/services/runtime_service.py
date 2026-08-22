@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
 
-from ..config import HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, TIMEZONE
+from ..config import DEVICE_ID, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, TIMEZONE
 
 
 def now_iso() -> str:
@@ -56,6 +56,7 @@ def live_state() -> dict[str, Any]:
     security = state.get("security", {})
     return {
         "generatedAt": now_iso(),
+        "device": {"id": DEVICE_ID, "type": "edge-agent", "biometric_owner": "local_engine"},
         "localTime": datetime.now(TIMEZONE).strftime("%H:%M:%S"),
         "connection": hb["status"],
         "engine": {

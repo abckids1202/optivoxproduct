@@ -6,11 +6,12 @@ from datetime import date, timedelta
 from typing import Any
 
 from ..database import fetch_all
+from ..config import local_today
 
 
 def overview(year: int | None = None, month: int | None = None) -> dict[str, Any]:
     """Expose academic metadata without requiring biometric records to contain it."""
-    today = date.today()
+    today = local_today()
     year = year or today.year
     month = month or today.month
     people = fetch_all("select id, name, role, metadata_json from people order by name")
@@ -22,7 +23,7 @@ def overview(year: int | None = None, month: int | None = None) -> dict[str, Any
         profiles.append({"person_id": person["id"], "name": person["name"], "subjects": person_subjects})
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
-    cutoff = min(date.today(), end)
+    cutoff = min(local_today(), end)
     recorded = fetch_all("select person_id, date from attendance where date between ? and ? and clock_in is not null", [start.isoformat(), cutoff.isoformat()])
     recorded_keys = {(row["person_id"], row["date"]) for row in recorded}
     absences = []

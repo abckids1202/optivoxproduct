@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 
@@ -16,6 +17,7 @@ FRONTEND_DIR = (PROJECT_ROOT / "frontend").resolve()
 TIMEZONE_NAME = os.getenv("OPTIVOX_TIMEZONE", "Asia/Jakarta")
 TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 APP_VERSION = "1.0.0-exhibition"
+DEVICE_ID = os.getenv("OPTIVOX_DEVICE_ID", "local-edge-cam-0")
 FRONTEND_ORIGINS = [
     os.getenv("OPTIVOX_FRONTEND_ORIGIN", "http://127.0.0.1:5173"),
     "http://localhost:5173",
@@ -29,10 +31,17 @@ def runtime_path(name: str) -> Path:
     return (RUNTIME_DIR / name).resolve()
 
 
+def local_now() -> datetime:
+    return datetime.now(TIMEZONE)
+
+
+def local_today() -> date:
+    return local_now().date()
+
+
 LIVE_STATE_PATH = runtime_path("live_state.json")
 HEARTBEAT_PATH = runtime_path("heartbeat.json")
 LATEST_FRAME_PATH = runtime_path("latest_frame.jpg")
 COMMANDS_PATH = runtime_path("commands.json")
 COMMAND_RESULTS_PATH = runtime_path("command_results.json")
 ENROLLMENT_STATUS_PATH = runtime_path("enrollment_status.json")
-

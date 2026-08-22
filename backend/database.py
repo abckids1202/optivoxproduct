@@ -16,7 +16,10 @@ def dict_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 @contextmanager
-def get_connection(path=DATABASE_PATH):
+def get_connection(path=None):
+    # Resolve the configured path at call time so tests and local deployments
+    # can swap databases without a stale default argument.
+    path = path or DATABASE_PATH
     con = sqlite3.connect(path, timeout=10, check_same_thread=False)
     con.row_factory = sqlite3.Row
     try:
@@ -60,4 +63,3 @@ def table_counts() -> dict[str, int]:
             name = row["name"]
             counts[name] = con.execute(f"select count(*) as c from {name}").fetchone()["c"]
     return counts
-

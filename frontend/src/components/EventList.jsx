@@ -1,7 +1,7 @@
-import { AlertTriangle, CheckCircle2, ShieldAlert } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, ShieldAlert, X } from "lucide-react";
 import { severityTone, StatusBadge } from "./StatusBadge";
 
-export default function EventList({ events, compact = false }) {
+export default function EventList({ events, compact = false, onReview }) {
   return (
     <div className={compact ? "event-list compact" : "event-list"}>
       {events.map((event) => (
@@ -26,6 +26,12 @@ export default function EventList({ events, compact = false }) {
               <span>{event.person}</span>
               <span>{event.location}</span>
             </div>
+            {onReview && !event.reviewed && (
+              <div className="event-actions">
+                <button type="button" onClick={() => onReview(event.id, "confirm")}><Check size={14} /> Confirm</button>
+                <button type="button" onClick={() => onReview(event.id, "dismiss")}><X size={14} /> Dismiss</button>
+              </div>
+            )}
           </div>
         </article>
       ))}

@@ -6,7 +6,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from ..services import runtime_service
 from ..services.analytics_service import attendance as attendance_analytics, security as security_analytics
 from ..services.attendance_service import attendance_summary, today_attendance
-from ..services.event_service import list_events
+from ..services.event_service import event_summary, list_events
+from ..services.incident_service import list_incidents
 from ..services.people_service import list_people
 
 router = APIRouter(tags=["live"])
@@ -18,9 +19,13 @@ def live_status():
     state["people"] = list_people()
     state["attendance"] = today_attendance()
     state["events"] = list_events(limit=8)
+    state["incidents"] = list_incidents(limit=8)
     attendance = attendance_summary()
     state["summary"].update(attendance)
     state["summary"]["presentToday"] = attendance["present"]
+    state["summary"]["openIncidents"] = sum(1 for incident in state["incidents"] if incident["status"] not in {"dismissed", "resolved"})
+    state["summary"]["securityObservations"] = event_summary()["total"]
+    state["summary"]["securityEvents"] = state["summary"]["openIncidents"]
     state["analytics"] = {
         **attendance_analytics(),
         **security_analytics(),

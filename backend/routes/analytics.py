@@ -16,11 +16,10 @@ def attendance(days: int = 7):
 
 
 @router.get("/security")
-def security():
-    return svc.security()
+def security(days: int = 30):
+    return svc.security(days)
 
 
 @router.get("/objects")
 def objects():
     return svc.objects()
-

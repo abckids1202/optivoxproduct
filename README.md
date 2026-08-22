@@ -1,10 +1,10 @@
 # OptiVox Local Web Application
 
-OptiVox uses one local computer-vision engine, `moretesting.py`, plus a FastAPI backend and React/Vite dashboard.
+OptiVox uses one local computer-vision engine, `main.py`, plus a FastAPI backend and React/Vite dashboard. `moretesting.py` is retained as the older standalone runtime and is not the launcher target.
 
 ## Architecture
 
-- `moretesting.py` owns the webcam, face recognition, object detection, attendance automation, alerts, snapshots, and SQLite writes.
+- `main.py` owns the webcam, face recognition, object detection, attendance automation, alerts, snapshots, and SQLite writes.
 - `runtime/` is the bridge between the engine and web app.
 - `backend/` reads SQLite and runtime files, exposes REST APIs, validates commands, serves snapshots and latest frames, and provides `/ws/live`.
 - `frontend/` is the exhibition dashboard.
@@ -61,3 +61,6 @@ The frontend only uses sample data when `VITE_USE_DEMO_DATA=true`. In normal liv
 
 Close the frontend tab, stop the backend terminal, then quit the engine with `q` so it can save its shutdown report.
 
+## API protection
+
+Local loopback access works without a key for the exhibition. Before exposing the backend beyond the local machine, set `OPTIVOX_API_KEY` and, for roster administration or attendance corrections, `OPTIVOX_ADMIN_KEY`. Put the matching `VITE_OPTIVOX_API_KEY` in the frontend build environment. Never commit real values.

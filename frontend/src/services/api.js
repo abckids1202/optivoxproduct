@@ -2,15 +2,29 @@ import { getDemoState } from "./mockData";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
 const USE_DEMO_DATA = import.meta.env.VITE_USE_DEMO_DATA === "true";
+const API_KEY = import.meta.env.VITE_OPTIVOX_API_KEY || "";
 
 export const FRAME_URL = `${API_BASE}/api/live/frame`;
 
 async function getJson(path) {
-  const response = await fetch(`${API_BASE}${path}`);
+  const response = await fetch(`${API_BASE}${path}`, { headers: requestHeaders() });
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+    throw new Error(await errorMessage(response));
   }
   return response.json();
+}
+
+function requestHeaders(extra = {}) {
+  return { ...(API_KEY ? { "X-Optivox-Key": API_KEY } : {}), ...extra };
+}
+
+async function errorMessage(response) {
+  try {
+    const body = await response.json();
+    return body?.detail?.message || body?.detail || `Request failed: ${response.status}`;
+  } catch {
+    return `Request failed: ${response.status}`;
+  }
 }
 
 export async function fetchDashboardState() {
@@ -30,12 +44,46 @@ export async function sendCommand(command, payload = {}) {
   try {
     return await fetch(`${API_BASE}/api/commands`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: requestHeaders({ "Content-Type": "application/json", "Idempotency-Key": `web-${command}-${Date.now()}` }),
       body: JSON.stringify({ command, payload }),
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(await errorMessage(response));
+      return response.json();
     });
-  } catch {
-    throw new Error("Backend command endpoint is unavailable.");
+  } catch (error) {
+    if (error instanceof Error && !error.message.includes("Failed to fetch")) throw error;
+    throw new Error("Backend command endpoint is unavailable or rejected the command.");
   }
+}
+
+export async function reviewEvent(eventId, action, note = "") {
+  const response = await fetch(`${API_BASE}/api/events/${eventId}/review`, {
+    method: "POST",
+    headers: requestHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ action, note }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+export async function reviewIncident(incidentId, action, note = "") {
+  const response = await fetch(`${API_BASE}/api/incidents/${incidentId}/review`, {
+    method: "POST",
+    headers: requestHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ action, note }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+export async function correctAttendance(personId, payload) {
+  const response = await fetch(`${API_BASE}/api/attendance/${personId}/correct`, {
+    method: "POST",
+    headers: requestHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
 }
 
 export async function fetchAttendanceCalendar(year, month) {
@@ -102,6 +150,8 @@ function getEmptyState() {
       visibleNow: 0,
       unknownToday: 0,
       securityEvents: 0,
+      securityObservations: 0,
+      openIncidents: 0,
       alertsSent: 0,
       registeredPeople: 0,
       present: 0,
@@ -119,5 +169,6 @@ function getEmptyState() {
       eventsByHour: [],
       securityCategories: [],
     },
+    incidents: [],
   };
 }

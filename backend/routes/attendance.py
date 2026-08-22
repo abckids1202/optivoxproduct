@@ -1,10 +1,20 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 
 from ..services import attendance_service as svc
+from ..security import require_admin, require_operator
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"])
+
+
+class CorrectionRequest(BaseModel):
+    date: str = Field(min_length=10, max_length=10)
+    clock_in: str | None = Field(default=None, max_length=64)
+    clock_out: str | None = Field(default=None, max_length=64)
+    late_minutes: int = Field(default=0, ge=0, le=1440)
+    reason: str = Field(min_length=3, max_length=500)
 
 
 @router.get("/today")
@@ -37,11 +47,16 @@ def export():
     return svc.export_csv()
 
 
-@router.post("/{person_id}/clock-in")
+@router.post("/{person_id}/clock-in", dependencies=[Depends(require_operator)])
 def clock_in(person_id: int):
     return svc.clock_in(person_id)
 
 
-@router.post("/{person_id}/clock-out")
+@router.post("/{person_id}/clock-out", dependencies=[Depends(require_operator)])
 def clock_out(person_id: int):
     return svc.clock_out(person_id)
+
+
+@router.post("/{person_id}/correct", dependencies=[Depends(require_admin)])
+def correct(person_id: int, payload: CorrectionRequest):
+    return svc.correct_attendance(person_id, payload.date, payload.clock_in, payload.clock_out, payload.late_minutes, payload.reason)

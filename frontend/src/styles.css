@@ -314,6 +314,11 @@ td span {
 .filter-select select { border: 0; outline: 0; background: transparent; color: #e7edf6; }
 .filter-select option { background: #111827; }
 .review-strip { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(145, 163, 184, 0.14); color: #91a3b8; font-size: 12px; }
+.event-actions, .incident-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 11px; }
+.event-actions button, .incident-actions button { min-height: 30px; padding: 0 10px; font-size: 12px; }
+.incident-list { display: grid; gap: 10px; }
+.incident-item { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px; border: 1px solid rgba(145, 163, 184, 0.14); border-radius: 8px; background: rgba(8, 13, 24, 0.48); }
+.incident-item p { margin: 5px 0 8px; color: #c8d3df; }
 
 .lower-grid,
 .analytics-grid,

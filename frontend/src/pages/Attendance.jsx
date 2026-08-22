@@ -1,6 +1,6 @@
-import { CalendarDays, ChevronLeft, ChevronRight, Clock, Download, Search } from "lucide-react";
+import { CalendarDays, ChevronLeft, ChevronRight, Clock, Download, Edit3, Search } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { fetchAcademicOverview, fetchAttendanceCalendar } from "../services/api";
+import { correctAttendance, fetchAcademicOverview, fetchAttendanceCalendar } from "../services/api";
 import StatCard from "../components/StatCard";
 
 export default function Attendance({ state }) {
@@ -20,6 +20,21 @@ export default function Attendance({ state }) {
   const late = rows.filter((p) => p.status === "Late").length;
   const left = rows.filter((p) => p.status === "Left").length;
   const pending = state.summary?.not_yet_detected || 0;
+
+  async function correct(person) {
+    const clockIn = window.prompt("Correct clock-in ISO time (blank removes it)", person.clock_in || `${person.date}T08:00:00`);
+    if (clockIn === null) return;
+    const clockOut = window.prompt("Correct clock-out ISO time (blank leaves it open)", person.clock_out || "");
+    if (clockOut === null) return;
+    const reason = window.prompt("Reason for this attendance correction");
+    if (!reason) return;
+    try {
+      await correctAttendance(person.person_id, { date: person.date, clock_in: clockIn || null, clock_out: clockOut || null, late_minutes: person.late_minutes || 0, reason });
+      window.alert("Attendance correction saved and added to the audit trail.");
+    } catch (error) {
+      window.alert(error.message);
+    }
+  }
 
   return (
     <div className="page-stack">
@@ -59,6 +74,7 @@ export default function Attendance({ state }) {
                 <th>Clock-out</th>
                 <th>Method</th>
                 <th>Confidence</th>
+                <th>Record</th>
               </tr>
             </thead>
             <tbody>
@@ -74,6 +90,7 @@ export default function Attendance({ state }) {
                   <td>{person.clockOut || "-"}</td>
                   <td>{person.method}</td>
                   <td>{person.confidence ? `${Math.round(person.confidence * 100)}%` : "-"}</td>
+                  <td><button type="button" className="icon-button" title="Correct attendance record" aria-label="Correct attendance record" onClick={() => correct(person)}><Edit3 size={15} /></button></td>
                 </tr>
               ))}
             </tbody>

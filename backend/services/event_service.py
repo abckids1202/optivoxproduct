@@ -9,6 +9,8 @@ from fastapi.responses import FileResponse
 
 from ..config import SNAPSHOTS_DIR
 from ..database import fetch_all, fetch_one
+from ..database import execute
+from .audit_service import record_action
 
 
 def severity_label(value: Any) -> str:
@@ -64,7 +66,9 @@ def normalize_event(row: dict[str, Any]) -> dict[str, Any]:
         "message": details_message(row.get("details_json")),
         "snapshot_available": bool(snapshot_path),
         "snapshot_url": f"/api/events/{row['id']}/snapshot" if snapshot_path else None,
-        "reviewed": False,
+        "review_status": row.get("review_status") or ("reviewed" if row.get("reviewed_at") else "open"),
+        "review_note": row.get("review_note"),
+        "reviewed": (row.get("review_status") or ("reviewed" if row.get("reviewed_at") else "open")) != "open",
     }
 
 
@@ -124,6 +128,21 @@ def event_summary() -> dict[str, Any]:
     }
 
 
+def review_event(event_id: int, action: str, note: str | None = None) -> dict[str, Any]:
+    actions = {"confirm": "confirmed", "dismiss": "dismissed", "escalate": "escalated", "resolve": "resolved"}
+    status = actions.get(action)
+    if not status:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_REVIEW_ACTION", "message": "Use confirm, dismiss, escalate, or resolve."})
+    if not fetch_one("select id from events where id=?", [event_id]):
+        raise HTTPException(status_code=404, detail={"code": "EVENT_NOT_FOUND", "message": "Event was not found."})
+    execute(
+        "update events set review_status=?, review_note=?, reviewed_at=datetime('now'), reviewed_by='operator' where id=?",
+        [status, (note or "").strip()[:500] or None, event_id],
+    )
+    record_action("event.review", "event", event_id, {"status": status, "note": note or ""})
+    return get_event(event_id)
+
+
 def snapshot_response(event_id: int) -> FileResponse:
     row = fetch_one("select snapshot_path from events where id=?", [event_id])
     if not row:
@@ -140,4 +159,3 @@ def snapshot_response(event_id: int) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail={"code": "SNAPSHOT_NOT_FOUND", "message": "Snapshot file is missing."})
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
-
