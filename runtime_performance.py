@@ -214,3 +214,63 @@ class LatestInferenceState:
     def snapshot(self):
         with self._lock:
             return self._result
+
+
+class AdaptiveInferenceScheduler:
+    """Frame-based scheduler with active/idle rates and load feedback."""
+
+    def __init__(self, config=None):
+        self.config = dict(config or {})
+        self.enabled = bool(self.config.get("enabled", True))
+        self.target_total_ms = float(self.config.get("target_total_ms", 120.0))
+        self._next_due = {}
+        self._ema_total_ms = None
+        self._last_intervals = {}
+        self._lock = threading.RLock()
+
+    def should_run(self, name, frame_id, base_interval, has_signal=False, force=False):
+        base_interval = max(1, int(base_interval))
+        if force:
+            return True
+        if not self.enabled:
+            return int(frame_id) % base_interval == 0
+        with self._lock:
+            return int(frame_id) >= self._next_due.get(name, int(frame_id))
+
+    def _configured_interval(self, name, base_interval, has_signal):
+        base_interval = max(1, int(base_interval))
+        mode = "active" if has_signal else "idle"
+        value = self.config.get(f"{name}_{mode}_every_n_frames")
+        return max(1, int(value if value is not None else base_interval))
+
+    def complete(self, name, frame_id, base_interval, has_signal=False):
+        interval = self._configured_interval(name, base_interval, has_signal)
+        with self._lock:
+            pressure = 1.0
+            if self._ema_total_ms is not None and self.target_total_ms > 0:
+                pressure = self._ema_total_ms / self.target_total_ms
+            if self.enabled and pressure > 1.10:
+                interval += min(3, max(1, int(round(pressure - 1.0))))
+            elif self.enabled and pressure < 0.60 and interval > 1:
+                interval -= 1
+            self._last_intervals[name] = interval
+            self._next_due[name] = int(frame_id) + interval
+        return interval
+
+    def record_total_ms(self, duration_ms):
+        duration_ms = max(0.0, float(duration_ms))
+        with self._lock:
+            alpha = 0.15
+            self._ema_total_ms = duration_ms if self._ema_total_ms is None else (
+                alpha * duration_ms + (1.0 - alpha) * self._ema_total_ms
+            )
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "enabled": self.enabled,
+                "target_total_ms": self.target_total_ms,
+                "ema_total_ms": round(self._ema_total_ms or 0.0, 2),
+                "next_due": dict(self._next_due),
+                "intervals": dict(self._last_intervals),
+            }

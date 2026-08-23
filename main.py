@@ -22,7 +22,12 @@ from collections import OrderedDict, deque, defaultdict
 from typing import Optional, Any, Dict, List, Tuple
 from datetime import datetime as dt_datetime, timedelta, date as dt_date, timezone as dt_timezone
 from zoneinfo import ZoneInfo
-from runtime_performance import LatestFrameBuffer, LatestInferenceState, PerformanceProfiler
+from runtime_performance import (
+    AdaptiveInferenceScheduler,
+    LatestFrameBuffer,
+    LatestInferenceState,
+    PerformanceProfiler,
+)
 
 #Optional try and error
 try:
@@ -290,6 +295,29 @@ CONFIG: Dict[str, Any] = {
     "SIDE_EFFECT_QUEUE_SIZE": 256,
     "CRITICAL_QUEUE_SIZE": 64,
     "DISPLAY_LOOP_FPS": 30,
+    "ADAPTIVE_SCHEDULING": True,
+    "ADAPTIVE_TARGET_TOTAL_MS": 120.0,
+    "FACE_DETECT_ACTIVE_EVERY_N_FRAMES": 3,
+    "FACE_DETECT_IDLE_EVERY_N_FRAMES": 8,
+    "YOLO_ACTIVE_EVERY_N_FRAMES": 8,
+    "YOLO_IDLE_EVERY_N_FRAMES": 12,
+    "HAND_ACTIVE_EVERY_N_FRAMES": 4,
+    "HAND_IDLE_EVERY_N_FRAMES": 8,
+    "POSE_ACTIVE_EVERY_N_FRAMES": 4,
+    "POSE_IDLE_EVERY_N_FRAMES": 8,
+    "DANGER_ACTIVE_EVERY_N_FRAMES": 8,
+    "DANGER_IDLE_EVERY_N_FRAMES": 12,
+    "CUSTOM_ACTIVE_EVERY_N_FRAMES": 5,
+    "CUSTOM_IDLE_EVERY_N_FRAMES": 8,
+    "FACE_QUALITY_GATE_ENABLED": True,
+    "FACE_QUALITY_MIN_SCORE": 50.0,
+    "FACE_QUALITY_MIN_BLUR": 45.0,
+    "FACE_RECOG_STABLE_FRAMES": 3,
+    "FACE_RECOG_REFRESH_SEC": 2.5,
+    "FACE_RECOG_REFRESH_MOVEMENT_PX": 36.0,
+    "ROI_INFERENCE_ENABLED": True,
+    "ROI_PADDING_RATIO": 0.12,
+    "ROI_MAX_FRAME_RATIO": 0.88,
     },
 
     #Attendance
@@ -1318,8 +1346,15 @@ class CustomObjectManager:
             return None
 
         pts = []
+        roi = hand.get("roi")
+        if roi and len(roi) == 4:
+            rx1, ry1, rx2, ry2 = (int(value) for value in roi)
+            rw = max(1, rx2 - rx1)
+            rh = max(1, ry2 - ry1)
+        else:
+            rx1, ry1, rw, rh = 0, 0, w, h
         for p in lm.landmark:
-            pts.append((int(p.x * w), int(p.y * h)))
+            pts.append((int(rx1 + p.x * rw), int(ry1 + p.y * rh)))
 
         if not pts:
             return None
@@ -1605,7 +1640,7 @@ class HandDetector:
                 min_tracking_confidence=self.cfg["HAND_MIN_TRACKING"])
             self.mp_draw = mp.solutions.drawing_utils
 
-    def detect(self, frame):
+    def detect(self, frame, roi=None):
         if not self.enabled: return []
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = self.hands.process(rgb)
@@ -1615,17 +1650,32 @@ class HandDetector:
                 handedness = "Right"
                 if res.multi_handedness and idx < len(res.multi_handedness):
                     handedness = res.multi_handedness[idx].classification[0].label
-                out.append({"landmarks": lm, "handedness": handedness})
+                out.append({"landmarks": lm, "handedness": handedness, "roi": roi})
         return out
 
     def draw(self, frame, hands):
         if not self.enabled or not self.cfg.get("SHOW_HAND_LANDMARKS", False):
             return frame
         for h in hands:
-            self.mp_draw.draw_landmarks(
-                frame, h["landmarks"], self.mp_hands.HAND_CONNECTIONS,
-                self.mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-                self.mp_draw.DrawingSpec(color=(255, 0, 255), thickness=2))
+            roi = h.get("roi")
+            if roi and len(roi) == 4:
+                rx1, ry1, rx2, ry2 = (int(value) for value in roi)
+                rw = max(1, rx2 - rx1)
+                rh = max(1, ry2 - ry1)
+                points = [
+                    (int(rx1 + point.x * rw), int(ry1 + point.y * rh))
+                    for point in h["landmarks"].landmark
+                ]
+                for start, end in self.mp_hands.HAND_CONNECTIONS:
+                    if start < len(points) and end < len(points):
+                        cv2.line(frame, points[start], points[end], (255, 0, 255), 2)
+                for point in points:
+                    cv2.circle(frame, point, 2, (0, 255, 0), -1)
+            else:
+                self.mp_draw.draw_landmarks(
+                    frame, h["landmarks"], self.mp_hands.HAND_CONNECTIONS,
+                    self.mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                    self.mp_draw.DrawingSpec(color=(255, 0, 255), thickness=2))
         return frame
 
 
@@ -1645,15 +1695,25 @@ class PoseDetector:
                 min_tracking_confidence=0.5)
             self.mp_draw = mp.solutions.drawing_utils
 
-    def analyze(self, frame) -> dict:
+    def analyze(self, frame, roi=None) -> dict:
         """Returns dict with keys: pose (landmarks), is_fallen, hands_raised."""
         if not self.enabled: return {"pose": None, "is_fallen": False, "hands_raised": False}
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        source = frame
+        if roi and len(roi) == 4:
+            x1, y1, x2, y2 = (int(value) for value in roi)
+            source = frame[max(0, y1):min(frame.shape[0], y2),
+                           max(0, x1):min(frame.shape[1], x2)]
+        else:
+            x1, y1 = 0, 0
+        if source.size == 0:
+            return {"pose": None, "is_fallen": False, "hands_raised": False, "roi": roi}
+        rgb = cv2.cvtColor(source, cv2.COLOR_BGR2RGB)
         res = self.pose.process(rgb)
-        if not res.pose_landmarks: return {"pose": None, "is_fallen": False, "hands_raised": False}
+        if not res.pose_landmarks:
+            return {"pose": None, "is_fallen": False, "hands_raised": False, "roi": roi}
         lm = res.pose_landmarks.landmark
-        h, w = frame.shape[:2]
-        def pt(i): return (lm[i].x * w, lm[i].y * h, lm[i].visibility)
+        h, w = source.shape[:2]
+        def pt(i): return (x1 + lm[i].x * w, y1 + lm[i].y * h, lm[i].visibility)
         nose = pt(0); l_sh = pt(11); r_sh = pt(12); l_hip = pt(23); r_hip = pt(24)
         l_an = pt(27); r_an = pt(28); l_wr = pt(15); r_wr = pt(16)
         is_fallen = False
@@ -1671,16 +1731,32 @@ class PoseDetector:
                 hands_raised = True
 
         return {"pose": res.pose_landmarks, "is_fallen": is_fallen, "hands_raised": hands_raised,
-                "landmarks_px": {"nose": nose, "l_sh": l_sh, "r_sh": r_sh,
+                "roi": roi,
+                 "landmarks_px": {"nose": nose, "l_sh": l_sh, "r_sh": r_sh,
                                  "l_hip": l_hip, "r_hip": r_hip}}
 
     def draw(self, frame, result):
         if not self.enabled or not result or not result.get("pose"): return frame
         if not self.cfg.get("SHOW_POSE_LANDMARKS", False): return frame
-        self.mp_draw.draw_landmarks(
-            frame, result["pose"], self.mp_pose.POSE_CONNECTIONS,
-            self.mp_draw.DrawingSpec(color=(0, 255, 255), thickness=2, circle_radius=2),
-            self.mp_draw.DrawingSpec(color=(255, 100, 0), thickness=2))
+        roi = result.get("roi")
+        if roi and len(roi) == 4:
+            x1, y1, x2, y2 = (int(value) for value in roi)
+            rw = max(1, x2 - x1)
+            rh = max(1, y2 - y1)
+            points = [
+                (int(x1 + landmark.x * rw), int(y1 + landmark.y * rh))
+                for landmark in result["pose"].landmark
+            ]
+            for start, end in self.mp_pose.POSE_CONNECTIONS:
+                if start < len(points) and end < len(points):
+                    cv2.line(frame, points[start], points[end], (255, 100, 0), 2)
+            for point in points:
+                cv2.circle(frame, point, 2, (0, 255, 255), -1)
+        else:
+            self.mp_draw.draw_landmarks(
+                frame, result["pose"], self.mp_pose.POSE_CONNECTIONS,
+                self.mp_draw.DrawingSpec(color=(0, 255, 255), thickness=2, circle_radius=2),
+                self.mp_draw.DrawingSpec(color=(255, 100, 0), thickness=2))
         return frame
 
 
@@ -2372,6 +2448,98 @@ class VisionSystem:
         self._last_held_objects: List[dict] = []
         self._last_hand_dets = []
         self._last_pose_result = {}
+        perf_cfg = self.cfg.get("PERFORMANCE", {})
+        scheduler_config = {
+            "enabled": bool(perf_cfg.get("ADAPTIVE_SCHEDULING", True)),
+            "target_total_ms": float(perf_cfg.get("ADAPTIVE_TARGET_TOTAL_MS", 120.0)),
+        }
+        for key, value in perf_cfg.items():
+            if key.endswith("_ACTIVE_EVERY_N_FRAMES") or key.endswith("_IDLE_EVERY_N_FRAMES"):
+                scheduler_config[key.lower()] = value
+        self._scheduler = AdaptiveInferenceScheduler(scheduler_config)
+        self._recognition_cache_hits = 0
+        self._recognition_cache_misses = 0
+        self._face_quality_rejects = 0
+        self._roi_inference_runs = 0
+
+    def performance_snapshot(self) -> dict:
+        return {
+            "recognition_cache_hits": self._recognition_cache_hits,
+            "recognition_cache_misses": self._recognition_cache_misses,
+            "face_quality_rejects": self._face_quality_rejects,
+            "roi_inference_runs": self._roi_inference_runs,
+            "scheduler": self._scheduler.snapshot(),
+        }
+
+    def _face_quality(self, frame, bbox):
+        if not self.cfg.get("PERFORMANCE", {}).get("FACE_QUALITY_GATE_ENABLED", True):
+            return 100.0, {}, True
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(frame.shape[1], int(x1)))
+        y1 = max(0, min(frame.shape[0], int(y1)))
+        x2 = max(0, min(frame.shape[1], int(x2)))
+        y2 = max(0, min(frame.shape[0], int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0, {}, False
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return 0.0, {}, False
+        score, metrics = self.quality_scorer.score(crop)
+        perf_cfg = self.cfg.get("PERFORMANCE", {})
+        accepted = (
+            score >= float(perf_cfg.get("FACE_QUALITY_MIN_SCORE", 50.0))
+            and metrics.get("blur", 0.0) >= float(
+                perf_cfg.get("FACE_QUALITY_MIN_BLUR", 45.0))
+        )
+        return float(score), metrics, bool(accepted)
+
+    @staticmethod
+    def _bbox_motion(previous_bbox, current_bbox):
+        if not previous_bbox or not current_bbox:
+            return float("inf")
+        px = (float(previous_bbox[0]) + float(previous_bbox[2])) * 0.5
+        py = (float(previous_bbox[1]) + float(previous_bbox[3])) * 0.5
+        cx = (float(current_bbox[0]) + float(current_bbox[2])) * 0.5
+        cy = (float(current_bbox[1]) + float(current_bbox[3])) * 0.5
+        return math.hypot(cx - px, cy - py)
+
+    def _relevant_roi(self, frame, object_detections=None, face_objects=None, tracked=None):
+        """Return a padded person-focused ROI, or None when it is not useful."""
+        if not self.cfg.get("PERFORMANCE", {}).get("ROI_INFERENCE_ENABLED", True):
+            return None
+        height, width = frame.shape[:2]
+        boxes = []
+        for detection in object_detections or []:
+            if str(detection.get("class_name", "")).lower() == "person":
+                boxes.append(detection.get("bbox"))
+        for face in face_objects or []:
+            try:
+                boxes.append(self.face_analyzer.get_bbox(face))
+            except Exception:
+                continue
+        if not boxes and tracked:
+            for center in tracked.values():
+                cx, cy = center
+                boxes.append((cx - 120, cy - 260, cx + 120, cy + 260))
+        boxes = [box for box in boxes if box and len(box) == 4]
+        if not boxes:
+            return None
+        x1 = min(float(box[0]) for box in boxes)
+        y1 = min(float(box[1]) for box in boxes)
+        x2 = max(float(box[2]) for box in boxes)
+        y2 = max(float(box[3]) for box in boxes)
+        padding = float(self.cfg.get("PERFORMANCE", {}).get("ROI_PADDING_RATIO", 0.12))
+        pad_x = max(24.0, (x2 - x1) * padding)
+        pad_y = max(24.0, (y2 - y1) * padding)
+        x1 = max(0, int(x1 - pad_x))
+        y1 = max(0, int(y1 - pad_y))
+        x2 = min(width, int(x2 + pad_x))
+        y2 = min(height, int(y2 + pad_y))
+        roi_area = max(0, x2 - x1) * max(0, y2 - y1)
+        if roi_area <= 0 or roi_area >= width * height * float(
+                self.cfg.get("PERFORMANCE", {}).get("ROI_MAX_FRAME_RATIO", 0.88)):
+            return None
+        return x1, y1, x2, y2
 
     def import_known_faces_folder(self, db: EventDatabase = None):
         root = self.cfg.get("KNOWN_FACES_DIR")
@@ -2750,11 +2918,18 @@ class VisionSystem:
         for fobj in face_objects:
             x1, y1, x2, y2 = self.face_analyzer.get_bbox(fobj)
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            embedding = self.face_analyzer.get_embedding(fobj)
             oid = -1; best_d = float("inf")
             for t_oid, t_c in tracked.items():
                 d = math.hypot(cx - t_c[0], cy - t_c[1])
                 if d < best_d and d < 150: best_d, oid = d, t_oid
+
+            quality_score, quality_metrics, quality_ok = self._face_quality(
+                frame, (x1, y1, x2, y2))
+            if not quality_ok:
+                self._face_quality_rejects += 1
+            embedding = (
+                self.face_analyzer.get_embedding(fobj) if quality_ok else None
+            )
 
             spoof_status = AntiSpoofDetector.REAL
             spoof_details = {}
@@ -2766,9 +2941,16 @@ class VisionSystem:
             if self.anti_spoof.enabled:
                 crop = frame[max(0, y1):min(frame.shape[0], y2),
                              max(0, x1):min(frame.shape[1], x2)]
-                spoof_status, spoof_details = self.anti_spoof.analyze(
-                    crop, frame.shape, landmarks=landmarks,
-                    bbox=(x1, y1, x2, y2), pose_keypoints=pose_keypoints)
+                if quality_ok:
+                    spoof_status, spoof_details = self.anti_spoof.analyze(
+                        crop, frame.shape, landmarks=landmarks,
+                        bbox=(x1, y1, x2, y2), pose_keypoints=pose_keypoints)
+                else:
+                    spoof_status = AntiSpoofDetector.UNCERTAIN
+                    spoof_details = {
+                        "reason": "low_face_quality",
+                        "quality_score": round(quality_score, 2),
+                    }
             if yaw is not None:
                 spoof_details["yaw"] = yaw
 
@@ -2789,7 +2971,11 @@ class VisionSystem:
                 AntiSpoofDetector.SUSPECT,
             }
             is_real = not spoof_confirmed
-            attendance_eligible = not spoof_confirmed and not liveness_blocks_attendance
+            attendance_eligible = (
+                not spoof_confirmed
+                and not liveness_blocks_attendance
+                and quality_ok
+            )
 
             if spoof_confirmed:
                 self._draw_face_box(frame, x1, y1, x2, y2, "SPOOF", 0.0, oid, False)
@@ -2803,22 +2989,71 @@ class VisionSystem:
 
             perf = self.cfg.get("PERFORMANCE", {})
             recog_every = max(1, int(perf.get("FACE_RECOG_EVERY_N_FRAMES", 3)))
-            cache_ttl = float(perf.get("RECOGNITION_CACHE_TTL_SEC", 2.0))
-            cached = self._recognition_cache.get(oid)
+            cache_ttl = float(perf.get("RECOGNITION_CACHE_TTL_SEC", 4.0))
+            refresh_sec = float(perf.get("FACE_RECOG_REFRESH_SEC", 2.5))
+            movement_limit = float(perf.get("FACE_RECOG_REFRESH_MOVEMENT_PX", 36.0))
+            stable_required = max(1, int(perf.get("FACE_RECOG_STABLE_FRAMES", 3)))
+            cached = self._recognition_cache.get(oid) if oid > 0 else None
+            now = time.time()
+            cache_age = now - float((cached or {}).get("ts", 0.0))
+            cached_name = str((cached or {}).get("name") or "UNKNOWN")
+            cached_known = (
+                cached is not None
+                and cached_name not in ("UNKNOWN", "SPOOF")
+                and not cached_name.startswith("STRANGER_")
+            )
+            stable_frames = int((cached or {}).get("stable_frames", 0))
+            movement = self._bbox_motion((cached or {}).get("bbox"),
+                                          (x1, y1, x2, y2))
+            stable_cache_valid = (
+                cached_known
+                and stable_frames >= stable_required
+                and cache_age <= min(cache_ttl, refresh_sec)
+                and movement <= movement_limit
+            )
+            quality_hold_valid = cached_known and cache_age <= cache_ttl
 
-            if (cached and time.time() - cached.get("ts", 0) <= cache_ttl
-                    and self._frame_count % recog_every != 0):
-                name, conf, reason = cached["name"], cached["conf"], cached["reason"]
-            else:
+            if stable_cache_valid or (not quality_ok and quality_hold_valid):
+                name = cached_name
+                conf = float(cached.get("conf", 0.0))
+                reason = "stable_track_cache" if quality_ok else "quality_hold"
+                self._recognition_cache_hits += 1
+            elif not quality_ok:
+                name, conf, reason = "UNKNOWN", 0.0, (
+                    f"low_face_quality={quality_score:.1f}"
+                )
+                self._recognition_cache_misses += 1
+            elif (cached is None or not cached_known
+                  or cache_age > cache_ttl
+                  or cache_age > refresh_sec
+                  or movement > movement_limit
+                  or self._frame_count % recog_every == 0):
                 name, conf, reason = self._smooth_recognize(oid, embedding)
-                self._recognition_cache[oid] = {
-                    "name": name,
-                    "conf": conf,
-                    "reason": reason,
-                    "embedding": embedding,
-                    "ts": time.time(),
-                }
-            if name == "UNKNOWN" and self.cfg.get("STRANGER_TRACKING_ENABLED", True):
+                previous_name = cached_name if cached else None
+                stable_frames = (
+                    int((cached or {}).get("stable_frames", 0)) + 1
+                    if name == previous_name else 1
+                )
+                if oid > 0:
+                    self._recognition_cache[oid] = {
+                        "name": name,
+                        "conf": conf,
+                        "reason": reason,
+                        "embedding": embedding,
+                        "bbox": (x1, y1, x2, y2),
+                        "stable_frames": stable_frames,
+                        "quality_score": quality_score,
+                        "ts": now,
+                    }
+                self._recognition_cache_misses += 1
+            elif cached:
+                name, conf, reason = cached["name"], cached["conf"], cached["reason"]
+                self._recognition_cache_hits += 1
+            else:
+                name, conf, reason = "UNKNOWN", 0.0, "no_recognition_cache"
+                self._recognition_cache_misses += 1
+
+            if name == "UNKNOWN" and embedding is not None and self.cfg.get("STRANGER_TRACKING_ENABLED", True):
                 if oid not in self.stranger_buffer:
                     matched_label = self._reid_stranger(embedding)
                     if matched_label:
@@ -2856,6 +3091,9 @@ class VisionSystem:
             info.append({"oid": oid, "name": name, "confidence": conf,
                          "bbox": (x1, y1, x2, y2), "is_real": is_real,
                          "attendance_eligible": attendance_eligible,
+                         "quality_score": quality_score,
+                         "quality_ok": quality_ok,
+                         "quality_metrics": quality_metrics,
                          "reason": reason, "age": age, "gender": gender,
                          "yaw": yaw, "liveness_status": spoof_status,
                          "liveness_details": spoof_details})
@@ -2977,38 +3215,54 @@ class VisionSystem:
         self._frame_count += 1
         perf = self.cfg.get("PERFORMANCE", {})
         face_every = max(1, int(perf.get("FACE_DETECT_EVERY_N_FRAMES", 2)))
-        if self._frame_count % face_every == 0 or not self._last_face_objects:
+        face_due = self._scheduler.should_run(
+            "face_detect", self._frame_count, face_every,
+            has_signal=bool(self._last_face_objects),
+            force=not bool(self._last_face_objects),
+        )
+        if face_due:
             try:
                 face_objects = self.face_analyzer.detect(analysis)
                 self._last_face_objects = face_objects
             except Exception as e:
                 print(f"[ERROR] face detect: {e}")
                 face_objects = self._last_face_objects or []
+            self._scheduler.complete(
+                "face_detect", self._frame_count, face_every,
+                has_signal=bool(face_objects),
+            )
         else:
             face_objects = self._last_face_objects
         mark_stage("face_detection")
-
-        hand_every = max(1, int(perf.get("HAND_EVERY_N_FRAMES", 4)))
-        if self._frame_count % hand_every == 0 or not self._last_hand_dets:
-            self._last_hand_dets = self.hand_detector.detect(analysis)
-        hand_dets = self._last_hand_dets
-
-        if self.cfg.get("SHOW_HAND_LANDMARKS", False):
-            self.hand_detector.draw(display, hand_dets)
-        mark_stage("hands_and_overlays")
 
         object_detections = []
         yolo_every = max(1, int(perf.get("YOLO_EVERY_N_FRAMES", 3)))
 
         if self.object_detector is not None:
-            if self._frame_count % yolo_every == 0 or not self._last_object_detections:
+            yolo_due = self._scheduler.should_run(
+                "yolo", self._frame_count, yolo_every,
+                has_signal=bool(self._last_object_detections),
+                force=not bool(self._last_object_detections),
+            )
+            if yolo_due:
                 object_detections = self.object_detector.detect(analysis)
                 self._last_object_detections = object_detections
+                self._scheduler.complete(
+                    "yolo", self._frame_count, yolo_every,
+                    has_signal=bool(object_detections),
+                )
             else:
                 object_detections = list(self._last_object_detections)
 
-        if self.cfg.get("ENABLE_FIRE_SMOKE_HEURISTICS", False):
+        supplementary_due = self._scheduler.should_run(
+            "supplementary", self._frame_count, 3,
+            has_signal=False,
+            force=self._frame_count == 1,
+        )
+        if self.cfg.get("ENABLE_FIRE_SMOKE_HEURISTICS", False) and supplementary_due:
             object_detections.extend(self.supplementary.detect_all(analysis))
+            self._scheduler.complete("supplementary", self._frame_count, 3,
+                                     has_signal=bool(object_detections))
 
         if self.danger_detector is not None:
             danger_cfg = self.cfg.get("DANGER_DETECTION", {})
@@ -3019,7 +3273,12 @@ class VisionSystem:
                 for k, v in danger_cfg.get("MIN_CONF_BY_CLASS", {}).items()
             }
 
-            if self._frame_count % danger_every == 0:
+            danger_due = self._scheduler.should_run(
+                "danger", self._frame_count, danger_every,
+                has_signal=bool(self._last_danger_detections),
+                force=not bool(self._last_danger_detections),
+            )
+            if danger_due:
                 raw_danger_dets = self.danger_detector.detect(analysis)
                 danger_dets = []
 
@@ -3042,12 +3301,40 @@ class VisionSystem:
                     danger_dets.append(d)
 
                 self._last_danger_detections = danger_dets
+                self._scheduler.complete(
+                    "danger", self._frame_count, danger_every,
+                    has_signal=bool(danger_dets),
+                )
             else:
                 danger_dets = list(self._last_danger_detections)
 
             object_detections.extend(danger_dets)
 
         mark_stage("objects_and_danger")
+
+        roi = self._relevant_roi(analysis, object_detections, face_objects)
+        hand_every = max(1, int(perf.get("HAND_EVERY_N_FRAMES", 4)))
+        hand_due = self._scheduler.should_run(
+            "hand", self._frame_count, hand_every,
+            has_signal=bool(self._last_hand_dets),
+            force=not bool(self._last_hand_dets),
+        )
+        if hand_due:
+            hand_input = analysis
+            if roi is not None:
+                x1, y1, x2, y2 = roi
+                hand_input = analysis[y1:y2, x1:x2]
+                self._roi_inference_runs += 1
+            self._last_hand_dets = self.hand_detector.detect(hand_input, roi=roi)
+            self._scheduler.complete(
+                "hand", self._frame_count, hand_every,
+                has_signal=bool(self._last_hand_dets),
+            )
+        hand_dets = self._last_hand_dets
+
+        if self.cfg.get("SHOW_HAND_LANDMARKS", False):
+            self.hand_detector.draw(display, hand_dets)
+        mark_stage("hands_and_overlays")
 
         if self.cfg.get("SHOW_OBJECT_BOXES", True) and self.object_detector is not None:
             self.object_detector.draw_detections(display, object_detections, skip_person=True)
@@ -3056,9 +3343,18 @@ class VisionSystem:
             custom_cfg = self.cfg.get("CUSTOM_OBJECTS", {})
             custom_every = max(1, int(custom_cfg.get("MATCH_EVERY_N_FRAMES", 5)))
 
-            if self._frame_count % custom_every == 0:
+            custom_due = self._scheduler.should_run(
+                "custom", self._frame_count, custom_every,
+                has_signal=bool(self._last_custom_object_detections),
+                force=not bool(self._last_custom_object_detections),
+            )
+            if custom_due:
                 custom_dets = self.custom_objects.detect_from_hands(analysis, hand_dets)
                 self._last_custom_object_detections = custom_dets
+                self._scheduler.complete(
+                    "custom", self._frame_count, custom_every,
+                    has_signal=bool(custom_dets),
+                )
             else:
                 custom_dets = list(self._last_custom_object_detections)
 
@@ -3075,8 +3371,22 @@ class VisionSystem:
 
         try:
             pose_every = max(1, int(perf.get("POSE_EVERY_N_FRAMES", 4)))
-            if self._frame_count % pose_every == 0 or not self._last_pose_result:
-                self._last_pose_result = self.pose_detector.analyze(analysis)
+            pose_due = self._scheduler.should_run(
+                "pose", self._frame_count, pose_every,
+                has_signal=bool(self._last_pose_result.get("pose")),
+                force=not bool(self._last_pose_result),
+            )
+            if pose_due:
+                pose_roi = self._relevant_roi(
+                    analysis, object_detections, face_objects, tracked)
+                if pose_roi is not None:
+                    self._roi_inference_runs += 1
+                self._last_pose_result = self.pose_detector.analyze(
+                    analysis, roi=pose_roi)
+                self._scheduler.complete(
+                    "pose", self._frame_count, pose_every,
+                    has_signal=bool(self._last_pose_result.get("pose")),
+                )
             pose_result = self._last_pose_result
             if pose_result.get("is_fallen"):
                 events.append(("FALL_DETECTED", "PERSON", 0.85, "Possible fall: torso horizontal"))
@@ -3107,6 +3417,8 @@ class VisionSystem:
                 "attendance_eligible": bool(fi.get("attendance_eligible", fi.get("is_real", True))),
                 "yaw": fi.get("yaw"),
                 "liveness_status": fi.get("liveness_status"),
+                "quality_score": float(fi.get("quality_score", 0.0)),
+                "quality_ok": bool(fi.get("quality_ok", True)),
                 "bbox": fi.get("bbox"),
                 "shirt_color": shirt_color,
             })
@@ -3194,12 +3506,16 @@ class VisionSystem:
             if fi["oid"] > 0: active_ids.add(fi["oid"])
         self.behavior.cleanup(active_ids)
         self._cleanup_strangers()
+        for oid in list(self._recognition_cache.keys()):
+            if oid > 0 and oid not in active_ids:
+                self._recognition_cache.pop(oid, None)
 
         self._draw_ui(display, events, tracked, object_detections)
         mark_stage("rendering")
         stage_timings["total"] = round((time.perf_counter() - t0) * 1000.0, 3)
         self._last_stage_timings = stage_timings
         dt = time.perf_counter() - t0
+        self._scheduler.record_total_ms(stage_timings["total"])
         return (display, faces_info, hand_dets, object_detections,
                 events, len(tracked), dt)
 
@@ -4450,6 +4766,8 @@ def _publish_runtime_state(
             "visible_seconds": 0,
             "spoof_status": str(face.get("liveness_status") or (
                 "passed" if face.get("is_real", True) else "suspect")).lower(),
+            "quality_score": float(face.get("quality_score") or 0),
+            "quality_ok": bool(face.get("quality_ok", True)),
             "bbox": face.get("bbox"),
         }
         if name in ("UNKNOWN", "SPOOF") or name.startswith("STRANGER_"):
@@ -5033,6 +5351,8 @@ class RuntimeWorker(threading.Thread):
                 queue_depths=self.operations.queue_depths(),
                 latest_frame_age_ms=latest_age,
             )
+            with self.vision_lock:
+                performance["vision"] = self.vision.performance_snapshot()
             fps = performance.get("inference_fps", 0.0)
             worker_error = self.inference_worker.last_error or self.operations.last_error
             if self.capture_worker.last_error:
@@ -5283,7 +5603,7 @@ def main():
         width, height = 1280.0, 720.0
         valid = []
         for face in faces_info:
-            if not face.get("is_real", True):
+            if not face.get("attendance_eligible", face.get("is_real", True)):
                 continue
             name = str(face.get("name", "UNKNOWN"))
             if name in ("UNKNOWN", "SPOOF") or name.startswith("STRANGER_"):

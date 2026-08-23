@@ -8,6 +8,8 @@ export default function System({ state, connection }) {
   const performance = state.performance || {};
   const latency = performance.latency_ms || {};
   const counters = performance.counters || {};
+  const visionPerformance = performance.vision || {};
+  const visionCounters = visionPerformance;
 
   async function runCommand(command, confirmText) {
     if (confirmText && !window.confirm(confirmText)) return;
@@ -70,6 +72,8 @@ export default function System({ state, connection }) {
             ["Stale frames dropped", counters.stale_frames_dropped || 0],
             ["Side-effect queue", performance.queue_depths?.side_effects || 0],
             ["Critical queue drops", counters.critical_queue_drops || 0],
+            ["Recognition cache hits", visionCounters.recognition_cache_hits || 0],
+            ["ROI inference runs", visionCounters.roi_inference_runs || 0],
           ].map(([name, value]) => (
             <div className="system-row" key={name}>
               <span>{name}</span>

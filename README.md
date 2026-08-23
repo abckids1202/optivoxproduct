@@ -56,6 +56,8 @@ The live engine uses four bounded responsibilities:
 
 Performance metrics are included in `runtime/heartbeat.json` and `runtime/live_state.json` under `performance`. This sprint does not change model thresholds, recognition rules, or model selection. Use the reported `inference_fps`, `latency_ms`, `stages_ms`, queue depths, and drop counters before choosing any later model optimization.
 
+Sprint II adds adaptive active/idle schedules, stable-track recognition reuse, live face-quality gating, and padded person ROIs for hand/pose inference. The general object detector and face detector remain full-frame. The System page also reports recognition-cache hits and ROI inference runs so the effect can be checked during a real camera session.
+
 ## Demo Mode
 
 The frontend only uses sample data when `VITE_USE_DEMO_DATA=true`. In normal live mode, backend or engine outages are shown explicitly.
