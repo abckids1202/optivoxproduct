@@ -38,11 +38,23 @@ The engine publishes:
 - `runtime/heartbeat.json`: engine/camera/FPS heartbeat.
 - `runtime/live_state.json`: current detections, objects, security level, and recent live events.
 - `runtime/latest_frame.jpg`: latest annotated frame for the dashboard.
+- `runtime/capability.json`: runtime version, process identity, and available engine capabilities.
 - `runtime/commands.json`: pending web commands written by FastAPI.
 - `runtime/command_results.json`: command results written by the engine.
 - `runtime/enrollment_status.json`: current enrollment progress.
 
 All JSON writes use a temporary file then atomic replace.
+
+## Performance Runtime
+
+The live engine uses four bounded responsibilities:
+
+- capture owns `cv2.VideoCapture` and publishes one latest frame with a monotonic frame ID;
+- inference consumes the newest available frame and records stage timing, frame age, and stale-frame drops;
+- the display loop renders the newest completed result at a bounded UI rate;
+- operations persist attendance/events and dispatch alerts from bounded regular and critical queues.
+
+Performance metrics are included in `runtime/heartbeat.json` and `runtime/live_state.json` under `performance`. This sprint does not change model thresholds, recognition rules, or model selection. Use the reported `inference_fps`, `latency_ms`, `stages_ms`, queue depths, and drop counters before choosing any later model optimization.
 
 ## Demo Mode
 
@@ -50,7 +62,7 @@ The frontend only uses sample data when `VITE_USE_DEMO_DATA=true`. In normal liv
 
 ## Exhibition Procedure
 
-1. Start `moretesting.py`.
+1. Start `main.py` (the canonical vision runtime).
 2. Start FastAPI.
 3. Start React.
 4. Open the frontend in full screen.

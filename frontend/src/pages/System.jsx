@@ -1,8 +1,14 @@
-import { BellRing, Camera, Cpu, Database, HardDrive, Radio } from "lucide-react";
+import { BellRing, Camera, Cpu, Database, Gauge, HardDrive, Radio } from "lucide-react";
 import StatCard from "../components/StatCard";
 import { sendCommand } from "../services/api";
 
 export default function System({ state, connection }) {
+  const runtime = state.runtime || {};
+  const capabilities = runtime.capabilities || {};
+  const performance = state.performance || {};
+  const latency = performance.latency_ms || {};
+  const counters = performance.counters || {};
+
   async function runCommand(command, confirmText) {
     if (confirmText && !window.confirm(confirmText)) return;
     try {
@@ -18,7 +24,7 @@ export default function System({ state, connection }) {
       <div className="stats-grid four">
         <StatCard label="Engine" value={state.engine.status} detail={state.engine.uptime} icon={Cpu} tone="success" />
         <StatCard label="Camera" value={state.engine.camera} detail={state.engine.location} icon={Camera} tone="success" />
-        <StatCard label="Bridge" value={connection === "live" ? "Connected" : "Demo"} detail="FastAPI ready path" icon={Radio} tone="info" />
+        <StatCard label="Bridge" value={connection === "live" ? "Connected" : "Offline"} detail={runtime.version || "Runtime not reported"} icon={Radio} tone="info" />
         <StatCard label="Storage" value="Local" detail="SQLite and snapshots" icon={HardDrive} tone="neutral" />
       </div>
 
@@ -31,18 +37,43 @@ export default function System({ state, connection }) {
         </div>
         <div className="system-grid">
           {[
-            ["Face detector", "Active"],
-            ["Face recognizer", "Active"],
-            ["Object detector", "Active"],
-            ["Pose detector", "Active"],
-            ["Anti-spoofing", "Active"],
-            ["Danger model", "Optional"],
-            ["SQLite database", "Connected"],
-            ["Alert channels", "Configured"],
+            ["Face detector", capabilities.face_detection],
+            ["Face recognizer", capabilities.face_recognition],
+            ["Object detector", capabilities.object_detection],
+            ["Pose detector", capabilities.pose_detection],
+            ["Guided liveness", capabilities.guided_liveness],
+            ["Web enrollment", capabilities.web_enrollment],
+            ["Runtime bridge", capabilities.runtime_bridge],
+            ["SQLite database", "local"],
           ].map(([name, status]) => (
             <div className="system-row" key={name}>
               <span>{name}</span>
-              <strong>{status}</strong>
+              <strong>{typeof status === "boolean" ? (status ? "Available" : "Unavailable") : status}</strong>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Performance telemetry</p>
+            <h2>Live pipeline health</h2>
+          </div>
+          <Gauge size={20} aria-hidden="true" />
+        </div>
+        <div className="system-grid">
+          {[
+            ["Inference rate", `${performance.inference_fps || 0} FPS`],
+            ["Inference p95", `${latency.inference_p95 || 0} ms`],
+            ["Latest frame age", `${latency.latest_frame_age || 0} ms`],
+            ["Stale frames dropped", counters.stale_frames_dropped || 0],
+            ["Side-effect queue", performance.queue_depths?.side_effects || 0],
+            ["Critical queue drops", counters.critical_queue_drops || 0],
+          ].map(([name, value]) => (
+            <div className="system-row" key={name}>
+              <span>{name}</span>
+              <strong>{value}</strong>
             </div>
           ))}
         </div>

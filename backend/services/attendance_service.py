@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..database import execute, fetch_all, fetch_one
-from ..config import local_today
+from ..config import local_now, local_today
 from .audit_service import record_action
 
 
@@ -177,16 +177,17 @@ def clock_in(person_id: int) -> dict[str, Any]:
     if not person:
         raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
     today = local_today().isoformat()
+    now = local_now().isoformat(timespec="seconds")
     existing = fetch_one("select * from attendance where person_id=? and date=?", [person_id, today])
     if existing and existing.get("clock_in"):
         return {"status": "already_clocked_in", "record": normalize_attendance({**existing, "name": None, "role": None, "metadata_json": None})}
     execute(
         """
         insert into attendance (person_id, date, clock_in, late_minutes, notes)
-        values (?, ?, datetime('now'), 0, 'manual_web')
+        values (?, ?, ?, 0, 'manual_web')
         on conflict(person_id, date) do update set clock_in=coalesce(attendance.clock_in, excluded.clock_in), notes='manual_web'
         """,
-        [person_id, today],
+        [person_id, today, now],
     )
     record_action("attendance.clock_in", "attendance", person_id, {"method": "Manual", "date": today})
     return {"status": "clocked_in", "person_id": person_id}
@@ -197,10 +198,11 @@ def clock_out(person_id: int) -> dict[str, Any]:
     if not person:
         raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
     today = local_today().isoformat()
+    now = local_now().isoformat(timespec="seconds")
     existing = fetch_one("select * from attendance where person_id=? and date=?", [person_id, today])
     if not existing or not existing.get("clock_in"):
         raise HTTPException(status_code=400, detail={"code": "NOT_CLOCKED_IN", "message": "Person is not clocked in today."})
-    execute("update attendance set clock_out=datetime('now'), notes='manual_web' where person_id=? and date=?", [person_id, today])
+    execute("update attendance set clock_out=?, notes='manual_web' where person_id=? and date=?", [now, person_id, today])
     record_action("attendance.clock_out", "attendance", person_id, {"method": "Manual", "date": today})
     return {"status": "clocked_out", "person_id": person_id}
 

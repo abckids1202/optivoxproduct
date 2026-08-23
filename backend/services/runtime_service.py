@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
 
-from ..config import DEVICE_ID, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, TIMEZONE
+from ..config import CAPABILITY_PATH, DEVICE_ID, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, TIMEZONE
 
 
 def now_iso() -> str:
@@ -46,17 +46,41 @@ def heartbeat_state() -> dict[str, Any]:
     return {"status": status, "age_seconds": age, "heartbeat": hb}
 
 
+def capability_state() -> dict[str, Any]:
+    capabilities = read_json(CAPABILITY_PATH, {}) or {}
+    if not capabilities:
+        return {"available": False, "capabilities": {}}
+    return {
+        "available": True,
+        "runtime_id": capabilities.get("runtime_id"),
+        "runtime_version": capabilities.get("runtime_version"),
+        "pid": capabilities.get("pid"),
+        "started_at": capabilities.get("started_at"),
+        "generated_at": capabilities.get("generated_at"),
+        "capabilities": capabilities.get("capabilities", {}),
+    }
+
+
 def live_state() -> dict[str, Any]:
     hb = heartbeat_state()
+    capabilities = capability_state()
     state = read_json(LIVE_STATE_PATH, {}) or {}
     engine = state.get("engine", {})
     camera = state.get("camera", {})
     presence = state.get("presence", {})
     objects = state.get("objects", [])
     security = state.get("security", {})
+    performance = state.get("performance", {})
     return {
         "generatedAt": now_iso(),
         "device": {"id": DEVICE_ID, "type": "edge-agent", "biometric_owner": "local_engine"},
+        "runtime": {
+            "id": capabilities.get("runtime_id") or (hb.get("heartbeat") or {}).get("runtime_id"),
+            "version": capabilities.get("runtime_version") or (hb.get("heartbeat") or {}).get("runtime_version"),
+            "capabilities": capabilities.get("capabilities", {}),
+            "capability_available": capabilities.get("available", False),
+            "heartbeat_age_seconds": hb.get("age_seconds"),
+        },
         "localTime": datetime.now(TIMEZONE).strftime("%H:%M:%S"),
         "connection": hb["status"],
         "engine": {
@@ -73,6 +97,7 @@ def live_state() -> dict[str, Any]:
             "frameWidth": engine.get("frame_width"),
             "frameHeight": engine.get("frame_height"),
         },
+        "performance": performance,
         "security": {
             "level": security.get("level", "normal"),
             "message": security.get("message", "No active warning"),
@@ -93,11 +118,18 @@ def live_state() -> dict[str, Any]:
 
 def live_detections() -> dict[str, Any]:
     state = read_json(LIVE_STATE_PATH, {}) or {}
+    capabilities = capability_state()
     return {
+        "runtime": {
+            "id": capabilities.get("runtime_id") or state.get("runtime_id"),
+            "version": capabilities.get("runtime_version") or state.get("runtime_version"),
+            "capabilities": capabilities.get("capabilities", {}),
+        },
         "presence": state.get("presence", {"registered": [], "unknown": []}),
         "objects": state.get("objects", []),
         "recent_events": state.get("recent_events", []),
         "security": state.get("security", {}),
+        "performance": state.get("performance", {}),
         "timestamp": state.get("timestamp"),
     }
 

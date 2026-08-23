@@ -20,7 +20,9 @@ from email.mime.image import MIMEImage
 from email.mime.application import MIMEApplication
 from collections import OrderedDict, deque, defaultdict
 from typing import Optional, Any, Dict, List, Tuple
-from datetime import datetime as dt_datetime, timedelta, date as dt_date
+from datetime import datetime as dt_datetime, timedelta, date as dt_date, timezone as dt_timezone
+from zoneinfo import ZoneInfo
+from runtime_performance import LatestFrameBuffer, LatestInferenceState, PerformanceProfiler
 
 #Optional try and error
 try:
@@ -248,11 +250,11 @@ CONFIG: Dict[str, Any] = {
     "POSE_HISTORY_FRAMES": 30,
     "DEPTH_VARIANCE_THRESHOLD": 0.004,
     "ANTI_SPOOF_MODEL_PATH": "antispoof_model.bin",
-    "REQUIRED_CHECKS_PASSED": 1,
+    "REQUIRED_CHECKS_PASSED": 2,
     "WARMUP_FRAMES": 12,
     "SUSPECT_CONFIRM_FRAMES": 4,
     "SUSPECT_WINDOW_FRAMES": 8,
-    "UNCERTAIN_BLOCKS_ATTENDANCE": False,
+    "UNCERTAIN_BLOCKS_ATTENDANCE": True,
 },
 
     "CUSTOM_OBJECTS": {
@@ -281,6 +283,13 @@ CONFIG: Dict[str, Any] = {
     "HAND_EVERY_N_FRAMES": 4,
     "POSE_EVERY_N_FRAMES": 4,
     "RECOGNITION_CACHE_TTL_SEC": 4.0,
+    "ENABLE_PROFILING": True,
+    "PROFILER_WINDOW_FRAMES": 120,
+    "MAX_INFERENCE_FRAME_AGE_MS": 250,
+    "CAPTURE_BUFFER_SIZE": 1,
+    "SIDE_EFFECT_QUEUE_SIZE": 256,
+    "CRITICAL_QUEUE_SIZE": 64,
+    "DISPLAY_LOOP_FPS": 30,
     },
 
     #Attendance
@@ -385,11 +394,29 @@ _YOLO_NAME_TO_CATEGORY_OVERRIDE = {
 }
 
 # Section 3: Utilities
+_APP_TIMEZONE = ZoneInfo(os.environ.get("OPTIVOX_TIMEZONE", "Asia/Jakarta"))
+
+
+def _utc_datetime() -> dt_datetime:
+    return dt_datetime.now(dt_timezone.utc)
+
+
+def _local_datetime() -> dt_datetime:
+    return dt_datetime.now(_APP_TIMEZONE)
+
+
 def _utc_now() -> str:
-    return dt_datetime.utcnow().isoformat()
+    return _utc_datetime().isoformat(timespec="milliseconds")
 
 def _today_iso() -> str:
-    return dt_date.today().isoformat()
+    return _local_datetime().date().isoformat()
+
+
+def _parse_timestamp(value: str) -> dt_datetime:
+    parsed = dt_datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_timezone.utc)
+    return parsed
 
 def _format_duration(seconds: float) -> str:
     if seconds < 60: return f"{int(seconds)}s"
@@ -789,6 +816,15 @@ class EventDatabase:
         row = self._fetchone("SELECT id FROM people WHERE name=?", (name,))
         return row["id"] if row else None
 
+    def get_active_person_id(self, name: str):
+        row = self._fetchone("SELECT id, metadata_json FROM people WHERE name=?", (name,))
+        if not row:
+            return None
+        metadata = _safe_json_parse(row["metadata_json"])
+        if isinstance(metadata, dict) and metadata.get("active") is False:
+            return None
+        return row["id"]
+
     def get_known_face_names(self, limit=1000, offset=0):
         return self._fetchall(
             "SELECT id, name, role, thumbnail_path, created_at FROM people "
@@ -817,7 +853,7 @@ class EventDatabase:
             self.conn.execute("""
                 INSERT INTO event_stats_hourly (hour, event_type, count) VALUES (?, ?, 1)
                 ON CONFLICT(hour, event_type) DO UPDATE SET count = count + 1
-            """, (dt_datetime.utcnow().strftime("%Y-%m-%d %H:00"), event_type))
+            """, (_utc_datetime().strftime("%Y-%m-%d %H:00"), event_type))
             self.conn.commit()
 
     def get_recent_events(self, limit=100):
@@ -827,7 +863,7 @@ class EventDatabase:
             ORDER BY e.timestamp DESC LIMIT ?""", (limit,))
 
     def get_event_summary(self, days=7):
-        since = (dt_datetime.utcnow() - timedelta(days=days)).date().isoformat()
+        since = (_utc_datetime() - timedelta(days=days)).date().isoformat()
         return self._fetchall("""
             SELECT event_type, SUM(count) AS total FROM event_stats_daily
             WHERE date >= ? GROUP BY event_type ORDER BY total DESC""", (since,))
@@ -845,7 +881,7 @@ class EventDatabase:
             ORDER BY timestamp DESC LIMIT ?""", (person_id, limit))
 
     def search_events(self, query, days=7, limit=30):
-        since = (dt_datetime.utcnow() - timedelta(days=days)).isoformat()
+        since = (_utc_datetime() - timedelta(days=days)).isoformat()
         like = f"%{query}%"
         return self._fetchall("""
             SELECT e.*, p.name AS person_name FROM events e
@@ -867,7 +903,7 @@ class EventDatabase:
             return {"already_clocked_in": True, "clock_in": existing["clock_in"]}
         work_start = CONFIG["ATTENDANCE"]["WORK_START_HOUR"]
         grace = CONFIG["ATTENDANCE"]["LATE_GRACE_MIN"]
-        now_local = dt_datetime.now()
+        now_local = _local_datetime()
         scheduled = now_local.replace(hour=work_start, minute=0, second=0, microsecond=0)
         late = max(0, int((now_local - scheduled).total_seconds() / 60) - grace)
         with self.lock:
@@ -891,8 +927,8 @@ class EventDatabase:
             return {"error": "Not clocked in today"}
         now = _utc_now()
         try:
-            ci = dt_datetime.fromisoformat(existing["clock_in"])
-            co = dt_datetime.fromisoformat(now)
+            ci = _parse_timestamp(existing["clock_in"])
+            co = _parse_timestamp(now)
             work_min = max(0, int((co - ci).total_seconds() / 60))
         except Exception:
             work_min = 0
@@ -904,7 +940,7 @@ class EventDatabase:
         return {"clocked_out_at": now, "work_minutes": work_min}
 
     def attendance_report(self, days=7, person_id=None):
-        since = (dt_date.today() - timedelta(days=days)).isoformat()
+        since = (_local_datetime().date() - timedelta(days=days)).isoformat()
         if person_id is not None:
             return self._fetchall("""
                 SELECT a.*, p.name FROM attendance a
@@ -1955,7 +1991,9 @@ class DepthEstimator:
     def is_consistent(self):
         if len(self.history) < 10: return True
         var = float(np.var(np.array(self.history)))
-        return var >= self.cfg.get("DEPTH_VARIANCE_THRESHOLD", 0.01)
+        # A stable apparent depth has low variance. High variance indicates
+        # unstable scale/depth evidence and must not pass this check.
+        return var <= self.cfg.get("DEPTH_VARIANCE_THRESHOLD", 0.01)
 
 
 class AntiSpoofDetector:
@@ -2003,7 +2041,7 @@ class AntiSpoofDetector:
 
         strictness = self.cfg.get("STRICTNESS", "normal").lower()
         movement_thr = {"low": 0.20, "normal": 0.35, "high": 0.65}.get(strictness, 0.35)
-        required = int(self.cfg.get("REQUIRED_CHECKS_PASSED", 1))
+        required = int(self.cfg.get("REQUIRED_CHECKS_PASSED", 2))
 
         has_movement = pose_var > movement_thr
         has_blinks = blink_n >= int(self.cfg.get("MIN_BLINKS_FOR_LIVENESS", 1))
@@ -2743,12 +2781,21 @@ class VisionSystem:
                     )
                     spoof_confirmed = recent_suspects >= needed
 
+            uncertain_blocks_attendance = bool(
+                self.cfg["ANTI_SPOOFING"].get("UNCERTAIN_BLOCKS_ATTENDANCE", True)
+            )
+            liveness_blocks_attendance = uncertain_blocks_attendance and spoof_status in {
+                AntiSpoofDetector.UNCERTAIN,
+                AntiSpoofDetector.SUSPECT,
+            }
             is_real = not spoof_confirmed
+            attendance_eligible = not spoof_confirmed and not liveness_blocks_attendance
 
             if spoof_confirmed:
                 self._draw_face_box(frame, x1, y1, x2, y2, "SPOOF", 0.0, oid, False)
                 info.append({"oid": oid, "name": "SPOOF", "confidence": 0.0,
                              "bbox": (x1, y1, x2, y2), "is_real": False,
+                             "attendance_eligible": False,
                              "spoof_status": spoof_status,
                              "spoof_details": spoof_details,
                              "yaw": yaw})
@@ -2808,6 +2855,7 @@ class VisionSystem:
 
             info.append({"oid": oid, "name": name, "confidence": conf,
                          "bbox": (x1, y1, x2, y2), "is_real": is_real,
+                         "attendance_eligible": attendance_eligible,
                          "reason": reason, "age": age, "gender": gender,
                          "yaw": yaw, "liveness_status": spoof_status,
                          "liveness_details": spoof_details})
@@ -2908,7 +2956,17 @@ class VisionSystem:
         return frame
 
     def process(self, frame):
-        t0 = time.time()
+        t0 = time.perf_counter()
+        stage_started = t0
+        stage_timings = {}
+
+        def mark_stage(name):
+            nonlocal stage_started
+            now = time.perf_counter()
+            stage_timings[name] = round((now - stage_started) * 1000.0, 3)
+            stage_started = now
+
+        self._last_stage_timings = {}
         events: List[tuple] = []
         h, w = frame.shape[:2]
         self.behavior.set_frame_size(h, w)
@@ -2928,6 +2986,7 @@ class VisionSystem:
                 face_objects = self._last_face_objects or []
         else:
             face_objects = self._last_face_objects
+        mark_stage("face_detection")
 
         hand_every = max(1, int(perf.get("HAND_EVERY_N_FRAMES", 4)))
         if self._frame_count % hand_every == 0 or not self._last_hand_dets:
@@ -2936,6 +2995,7 @@ class VisionSystem:
 
         if self.cfg.get("SHOW_HAND_LANDMARKS", False):
             self.hand_detector.draw(display, hand_dets)
+        mark_stage("hands_and_overlays")
 
         object_detections = []
         yolo_every = max(1, int(perf.get("YOLO_EVERY_N_FRAMES", 3)))
@@ -2987,6 +3047,8 @@ class VisionSystem:
 
             object_detections.extend(danger_dets)
 
+        mark_stage("objects_and_danger")
+
         if self.cfg.get("SHOW_OBJECT_BOXES", True) and self.object_detector is not None:
             self.object_detector.draw_detections(display, object_detections, skip_person=True)
         
@@ -3009,6 +3071,7 @@ class VisionSystem:
 
         events.extend(self.behavior.update(tracked))
         events.extend(self.crowd_intel.update(tracked, frame_size=(h, w)))
+        mark_stage("tracking_and_behavior")
 
         try:
             pose_every = max(1, int(perf.get("POSE_EVERY_N_FRAMES", 4)))
@@ -3023,8 +3086,10 @@ class VisionSystem:
                 self.pose_detector.draw(display, pose_result)
         except Exception as e:
             print(f"[WARN] pose analysis failed: {e}")
+        mark_stage("pose")
 
         faces_info = self._recognize_and_draw(display, face_objects, tracked)
+        mark_stage("recognition_and_liveness")
 
         self._last_faces_seen = []
         for fi in faces_info:
@@ -3039,6 +3104,7 @@ class VisionSystem:
                 "name": fi.get("name"),
                 "confidence": float(fi.get("confidence", 0.0)),
                 "is_real": bool(fi.get("is_real", True)),
+                "attendance_eligible": bool(fi.get("attendance_eligible", fi.get("is_real", True))),
                 "yaw": fi.get("yaw"),
                 "liveness_status": fi.get("liveness_status"),
                 "bbox": fi.get("bbox"),
@@ -3130,7 +3196,10 @@ class VisionSystem:
         self._cleanup_strangers()
 
         self._draw_ui(display, events, tracked, object_detections)
-        dt = time.time() - t0
+        mark_stage("rendering")
+        stage_timings["total"] = round((time.perf_counter() - t0) * 1000.0, 3)
+        self._last_stage_timings = stage_timings
+        dt = time.perf_counter() - t0
         return (display, faces_info, hand_dets, object_detections,
                 events, len(tracked), dt)
 
@@ -3143,6 +3212,7 @@ class AttendanceManager:
         self._recognitions: Dict[str, deque] = defaultdict(
             lambda: deque(maxlen=self.cfg.get("MIN_RECOGNITION_FRAMES", 8) * 4))
         self._today_clocked_in: set = set()
+        self._unregistered_logged: set = set()
         self._announce = self.cfg.get("ANNOUNCE_ARRIVAL", True)
         self._date = _today_iso()
 
@@ -3150,6 +3220,7 @@ class AttendanceManager:
         today = _today_iso()
         if today != self._date:
             self._today_clocked_in.clear()
+            self._unregistered_logged.clear()
             self._date = today
 
     def handle_recognition(self, person_name: str, camera_id: str = "cam_0", location: str = None):
@@ -3167,10 +3238,17 @@ class AttendanceManager:
         min_frames = self.cfg.get("MIN_RECOGNITION_FRAMES", 8)
         if (len(self._recognitions[person_name]) >= min_frames
                 and person_name not in self._today_clocked_in):
-            pid = self.db.get_person_id(person_name)
+            pid = self.db.get_active_person_id(person_name)
             if pid is None:
-                # auto-create lightweight people row
-                pid = self.db.upsert_person(person_name)
+                if person_name not in self._unregistered_logged:
+                    self.db.log_audit(
+                        "ATTENDANCE_REJECTED_UNREGISTERED",
+                        person_name,
+                        {"reason": "recognized label is not an active roster person"},
+                    )
+                    self._unregistered_logged.add(person_name)
+                self._recognitions[person_name].clear()
+                return
             result = self.db.attendance_clock_in(pid, camera_id, location)
             self._today_clocked_in.add(person_name)
             if "clocked_in_at" in result:
@@ -3191,7 +3269,7 @@ class AttendanceManager:
         if person_name in ("UNKNOWN", "SPOOF") or person_name.startswith("STRANGER_"):
             return {"error": "Only a recognized enrolled person can clock in"}
         self._maybe_rollover()
-        pid = self.db.get_person_id(person_name)
+        pid = self.db.get_active_person_id(person_name)
         if pid is None:
             return {"error": f"No database person found for {person_name}"}
         result = self.db.attendance_clock_in(pid, camera_id, location)
@@ -3326,7 +3404,7 @@ def _build_system_prompt() -> str:
         " - For security events, lead with severity.\n"
         " - If user asks about someone, fetch their events AND attendance.\n"
         " - Never invent data. If a tool returns nothing, say so.\n"
-        f"Current UTC time: {dt_datetime.utcnow().strftime('%Y-%m-%d %H:%M')}\n"
+        f"Current UTC time: {_utc_datetime().strftime('%Y-%m-%d %H:%M')}\n"
     )
 
 
@@ -4150,7 +4228,7 @@ def _draw_center_attendance_guide(display, ui, cfg):
 
 
 def _draw_command_panel(display, faces_info, events, vision, db, assistant, ui,
-                        cam_id, cam_location):
+                        cam_id, cam_location, performance=None):
     """Render live controls and system details beside the annotated camera frame."""
     height, width = display.shape[:2]
     panel_width = 370
@@ -4192,9 +4270,12 @@ def _draw_command_panel(display, faces_info, events, vision, db, assistant, ui,
     cv2.line(canvas, (px, 0), (px, height), (18, 70, 105), 1, cv2.LINE_AA)
     line("OPTIVOX CONTROL CENTER", 25, (235, 248, 255), 0.57, 2)
     line("LOCAL-FIRST COMPUTER VISION", 47, (42, 193, 245), 0.37, 1)
-    fps = getattr(vision, "_fps", 0.0)
+    performance = performance or {}
+    fps = float(performance.get("inference_fps", getattr(vision, "_fps", 0.0)) or 0.0)
+    frame_age = float((performance.get("latency_ms") or {}).get("latest_frame_age", 0.0) or 0.0)
     line(f"CAMERA: ONLINE   {cam_id} / {cam_location}", 71, (225, 239, 248), 0.39, 1)
-    line(f"FPS {fps:.1f}   FACES {len(faces_info)}   DB {db.get_face_count()}", 91, (225, 239, 248))
+    line(f"AI {fps:.1f} FPS   AGE {frame_age:.0f}ms   FACES {len(faces_info)}", 91, (225, 239, 248))
+    line(f"DB {db.get_face_count()}   BUF {performance.get('queue_depths', {}).get('side_effects', 0)}", 108, (170, 190, 205), 0.37)
 
     button("ENROLL PERSON", 14, 105, color=(42, 193, 245))
     button("ASK ASSISTANT", 184, 105, color=(42, 145, 235))
@@ -4260,12 +4341,754 @@ def _draw_command_panel(display, faces_info, events, vision, db, assistant, ui,
     line("Q QUIT | CLICK | K CENTER ATTENDANCE | E ENROLL", height - 5, (170, 185, 198), 0.32)
     return canvas
 
-#Main function
+# Runtime bridge
+RUNTIME_VERSION = "2.1.0"
+RUNTIME_ID = os.environ.get("OPTIVOX_RUNTIME_ID", "edge-local-01")
+
+
+def _runtime_dir() -> str:
+    path = os.path.join(_BASE_DIR, "runtime")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _atomic_json_write(path: str, data: dict):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, default=str)
+    os.replace(tmp, path)
+
+
+def _runtime_now() -> str:
+    return dt_datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def _runtime_capabilities(vision=None) -> dict:
+    danger_enabled = bool(CONFIG.get("DANGER_DETECTION", {}).get("ENABLED", False))
+    return {
+        "face_detection": bool(INSIGHTFACE_AVAILABLE),
+        "face_recognition": bool(INSIGHTFACE_AVAILABLE),
+        "attendance": bool(CONFIG.get("ATTENDANCE", {}).get("ENABLED", True)),
+        "guided_liveness": bool(CONFIG.get("ATTENDANCE", {}).get("CENTER_MODE_REQUIRE_LIVENESS", True)),
+        "object_detection": bool(YOLO_AVAILABLE),
+        "pose_detection": bool(MEDIAPIPE_AVAILABLE),
+        "hand_detection": bool(MEDIAPIPE_AVAILABLE),
+        "danger_detection": danger_enabled,
+        "web_enrollment": vision is not None,
+        "voice_assistant": bool(STT_AVAILABLE),
+        "runtime_bridge": True,
+    }
+
+
+def _publish_runtime_capabilities(runtime_dir: str, started_at: str, vision=None):
+    _atomic_json_write(os.path.join(runtime_dir, "capability.json"), {
+        "schema_version": 1,
+        "runtime_id": RUNTIME_ID,
+        "runtime_version": RUNTIME_VERSION,
+        "pid": os.getpid(),
+        "started_at": started_at,
+        "generated_at": _runtime_now(),
+        "capabilities": _runtime_capabilities(vision),
+    })
+
+
+def _publish_runtime_heartbeat(
+    runtime_dir: str,
+    engine_status: str,
+    camera_status: str,
+    fps: float,
+    started_at: str,
+    last_error=None,
+    performance=None,
+    frame_id=None,
+    frame_age_ms=None,
+):
+    timestamp = _runtime_now()
+    _atomic_json_write(os.path.join(runtime_dir, "heartbeat.json"), {
+        "schema_version": 1,
+        "runtime_id": RUNTIME_ID,
+        "runtime_version": RUNTIME_VERSION,
+        "pid": os.getpid(),
+        "started_at": started_at,
+        "timestamp": timestamp,
+        "last_heartbeat": timestamp,
+        "engine_status": str(engine_status).upper(),
+        "camera_status": str(camera_status).upper(),
+        "fps": round(float(fps or 0), 2),
+        "last_error": last_error,
+        "frame_id": frame_id,
+        "frame_age_ms": round(float(frame_age_ms or 0), 2),
+        "performance": performance or {},
+    })
+
+
+def _publish_runtime_state(
+    runtime_dir: str,
+    vision,
+    display,
+    cam_id: str,
+    location: str,
+    fps: float,
+    started_epoch: float,
+    started_at: str,
+    events: list,
+    last_error=None,
+    source_result=None,
+    performance=None,
+):
+    faces = getattr(vision, "_last_faces_seen", []) or []
+    registered = []
+    unknown = []
+    for face in faces:
+        name = str(face.get("name") or "UNKNOWN")
+        item = {
+            "track_id": face.get("track_id"),
+            "name": name,
+            "temporary_name": name,
+            "confidence": float(face.get("confidence") or 0),
+            "attendance_status": "present",
+            "visible_seconds": 0,
+            "spoof_status": str(face.get("liveness_status") or (
+                "passed" if face.get("is_real", True) else "suspect")).lower(),
+            "bbox": face.get("bbox"),
+        }
+        if name in ("UNKNOWN", "SPOOF") or name.startswith("STRANGER_"):
+            unknown.append(item)
+        else:
+            registered.append(item)
+
+    object_counts = {}
+    for obj in getattr(vision, "_last_objects_seen", []) or []:
+        name = str(obj.get("class_name") or "object")
+        object_counts.setdefault(name, {
+            "class_name": name,
+            "count": 0,
+            "confidence": 0.0,
+            "category": obj.get("category"),
+        })
+        object_counts[name]["count"] += 1
+        object_counts[name]["confidence"] = max(
+            object_counts[name]["confidence"],
+            float(obj.get("confidence") or 0),
+        )
+
+    active_events = []
+    for index, evt in enumerate((events or [])[-10:]):
+        try:
+            active_events.append({
+                "id": f"live_{int(time.time() * 1000)}_{index}",
+                "time": _runtime_now(),
+                "type": evt[0],
+                "severity": "Critical" if evt[0] in _SEVERE_EVENT_TYPES else "Warning",
+                "person": evt[1] if len(evt) > 1 else "System",
+                "location": location,
+                "confidence": float(evt[2]) if len(evt) > 2 else 0,
+                "details": evt[3] if len(evt) > 3 else "",
+            })
+        except Exception:
+            continue
+
+    height, width = display.shape[:2] if display is not None else (None, None)
+    security_level = (
+        "critical" if any(e.get("severity") == "Critical" for e in active_events)
+        else ("attention" if unknown or active_events else "normal")
+    )
+    _atomic_json_write(os.path.join(runtime_dir, "live_state.json"), {
+        "schema_version": 1,
+        "runtime_id": RUNTIME_ID,
+        "runtime_version": RUNTIME_VERSION,
+        "timestamp": _runtime_now(),
+        "source_frame_id": source_result.get("frame_id") if source_result else None,
+        "source_capture_timestamp": source_result.get("captured_at") if source_result else None,
+        "inference_completed_at": source_result.get("completed_at") if source_result else None,
+        "frame_age_ms": round(float((source_result or {}).get("frame_age_ms") or 0), 2),
+        "performance": performance or {},
+        "engine": {
+            "status": "online",
+            "uptime_seconds": round(time.time() - started_epoch, 1),
+            "fps": round(float(fps or 0), 2),
+            "frame_width": width,
+            "frame_height": height,
+            "last_error": last_error,
+        },
+        "camera": {
+            "status": "connected",
+            "id": cam_id,
+            "name": cam_id,
+            "location": location,
+        },
+        "security": {
+            "level": security_level,
+            "message": "Unknown person detected" if unknown else (
+                "Security event active" if active_events else "No active warning"
+            ),
+            "active_event_count": len(active_events),
+        },
+        "presence": {"registered": registered, "unknown": unknown},
+        "objects": list(object_counts.values()),
+        "recent_events": active_events,
+    })
+
+
+def _publish_runtime_frame(runtime_dir: str, display, quality: int = 78):
+    if display is None:
+        return
+    tmp = os.path.join(runtime_dir, "latest_frame.tmp.jpg")
+    final = os.path.join(runtime_dir, "latest_frame.jpg")
+    if cv2.imwrite(tmp, display, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]):
+        os.replace(tmp, final)
+
+
+def _read_pending_runtime_commands(runtime_dir: str) -> list:
+    path = os.path.join(runtime_dir, "commands.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        commands = data.get("commands", []) if isinstance(data, dict) else data
+        return [cmd for cmd in commands if cmd.get("status") == "pending"]
+    except Exception:
+        return []
+
+
+def _write_runtime_command_result(runtime_dir: str, result: dict):
+    path = os.path.join(runtime_dir, "command_results.json")
+    results = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            results = data.get("results", []) if isinstance(data, dict) else data
+        except Exception:
+            results = []
+    results = [item for item in results if item.get("id") != result.get("id")][-100:]
+    results.append(result)
+    _atomic_json_write(path, {"results": results})
+
+
+def _mark_runtime_commands_completed(runtime_dir: str, handled_ids: set):
+    path = os.path.join(runtime_dir, "commands.json")
+    if not handled_ids or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        commands = data.get("commands", []) if isinstance(data, dict) else data
+        for command in commands:
+            if command.get("id") in handled_ids:
+                command["status"] = "completed"
+        _atomic_json_write(path, {"commands": commands})
+    except Exception:
+        pass
+
+
+def _set_enrollment_status(runtime_dir: str, stage: str, message: str, extra=None):
+    data = {"stage": stage, "message": message, "updated_at": _runtime_now()}
+    if extra:
+        data.update(extra)
+    _atomic_json_write(os.path.join(runtime_dir, "enrollment_status.json"), data)
+
+
+def _process_runtime_commands(
+    runtime_dir: str,
+    db,
+    attendance,
+    alert_mgr,
+    vision,
+    last_raw_frame,
+    snapshot_dir: str,
+    cam_id: str,
+    cam_location: str,
+):
+    handled = set()
+    for command in _read_pending_runtime_commands(runtime_dir):
+        command_id = command.get("id")
+        command_type = command.get("type")
+        payload = command.get("payload") or {}
+        result = {
+            "id": command_id,
+            "type": command_type,
+            "status": "completed",
+            "completed_at": _runtime_now(),
+            "result": {},
+            "error": None,
+        }
+        try:
+            if command_type == "save_snapshot":
+                if last_raw_frame is None:
+                    raise RuntimeError("No frame is available for a snapshot.")
+                path = _save_snapshot(snapshot_dir, "MANUAL", "web", last_raw_frame)
+                result["result"] = {"message": "Snapshot saved successfully.", "snapshot_path": path}
+            elif command_type == "test_alert":
+                result["result"] = {"message": "Test alert requested.", "channels": alert_mgr.test_alert()}
+            elif command_type == "manual_clock_in":
+                person_id = payload.get("person_id")
+                if not person_id:
+                    raise RuntimeError("person_id is required.")
+                person = db._fetchone("SELECT id FROM people WHERE id=?", (int(person_id),))
+                if not person:
+                    raise RuntimeError("The selected person is not in the roster.")
+                result["result"] = db.attendance_clock_in(int(person_id), cam_id, cam_location)
+            elif command_type == "manual_clock_out":
+                person_id = payload.get("person_id")
+                name = str(payload.get("name") or "").strip()
+                if not name and person_id:
+                    person = db._fetchone("SELECT name FROM people WHERE id=?", (int(person_id),))
+                    name = str(person["name"]) if person else ""
+                if not name:
+                    raise RuntimeError("name or person_id is required.")
+                result["result"] = attendance.manual_clock_out(name)
+            elif command_type in {"start_enrollment", "register_visible_unknown"}:
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    raise RuntimeError("name is required.")
+                _set_enrollment_status(
+                    runtime_dir,
+                    "capturing",
+                    f"Registering the visible face as {name}.",
+                    {"mode": "visible_face", "person_name": name},
+                )
+                ok = vision.enroll_best_visible_face(name)
+                if not ok:
+                    _set_enrollment_status(runtime_dir, "failed", "No visible unknown face was available.")
+                    raise RuntimeError("No visible unknown face was available.")
+                db.upsert_person(name)
+                db.log_audit("ENROLL_VISIBLE_FACE_WEB", name, payload)
+                _set_enrollment_status(
+                    runtime_dir,
+                    "completed",
+                    f"{name} enrolled from the visible face.",
+                    {"mode": "visible_face", "person_name": name},
+                )
+                result["result"] = {
+                    "message": f"{name} enrolled.",
+                    "mode": "visible_face",
+                }
+            elif command_type == "cancel_enrollment":
+                _set_enrollment_status(runtime_dir, "cancelled", "Enrollment cancelled.")
+                result["result"] = {"message": "Enrollment cancelled."}
+            elif command_type == "reset_demo_data":
+                result["result"] = {"message": "Demo reset is intentionally non-destructive."}
+            else:
+                raise RuntimeError(f"Unsupported command: {command_type}")
+        except Exception as exc:
+            result["status"] = "failed"
+            result["error"] = str(exc)
+        handled.add(command_id)
+        _write_runtime_command_result(runtime_dir, result)
+    _mark_runtime_commands_completed(runtime_dir, handled)
+
+
+class LatestFrameCaptureProxy:
+    """VideoCapture-compatible reader for workflows using the latest buffer."""
+
+    def __init__(self, frame_buffer):
+        self.frame_buffer = frame_buffer
+        self._last_frame_id = 0
+
+    def read(self):
+        packet = self.frame_buffer.wait_for_latest(self._last_frame_id, timeout=0.5)
+        if not packet:
+            return False, None
+        self._last_frame_id = packet["frame_id"]
+        return True, packet["frame"].copy()
+
+    def isOpened(self):
+        return not self.frame_buffer.metrics().get("closed", False)
+
+    def release(self):
+        return None
+
+
+def _compact_inference_result(result):
+    """Drop the annotated image before putting a result on side-effect queues."""
+    return {
+        "frame_id": result.get("frame_id"),
+        "captured_at": result.get("captured_at"),
+        "faces_info": list(result.get("faces_info") or []),
+        "events": list(result.get("events") or []),
+        "evidence_frame": result.get("evidence_frame"),
+    }
+
+
+def _process_runtime_side_effects(
+    task,
+    db,
+    attendance,
+    alert_mgr,
+    snapshot_dir,
+    cam_id,
+    cam_location,
+    attendance_lock,
+    center_mode_getter,
+):
+    """Persist attendance/events and dispatch alerts outside model inference."""
+    if not center_mode_getter():
+        for face in task.get("faces_info") or []:
+            name = str(face.get("name") or "UNKNOWN")
+            eligible = face.get("attendance_eligible", face.get("is_real", True))
+            if (eligible and name not in ("UNKNOWN", "SPOOF")
+                    and not name.startswith("STRANGER_")):
+                try:
+                    with attendance_lock:
+                        attendance.handle_recognition(name, cam_id, cam_location)
+                except Exception as exc:
+                    print(f"[ERROR] Attendance update failed: {exc}")
+
+    for evt in task.get("events") or []:
+        try:
+            event_type = evt[0]
+            target = evt[1] if len(evt) > 1 else "SYSTEM"
+            confidence = float(evt[2]) if len(evt) > 2 else 0.0
+            details = evt[3] if len(evt) > 3 else ""
+        except (IndexError, TypeError, ValueError):
+            continue
+
+        snapshot_path = None
+        evidence_frame = task.get("evidence_frame")
+        if event_type in _SEVERE_EVENT_TYPES and evidence_frame is not None:
+            snapshot_path = _save_snapshot(
+                snapshot_dir, event_type, target, evidence_frame)
+
+        pid = None
+        if (target not in ("SYSTEM", "UNKNOWN", "PERSON")
+                and not str(target).startswith(("STRANGER_", "ID_", "AREA_", "ZONE_"))):
+            pid = db.get_person_id(target)
+
+        try:
+            db.log_event(
+                event_type=event_type,
+                person_id=pid,
+                confidence=confidence,
+                details=details,
+                snapshot_path=snapshot_path,
+                camera_id=cam_id,
+                location=cam_location,
+                severity=_SEVERITY_MAP.get(event_type, 0),
+            )
+        except Exception as exc:
+            print(f"[ERROR] log_event failed: {exc}")
+
+        if event_type in _SEVERE_EVENT_TYPES:
+            try:
+                alert_mgr.check_and_alert(
+                    event_type=event_type,
+                    name=str(target),
+                    confidence=confidence,
+                    details=details,
+                    snapshot_path=snapshot_path,
+                )
+            except Exception as exc:
+                print(f"[ERROR] Alert dispatch failed: {exc}")
+
+        if event_type == "DANGEROUS_OBJECT":
+            voice(f"Warning. Dangerous object detected: {target}.",
+                  "CRITICAL", dedup_key=f"danger:{target}")
+        elif event_type == "WEAPON_DETECTED":
+            voice(f"Warning. Weapon detected: {target}.",
+                  "CRITICAL", dedup_key=f"weapon:{target}")
+        elif event_type == "FIRE_DETECTED":
+            voice("Warning. Fire or flame detected.", "CRITICAL", dedup_key="fire")
+        elif event_type == "SMOKE_DETECTED":
+            voice("Warning. Smoke detected.", "CRITICAL", dedup_key="smoke")
+        elif event_type == "SPOOF_DETECTED":
+            voice("Warning. Possible spoofed face detected.",
+                  "WARN", dedup_key=f"spoof:{target}")
+        elif event_type == "FALL_DETECTED":
+            voice("Alert. Possible fall detected. Please check.",
+                  "WARN", dedup_key="fall")
+        elif event_type == "EVACUATION_ALERT":
+            voice("Emergency. Possible evacuation in progress.",
+                  "CRITICAL", dedup_key="evac")
+        elif event_type == "CONGESTION":
+            voice(f"Notice. Crowd congestion at {target}.",
+                  "WARN", dedup_key=f"cong:{target}")
+
+
+class CameraCaptureWorker(threading.Thread):
+    def __init__(self, capture, frame_buffer, profiler, stop_event, target_size=(1280, 720)):
+        super().__init__(name="optivox-camera", daemon=True)
+        self.capture = capture
+        self.frame_buffer = frame_buffer
+        self.profiler = profiler
+        self.stop_event = stop_event
+        self.target_size = target_size
+        self.last_error = None
+        self.frames_read = 0
+
+    def run(self):
+        try:
+            while not self.stop_event.is_set():
+                ret, frame = self.capture.read()
+                captured_at = time.time()
+                if not ret or frame is None:
+                    self.last_error = "Camera read failed."
+                    time.sleep(0.05)
+                    continue
+                width, height = self.target_size
+                if frame.shape[1] != width or frame.shape[0] != height:
+                    frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+                replaced = bool(self.frame_buffer.metrics().get("frame_id"))
+                self.frame_buffer.publish(frame, captured_at)
+                self.profiler.record_capture(replaced=replaced)
+                self.frames_read += 1
+                self.last_error = None
+        except Exception as exc:
+            self.last_error = str(exc)
+            print(f"[CAPTURE] Worker stopped: {exc}")
+        finally:
+            try:
+                self.capture.release()
+            except Exception:
+                pass
+
+
+class InferenceWorker(threading.Thread):
+    def __init__(self, vision, frame_buffer, inference_state, profiler,
+                 side_effect_worker, stop_event, vision_lock, max_age_ms):
+        super().__init__(name="optivox-inference", daemon=True)
+        self.vision = vision
+        self.frame_buffer = frame_buffer
+        self.inference_state = inference_state
+        self.profiler = profiler
+        self.side_effect_worker = side_effect_worker
+        self.stop_event = stop_event
+        self.vision_lock = vision_lock
+        self.max_age_ms = max(1, int(max_age_ms))
+        self.last_error = None
+        self._last_frame_id = 0
+
+    def run(self):
+        try:
+            while not self.stop_event.is_set():
+                packet = self.frame_buffer.wait_for_latest(self._last_frame_id, timeout=0.2)
+                if packet is None:
+                    continue
+                self._last_frame_id = packet["frame_id"]
+                if packet["age_ms"] > self.max_age_ms:
+                    self.profiler.record_stale_drop()
+                    continue
+                started = time.perf_counter()
+                try:
+                    with self.vision_lock:
+                        processed = self.vision.process(packet["frame"])
+                    (display, faces_info, hand_dets, object_detections,
+                     events, tracked_count, dt) = processed
+                    completed_at = time.time()
+                    result = {
+                        "frame_id": packet["frame_id"],
+                        "captured_at": packet["captured_at"],
+                        "completed_at": completed_at,
+                        "frame_age_ms": max(0.0, (completed_at - packet["captured_at"]) * 1000.0),
+                        "display": display,
+                        "faces_info": faces_info,
+                        "hand_dets": hand_dets,
+                        "object_detections": object_detections,
+                        "events": events,
+                        "tracked_count": tracked_count,
+                        "dt": dt,
+                        "inference_ms": (time.perf_counter() - started) * 1000.0,
+                        "evidence_frame": display.copy() if any(
+                            event[0] in _SEVERE_EVENT_TYPES for event in events
+                            if isinstance(event, (tuple, list)) and event
+                        ) else None,
+                    }
+                    self.vision._last_frame_id = packet["frame_id"]
+                    self.vision._last_frame_capture_timestamp = packet["captured_at"]
+                    self.profiler.record_inference(
+                        packet["frame_id"], result["frame_age_ms"],
+                        result["inference_ms"],
+                        getattr(self.vision, "_last_stage_timings", {}),
+                    )
+                    self.inference_state.publish(result)
+                    self.side_effect_worker.submit(_compact_inference_result(result))
+                    self.last_error = None
+                except Exception as exc:
+                    self.profiler.record_inference_error()
+                    self.last_error = str(exc)
+                    print(f"[ERROR] Vision pipeline failed (worker continues): {exc}")
+                    traceback.print_exc()
+        except Exception as exc:
+            self.last_error = str(exc)
+            print(f"[INFERENCE] Worker stopped: {exc}")
+
+
+class OperationalWorker(threading.Thread):
+    def __init__(self, db, attendance, alert_mgr, snapshot_dir, cam_id,
+                 cam_location, attendance_lock, center_mode_getter, profiler,
+                 regular_size=256, critical_size=64):
+        super().__init__(name="optivox-operations", daemon=True)
+        self.db = db
+        self.attendance = attendance
+        self.alert_mgr = alert_mgr
+        self.snapshot_dir = snapshot_dir
+        self.cam_id = cam_id
+        self.cam_location = cam_location
+        self.attendance_lock = attendance_lock
+        self.center_mode_getter = center_mode_getter
+        self.profiler = profiler
+        self.regular_queue = queue.Queue(maxsize=max(8, int(regular_size)))
+        self.critical_queue = queue.Queue(maxsize=max(4, int(critical_size)))
+        self.stop_event = threading.Event()
+        self.last_error = None
+
+    def _is_critical(self, task):
+        return any(
+            isinstance(event, (tuple, list)) and event and event[0] in _SEVERE_EVENT_TYPES
+            for event in task.get("events") or []
+        )
+
+    def submit(self, task):
+        useful_face = any(
+            face.get("attendance_eligible", face.get("is_real", True))
+            and str(face.get("name") or "UNKNOWN") not in ("UNKNOWN", "SPOOF")
+            and not str(face.get("name") or "").startswith("STRANGER_")
+            for face in task.get("faces_info") or []
+        )
+        if not useful_face and not task.get("events"):
+            return
+        critical = self._is_critical(task)
+        target = self.critical_queue if critical else self.regular_queue
+        try:
+            target.put_nowait(task)
+        except queue.Full:
+            self.profiler.record_queue_drop(critical=critical)
+            print(f"[OPERATIONS] {'Critical' if critical else 'Regular'} queue full; "
+                  f"frame {task.get('frame_id')} was not enqueued.")
+
+    def queue_depths(self):
+        return {
+            "side_effects": self.regular_queue.qsize(),
+            "critical_side_effects": self.critical_queue.qsize(),
+        }
+
+    def run(self):
+        while not self.stop_event.is_set() or not self.critical_queue.empty() or not self.regular_queue.empty():
+            task = None
+            try:
+                task = self.critical_queue.get_nowait()
+            except queue.Empty:
+                try:
+                    task = self.regular_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+            try:
+                _process_runtime_side_effects(
+                    task, self.db, self.attendance, self.alert_mgr,
+                    self.snapshot_dir, self.cam_id, self.cam_location,
+                    self.attendance_lock, self.center_mode_getter,
+                )
+                self.last_error = None
+            except Exception as exc:
+                self.last_error = str(exc)
+                print(f"[OPERATIONS] Side-effect task failed: {exc}")
+            finally:
+                if self.critical_queue.empty() and self.regular_queue.empty():
+                    time.sleep(0.001)
+
+    def stop(self):
+        self.stop_event.set()
+
+
+class RuntimeWorker(threading.Thread):
+    def __init__(self, runtime_dir, vision, db, attendance, alert_mgr,
+                 frame_buffer, inference_state, profiler, operations,
+                 vision_lock, stop_event, started_epoch, started_at,
+                 cam_id, cam_location, snapshot_dir, capture_worker,
+                 inference_worker):
+        super().__init__(name="optivox-runtime", daemon=True)
+        self.runtime_dir = runtime_dir
+        self.vision = vision
+        self.db = db
+        self.attendance = attendance
+        self.alert_mgr = alert_mgr
+        self.frame_buffer = frame_buffer
+        self.inference_state = inference_state
+        self.profiler = profiler
+        self.operations = operations
+        self.vision_lock = vision_lock
+        self.stop_event = stop_event
+        self.started_epoch = started_epoch
+        self.started_at = started_at
+        self.cam_id = cam_id
+        self.cam_location = cam_location
+        self.snapshot_dir = snapshot_dir
+        self.capture_worker = capture_worker
+        self.inference_worker = inference_worker
+        self.last_error = None
+        self._last_state = 0.0
+        self._last_frame = 0.0
+        self._last_commands = 0.0
+
+    def run(self):
+        while not self.stop_event.is_set():
+            now = time.time()
+            result = self.inference_state.snapshot()
+            packet = self.frame_buffer.snapshot()
+            display = result.get("display") if result else (packet.get("frame") if packet else None)
+            events = result.get("events", []) if result else []
+            latest_age = packet.get("age_ms", 0.0) if packet else 0.0
+            performance = self.profiler.snapshot(
+                queue_depths=self.operations.queue_depths(),
+                latest_frame_age_ms=latest_age,
+            )
+            fps = performance.get("inference_fps", 0.0)
+            worker_error = self.inference_worker.last_error or self.operations.last_error
+            if self.capture_worker.last_error:
+                worker_error = self.capture_worker.last_error
+            try:
+                if now - self._last_state >= 1.0:
+                    _publish_runtime_heartbeat(
+                        self.runtime_dir, "online", "connected", fps,
+                        self.started_at, worker_error, performance=performance,
+                        frame_id=result.get("frame_id") if result else None,
+                        frame_age_ms=result.get("frame_age_ms") if result else latest_age,
+                    )
+                    with self.vision_lock:
+                        _publish_runtime_state(
+                            self.runtime_dir, self.vision, display,
+                            self.cam_id, self.cam_location, fps,
+                            self.started_epoch, self.started_at, events,
+                            worker_error, source_result=result,
+                            performance=performance,
+                        )
+                    self._last_state = now
+                if display is not None and now - self._last_frame >= 0.16:
+                    _publish_runtime_frame(self.runtime_dir, display)
+                    self._last_frame = now
+                if now - self._last_commands >= 0.5:
+                    raw = packet.get("frame").copy() if packet and packet.get("frame") is not None else None
+                    with self.vision_lock:
+                        _process_runtime_commands(
+                            self.runtime_dir, self.db, self.attendance,
+                            self.alert_mgr, self.vision, raw,
+                            self.snapshot_dir, self.cam_id, self.cam_location,
+                        )
+                    self._last_commands = now
+                self.last_error = None
+            except Exception as exc:
+                self.last_error = str(exc)
+                print(f"[RUNTIME] Worker update failed: {exc}")
+            time.sleep(0.05)
+
+# Main function
 def main():
     print("=" * 70)
-    print("  INTELLIGENT SECURITY & ATTENDANCE SYSTEM  v2.0")
+    print(f"  INTELLIGENT SECURITY & ATTENDANCE SYSTEM  v{RUNTIME_VERSION}")
     print("=" * 70)
     ensure_dirs()
+    runtime_dir = _runtime_dir()
+    started_at_epoch = time.time()
+    started_at = _runtime_now()
+    _publish_runtime_capabilities(runtime_dir, started_at)
+    _publish_runtime_heartbeat(
+        runtime_dir,
+        "starting",
+        "disconnected",
+        0.0,
+        started_at,
+    )
 
     global VOICE
     VOICE = VoiceManager(CONFIG)
@@ -4295,6 +5118,7 @@ def main():
 
     vision = VisionSystem()
     vision.import_known_faces_folder(db)
+    _publish_runtime_capabilities(runtime_dir, started_at, vision)
 
     attendance = AttendanceManager(db)
     if attendance.enabled:
@@ -4326,6 +5150,14 @@ def main():
     cap = _open_capture(cam_spec["source"])
     if not cap.isOpened():
         print("[FATAL] No camera available. Exiting.")
+        _publish_runtime_heartbeat(
+            runtime_dir,
+            "offline",
+            "disconnected",
+            0.0,
+            started_at,
+            "Camera could not be opened.",
+        )
         return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -4336,6 +5168,7 @@ def main():
     snapshot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "snapshots")
     os.makedirs(snapshot_dir, exist_ok=True)
+    _set_enrollment_status(runtime_dir, "idle", "No enrollment in progress.")
 
     print()
     print("=" * 70)
@@ -4397,6 +5230,9 @@ def main():
             "density": bool(CONFIG.get("CROWD_INTELLIGENCE", {}).get("SHOW_DENSITY_HEATMAP", False)),
         },
     }
+
+    vision_lock = threading.RLock()
+    attendance_lock = threading.RLock()
 
     def refresh_roster():
         try:
@@ -4620,7 +5456,7 @@ def main():
         ui["message"] = state["status"]
         refresh_roster()
 
-    def set_feature(feature):
+    def _set_feature_unlocked(feature):
         ui["toggles"][feature] = not ui["toggles"].get(feature, False)
         if feature == "heatmap":
             CONFIG["SHOW_HEATMAP"] = ui["toggles"][feature]
@@ -4654,6 +5490,10 @@ def main():
             if getattr(vision, "danger_detector", None) is not None:
                 vision.danger_detector.enabled = danger_cfg["ENABLED"]
         ui["message"] = f"{feature.replace('_', ' ').title()} = {'ON' if ui['toggles'][feature] else 'OFF'}"
+
+    def set_feature(feature):
+        with vision_lock:
+            _set_feature_unlocked(feature)
 
     def handle_panel_click(event, x, y, _flags, _userdata):
         if event != cv2.EVENT_LBUTTONDOWN:
@@ -4715,110 +5555,75 @@ def main():
     cv2.namedWindow("Security & Attendance Feed", cv2.WINDOW_NORMAL)
     cv2.setMouseCallback("Security & Attendance Feed", handle_panel_click)
 
+    performance_cfg = CONFIG.get("PERFORMANCE", {})
+    profiler = PerformanceProfiler(
+        window_size=performance_cfg.get("PROFILER_WINDOW_FRAMES", 120),
+        enabled=performance_cfg.get("ENABLE_PROFILING", True),
+    )
+    frame_buffer = LatestFrameBuffer(
+        max_age_ms=performance_cfg.get("MAX_INFERENCE_FRAME_AGE_MS", 250),
+    )
+    capture_proxy = LatestFrameCaptureProxy(frame_buffer)
+    inference_state = LatestInferenceState()
+    stop_event = threading.Event()
+    capture_worker = CameraCaptureWorker(
+        cap, frame_buffer, profiler, stop_event, target_size=(1280, 720))
+    operations = OperationalWorker(
+        db, attendance, alert_mgr, snapshot_dir, cam_id, cam_location,
+        attendance_lock, lambda: bool(ui["center_attendance"].get("enabled")),
+        profiler,
+        regular_size=performance_cfg.get("SIDE_EFFECT_QUEUE_SIZE", 256),
+        critical_size=performance_cfg.get("CRITICAL_QUEUE_SIZE", 64),
+    )
+    inference_worker = InferenceWorker(
+        vision, frame_buffer, inference_state, profiler, operations,
+        stop_event, vision_lock,
+        max_age_ms=performance_cfg.get("MAX_INFERENCE_FRAME_AGE_MS", 250),
+    )
+    runtime_worker = RuntimeWorker(
+        runtime_dir, vision, db, attendance, alert_mgr,
+        frame_buffer, inference_state, profiler, operations,
+        vision_lock, stop_event, started_at_epoch, started_at,
+        cam_id, cam_location, snapshot_dir, capture_worker,
+        inference_worker,
+    )
+    operations.start()
+    capture_worker.start()
+    inference_worker.start()
+    runtime_worker.start()
+    print("[PERF] Capture, inference, operations, and runtime workers started.")
+
     frame_count = 0
-    start_time = time.time()
+    start_time = started_at_epoch
     last_raw_frame = None
+    latest_result = None
+    latest_result_id = 0
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("[WARN] Camera read failed, retrying...")
-                time.sleep(0.3)
-                continue
-            if frame.shape[1] != 1280 or frame.shape[0] != 720:
-                frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
-            last_raw_frame = frame.copy()
+            packet = frame_buffer.snapshot()
+            if packet and packet.get("frame") is not None:
+                last_raw_frame = packet["frame"].copy()
 
-            try:
-                (display, faces_info, hand_dets, obj_dets,
-                 events, tracked_count, dt) = vision.process(frame)
-            except Exception as e:
-                print(f"[ERROR] Vision pipeline failed (skipping frame): {e}")
-                traceback.print_exc()
-                continue
+            result = inference_state.snapshot()
+            if result and result.get("frame_id") != latest_result_id:
+                latest_result = result
+                latest_result_id = result.get("frame_id") or latest_result_id
+                with attendance_lock:
+                    update_center_attendance(result.get("faces_info") or [])
 
-            update_center_attendance(faces_info)
-            for fi in faces_info:
-                name = fi.get("name", "UNKNOWN")
-                is_real = fi.get("is_real", True)
-                if (not ui["center_attendance"].get("enabled")
-                        and is_real and name not in ("UNKNOWN", "SPOOF")
-                        and not name.startswith("STRANGER_")):
-                    try:
-                        attendance.handle_recognition(name, cam_id, cam_location)
-                    except Exception as e:
-                        print(f"[ERROR] Attendance update failed: {e}")
-
-            for evt in events:
-                try:
-                    event_type = evt[0]
-                    target = evt[1] if len(evt) > 1 else "SYSTEM"
-                    confidence = float(evt[2]) if len(evt) > 2 else 0.0
-                    details = evt[3] if len(evt) > 3 else ""
-                except (IndexError, TypeError, ValueError):
-                    continue
-
-                snapshot_path = None
-                if event_type in _SEVERE_EVENT_TYPES and last_raw_frame is not None:
-                    snapshot_path = _save_snapshot(
-                        snapshot_dir, event_type, target, last_raw_frame)
-
-                pid = None
-                if (target not in ("SYSTEM", "UNKNOWN", "PERSON")
-                        and not str(target).startswith(("STRANGER_", "ID_", "AREA_", "ZONE_"))):
-                    pid = db.get_person_id(target)
-
-                try:
-                    db.log_event(
-                        event_type=event_type,
-                        person_id=pid,
-                        confidence=confidence,
-                        details=details,
-                        snapshot_path=snapshot_path,
-                        camera_id=cam_id,
-                        location=cam_location,
-                        severity=_SEVERITY_MAP.get(event_type, 0),
-                    )
-                except Exception as e:
-                    print(f"[ERROR] log_event failed: {e}")
-
-                if event_type in _SEVERE_EVENT_TYPES:
-                    try:
-                        alert_mgr.check_and_alert(
-                            event_type=event_type,
-                            name=str(target),
-                            confidence=confidence,
-                            details=details,
-                            snapshot_path=snapshot_path,
-                        )
-                    except Exception as e:
-                        print(f"[ERROR] Alert dispatch failed: {e}")
-
-                if event_type == "DANGEROUS_OBJECT":
-                    voice(f"Warning. Dangerous object detected: {target}.",
-                        "CRITICAL", dedup_key=f"danger:{target}")
-                elif event_type == "WEAPON_DETECTED":
-                    voice(f"Warning. Weapon detected: {target}.",
-                        "CRITICAL", dedup_key=f"weapon:{target}")
-                elif event_type == "FIRE_DETECTED":
-                    voice("Warning. Fire or flame detected.",
-                        "CRITICAL", dedup_key="fire")
-                elif event_type == "SMOKE_DETECTED":
-                    voice("Warning. Smoke detected.",
-                        "CRITICAL", dedup_key="smoke")
-                elif event_type == "SPOOF_DETECTED":
-                    voice("Warning. Possible spoofed face detected.",
-                        "WARN", dedup_key=f"spoof:{target}")
-                elif event_type == "FALL_DETECTED":
-                    voice("Alert. Possible fall detected. Please check.",
-                          "WARN", dedup_key="fall")
-                elif event_type == "EVACUATION_ALERT":
-                    voice("Emergency. Possible evacuation in progress.",
-                          "CRITICAL", dedup_key="evac")
-                elif event_type == "CONGESTION":
-                    voice(f"Notice. Crowd congestion at {target}.",
-                          "WARN", dedup_key=f"cong:{target}")
+            if latest_result:
+                display = latest_result["display"].copy()
+                faces_info = latest_result.get("faces_info") or []
+                events = latest_result.get("events") or []
+            elif packet and packet.get("frame") is not None:
+                display = packet["frame"].copy()
+                faces_info = []
+                events = []
+            else:
+                display = np.zeros((720, 1280, 3), dtype=np.uint8)
+                faces_info = []
+                events = []
 
             frame_count += 1
             elapsed = time.time() - start_time
@@ -4837,12 +5642,20 @@ def main():
 
             if frame_count % 15 == 0 or not ui.get("roster"):
                 refresh_roster()
+
             cv2.imshow("Security & Attendance Feed",
                        _draw_command_panel(display, faces_info, events, vision, db, assistant, ui,
-                                           cam_id, cam_location))
+                                           cam_id, cam_location,
+                                           profiler.snapshot(
+                                               queue_depths=operations.queue_depths(),
+                                               latest_frame_age_ms=(packet or {}).get("age_ms", 0.0),
+                                           )))
+            profiler.record_display()
 
             #Keyboard controls
-            key = cv2.waitKey(1) & 0xFF
+            display_delay = max(1, int(1000 / max(1, int(
+                performance_cfg.get("DISPLAY_LOOP_FPS", 30)))))
+            key = cv2.waitKey(display_delay) & 0xFF
 
             if ui["mode"] == "text":
                 if key == 27:
@@ -4854,16 +5667,37 @@ def main():
                         ui.update({"mode": "normal", "message": "Nothing entered; action cancelled."})
                     elif prompt == "Enrollment name":
                         ui.update({"mode": "normal", "text": "", "prompt": "", "message": f"Starting enrollment for {entered}."})
+                        _set_enrollment_status(
+                            runtime_dir,
+                            "capturing",
+                            f"Capturing enrollment samples for {entered}.",
+                            {"mode": "multi_angle", "person_name": entered},
+                        )
                         try:
-                            ok = _multi_angle_enrollment(
-                                vision, db, cap, entered,
-                                min_embeddings=CONFIG.get("MIN_ENROLLMENT_EMBEDDINGS", 5),
-                                max_embeddings=CONFIG.get("MAX_ENROLLMENT_EMBEDDINGS", 10),
-                            )
+                            # Enrollment mutates the face index, so it takes
+                            # the same lock as inference for this explicit action.
+                            with vision_lock:
+                                ok = _multi_angle_enrollment(
+                                    vision, db, capture_proxy, entered,
+                                    min_embeddings=CONFIG.get("MIN_ENROLLMENT_EMBEDDINGS", 5),
+                                    max_embeddings=CONFIG.get("MAX_ENROLLMENT_EMBEDDINGS", 10),
+                                )
                             ui["message"] = f"{entered} enrollment {'completed' if ok else 'cancelled or failed'}."
+                            _set_enrollment_status(
+                                runtime_dir,
+                                "completed" if ok else "cancelled",
+                                f"{entered} enrollment {'completed' if ok else 'cancelled or failed'}.",
+                                {"mode": "multi_angle", "person_name": entered},
+                            )
                             refresh_roster()
                         except Exception as exc:
                             ui["message"] = f"Enrollment failed: {exc}"
+                            _set_enrollment_status(
+                                runtime_dir,
+                                "failed",
+                                f"Enrollment failed: {exc}",
+                                {"mode": "multi_angle", "person_name": entered},
+                            )
                     else:
                         ui.update({"mode": "normal", "text": "", "prompt": "", "message": "Local-only Assistant input received."})
                         ui["assistant_answer"] = "External AI is disabled in this panel. Approve OpenAI data sharing before enabling live Assistant answers."
@@ -4934,7 +5768,7 @@ def main():
                         else:
                             print("[ENROLL] No visible stranger found. Starting passive enrollment instead.")
                             _multi_angle_enrollment(
-                                vision, db, cap, name,
+                                vision, db, capture_proxy, name,
                                 min_embeddings=CONFIG.get("MIN_ENROLLMENT_EMBEDDINGS", 5),
                                 max_embeddings=CONFIG.get("MAX_ENROLLMENT_EMBEDDINGS", 10),
                             )
@@ -5042,8 +5876,9 @@ def main():
                     print("[CUSTOM-OBJ] No frame available.")
                 else:
                     try:
-                        hands = vision.hand_detector.detect(last_raw_frame)
-                        ok = vision.custom_objects.enroll_from_hand(last_raw_frame, hands, obj_name)
+                        with vision_lock:
+                            hands = vision.hand_detector.detect(last_raw_frame)
+                            ok = vision.custom_objects.enroll_from_hand(last_raw_frame, hands, obj_name)
 
                         if ok:
                             voice(f"{obj_name} enrolled.", "INFO", dedup_key=f"custom_obj:{obj_name}")
@@ -5084,6 +5919,26 @@ def main():
         traceback.print_exc()
     finally:
         print("[INFO] Shutting down...")
+        try:
+            stop_event.set()
+            operations.stop()
+            frame_buffer.close()
+            for worker in (capture_worker, inference_worker, runtime_worker, operations):
+                worker.join(timeout=5.0)
+            print("[PERF] Workers stopped cleanly.")
+        except Exception as exc:
+            print(f"[PERF] Worker shutdown warning: {exc}")
+        try:
+            _publish_runtime_heartbeat(
+                runtime_dir,
+                "offline",
+                "disconnected",
+                0.0,
+                started_at,
+                "Runtime stopped.",
+            )
+        except Exception as exc:
+            print(f"[RUNTIME] Shutdown heartbeat failed: {exc}")
 
         report_path = None
         try:
