@@ -10,6 +10,8 @@ export default function System({ state, connection }) {
   const counters = performance.counters || {};
   const visionPerformance = performance.vision || {};
   const visionCounters = visionPerformance;
+  const models = visionPerformance.models || {};
+  const resources = performance.resource || {};
 
   async function runCommand(command, confirmText) {
     if (confirmText && !window.confirm(confirmText)) return;
@@ -67,13 +69,26 @@ export default function System({ state, connection }) {
         <div className="system-grid">
           {[
             ["Inference rate", `${performance.inference_fps || 0} FPS`],
+            ["Capture rate", `${performance.capture_fps || 0} FPS`],
+            ["Display rate", `${performance.display_fps || 0} FPS`],
             ["Inference p95", `${latency.inference_p95 || 0} ms`],
+            ["Frame age at start", `${latency.frame_age_start_avg || 0} ms avg`],
+            ["Frame age at completion", `${latency.frame_age_end_avg || 0} ms avg`],
+            ["Frame age at display", `${latency.display_frame_age_avg || 0} ms avg`],
             ["Latest frame age", `${latency.latest_frame_age || 0} ms`],
+            ["Frames consumed", counters.frames_consumed || 0],
+            ["Frames replaced", counters.frames_replaced || 0],
+            ["Frame IDs skipped", counters.frame_ids_skipped || 0],
             ["Stale frames dropped", counters.stale_frames_dropped || 0],
             ["Side-effect queue", performance.queue_depths?.side_effects || 0],
             ["Critical queue drops", counters.critical_queue_drops || 0],
             ["Recognition cache hits", visionCounters.recognition_cache_hits || 0],
+            ["Embedding skips", visionCounters.embeddings_skipped_due_to_cache || 0],
+            ["Embedding calls/sec", models.face_embedding?.calls_per_second || 0],
+            ["Matcher calls/sec", models.identity_matching?.calls_per_second || 0],
             ["ROI inference runs", visionCounters.roi_inference_runs || 0],
+            ["Process CPU", resources.cpu_percent == null ? "Not measured" : `${resources.cpu_percent}%`],
+            ["Process RAM", resources.process_rss_mb == null ? "Not measured" : `${resources.process_rss_mb} MB`],
           ].map(([name, value]) => (
             <div className="system-row" key={name}>
               <span>{name}</span>

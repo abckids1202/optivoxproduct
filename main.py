@@ -26,6 +26,7 @@ from runtime_performance import (
     AdaptiveInferenceScheduler,
     LatestFrameBuffer,
     LatestInferenceState,
+    ModelCallProfiler,
     PerformanceProfiler,
 )
 
@@ -39,6 +40,7 @@ except ImportError:
 
 try:
     from insightface.app import FaceAnalysis
+    from insightface.app.common import Face as InsightFace
     INSIGHTFACE_AVAILABLE = True
 except ImportError:
     INSIGHTFACE_AVAILABLE = False
@@ -131,6 +133,12 @@ CONFIG: Dict[str, Any] = {
     "CAMERA_INDEX": 0,
     "FRAME_WIDTH": 854,
     "FRAME_HEIGHT": 480,
+    "CAPTURE_WIDTH": 1280,
+    "CAPTURE_HEIGHT": 720,
+    "DISPLAY_WIDTH": 1280,
+    "DISPLAY_HEIGHT": 720,
+    "PROCESSING_WIDTH": 1280,
+    "PROCESSING_HEIGHT": 720,
     "TARGET_FPS": 25,
     "CAMERAS": [                         
         {"id": "cam_0", "source": 0, "location": "Class", "enabled": True},
@@ -318,6 +326,10 @@ CONFIG: Dict[str, Any] = {
     "ROI_INFERENCE_ENABLED": True,
     "ROI_PADDING_RATIO": 0.12,
     "ROI_MAX_FRAME_RATIO": 0.88,
+    "RECOGNITION_UNRESOLVED_EVERY_SEC": 0.20,
+    "RECOGNITION_CANDIDATE_EVERY_SEC": 0.30,
+    "MAX_ATTENDANCE_IDENTITY_AGE_SEC": 2.5,
+    "RECOGNITION_CONTRADICTION_CONFIRMATIONS": 2,
     },
 
     #Attendance
@@ -360,6 +372,14 @@ CONFIG: Dict[str, Any] = {
     "SHOW_HAND_LANDMARKS": False,
     "SHOW_POSE_LANDMARKS": False,
     "SHOW_OBJECT_BOXES": True,
+    # Compute switches are separate from the display-only overlay switches.
+    "ENABLE_OBJECT_DETECTION": True,
+    "ENABLE_DANGER_INFERENCE": True,
+    "ENABLE_POSE_INFERENCE": True,
+    "ENABLE_HAND_INFERENCE": True,
+    "ENABLE_CUSTOM_OBJECT_INFERENCE": True,
+    "ENABLE_LIVENESS_INFERENCE": True,
+    "ENABLE_AGE_GENDER_INFERENCE": False,
 
     #Hand detection
     "HAND_MAX_NUM": 2,
@@ -1590,12 +1610,74 @@ class CentroidTracker:
 
 #7.4: Face analyzer
 class FaceAnalyzer:
-    def __init__(self):
+    def __init__(self, cfg=None):
+        cfg = cfg or CONFIG
         self.app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
         self.app.prepare(ctx_id=-1, det_size=(640, 640))
+        self.enable_age_gender = bool(cfg.get("ENABLE_AGE_GENDER_INFERENCE", False))
 
-    def detect(self, frame): return self.app.get(frame)
-    def get_embedding(self, face): return face.embedding
+    def detect(self, frame):
+        """Detect and landmark faces without running the recognition model."""
+        bboxes, kpss = self.app.det_model.detect(
+            frame, max_num=0, metric="default")
+        if bboxes is None or len(bboxes) == 0:
+            return []
+        faces = []
+        for index in range(len(bboxes)):
+            bbox = bboxes[index, 0:4]
+            det_score = bboxes[index, 4]
+            kps = kpss[index] if kpss is not None else None
+            face = InsightFace(bbox=bbox, kps=kps, det_score=det_score)
+            for taskname, model in self.app.models.items():
+                if taskname in {"detection", "recognition"}:
+                    continue
+                if taskname == "genderage" and not self.enable_age_gender:
+                    continue
+                model.get(frame, face)
+            faces.append(face)
+        return faces
+
+    def get_embedding(self, face, frame=None):
+        """Run recognition only when the caller explicitly requests it."""
+        if frame is not None:
+            recognition_model = self.app.models.get("recognition")
+            if recognition_model is not None:
+                recognition_model.get(frame, face)
+        return getattr(face, "embedding", None)
+
+    def scale_face(self, face, scale_x=1.0, scale_y=1.0):
+        """Map a processing-frame face onto the original capture frame."""
+        if abs(float(scale_x) - 1.0) < 1e-6 and abs(float(scale_y) - 1.0) < 1e-6:
+            return face
+
+        mapped = {}
+        for key, value in face.items():
+            if key == "embedding":
+                # Embeddings belong to a specific image crop and must not be
+                # carried into a new coordinate system.
+                continue
+            if key == "bbox":
+                arr = np.asarray(value, dtype=np.float32).copy()
+                if arr.size >= 4:
+                    arr[0] *= float(scale_x)
+                    arr[2] *= float(scale_x)
+                    arr[1] *= float(scale_y)
+                    arr[3] *= float(scale_y)
+                mapped[key] = arr
+                continue
+            if key in {"kps", "landmark_2d_106", "landmark_3d_68"}:
+                arr = np.asarray(value).copy()
+                if arr.ndim >= 2 and arr.shape[-1] >= 2:
+                    arr[..., 0] *= float(scale_x)
+                    arr[..., 1] *= float(scale_y)
+                elif arr.ndim == 1 and arr.size >= 2:
+                    arr[0] *= float(scale_x)
+                    arr[1] *= float(scale_y)
+                mapped[key] = arr
+                continue
+            mapped[key] = value
+        return InsightFace(mapped)
+
     def get_bbox(self, face):
         b = face.bbox.astype(int)
         return int(b[0]), int(b[1]), int(b[2]), int(b[3])
@@ -2404,7 +2486,7 @@ class VisionSystem:
         print("[INFO] VisionSystem ready.")
 
     def _init_components(self):
-        self.face_analyzer    = FaceAnalyzer()
+        self.face_analyzer    = FaceAnalyzer(self.cfg)
         self.hand_detector    = HandDetector(self.cfg)
         self.object_detector  = ObjectDetector(self.cfg) if YOLO_AVAILABLE else None
         self.danger_detector = DangerDetector(self.cfg) if YOLO_AVAILABLE and self.cfg.get("DANGER_DETECTION", {}).get("ENABLED", False) else None
@@ -2459,17 +2541,64 @@ class VisionSystem:
         self._scheduler = AdaptiveInferenceScheduler(scheduler_config)
         self._recognition_cache_hits = 0
         self._recognition_cache_misses = 0
+        self._recognition_attempts = 0
+        self._recognition_confirmations = 0
+        self._embeddings_skipped_due_to_cache = 0
+        self._embeddings_skipped_due_to_quality = 0
         self._face_quality_rejects = 0
         self._roi_inference_runs = 0
+        self._model_metrics = ModelCallProfiler(
+            window_size=perf_cfg.get("PROFILER_WINDOW_FRAMES", 120))
+        self._identity_started_at: Dict[int, float] = {}
+        self._identity_timing: Dict[int, dict] = {}
+        self._identity_timing_samples: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=120))
+        self._identity_confirmation_times: deque = deque(maxlen=120)
 
     def performance_snapshot(self) -> dict:
         return {
             "recognition_cache_hits": self._recognition_cache_hits,
             "recognition_cache_misses": self._recognition_cache_misses,
+            "recognition_attempts": self._recognition_attempts,
+            "recognition_confirmations": self._recognition_confirmations,
+            "embeddings_skipped_due_to_cache": self._embeddings_skipped_due_to_cache,
+            "embeddings_skipped_due_to_quality": self._embeddings_skipped_due_to_quality,
             "face_quality_rejects": self._face_quality_rejects,
             "roi_inference_runs": self._roi_inference_runs,
+            "models": self._model_metrics.snapshot(),
+            "execution_provider": {
+                "face": "CPUExecutionProvider",
+                "yolo": "NOT MEASURED",
+            },
+            "identity_timing": {
+                "confirmed_count": len(self._identity_confirmation_times),
+                "mean_time_to_confirm_sec": round(
+                    sum(self._identity_confirmation_times) /
+                    len(self._identity_confirmation_times), 3
+                ) if self._identity_confirmation_times else 0.0,
+                "last_time_to_confirm_sec": round(
+                    self._identity_confirmation_times[-1], 3
+                ) if self._identity_confirmation_times else 0.0,
+                "mean_time_to_first_usable_face_sec": self._mean_timing(
+                    "first_usable_face"),
+                "mean_time_to_first_embedding_sec": self._mean_timing(
+                    "first_embedding"),
+                "mean_time_to_candidate_sec": self._mean_timing("candidate"),
+            },
             "scheduler": self._scheduler.snapshot(),
         }
+
+    def _mean_timing(self, name):
+        values = self._identity_timing_samples.get(name, ())
+        return round(sum(values) / len(values), 3) if values else 0.0
+
+    def _profile_call(self, name, callback, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            self._model_metrics.record(
+                name, (time.perf_counter() - started) * 1000.0)
 
     def _face_quality(self, frame, bbox):
         if not self.cfg.get("PERFORMANCE", {}).get("FACE_QUALITY_GATE_ENABLED", True):
@@ -2484,7 +2613,8 @@ class VisionSystem:
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             return 0.0, {}, False
-        score, metrics = self.quality_scorer.score(crop)
+        score, metrics = self._profile_call(
+            "face_quality", self.quality_scorer.score, crop)
         perf_cfg = self.cfg.get("PERFORMANCE", {})
         accepted = (
             score >= float(perf_cfg.get("FACE_QUALITY_MIN_SCORE", 50.0))
@@ -2584,7 +2714,7 @@ class VisionSystem:
                         print(f"[FACES] Skip {path}: low quality {score:.0f}")
                         continue
 
-                emb = self.face_analyzer.get_embedding(faces[0])
+                emb = self.face_analyzer.get_embedding(faces[0], img)
                 if emb is None:
                     print(f"[FACES] Skip {path}: no embedding")
                     continue
@@ -2681,7 +2811,8 @@ class VisionSystem:
             f"uncertain score={best_sim:.3f}/{required:.3f} margin={margin:.3f}/{min_margin:.3f}")
 
     def _smooth_recognize(self, oid, embedding):
-        name, conf, reason = self.recognize_face(embedding)
+        name, conf, reason = self._profile_call(
+            "identity_matching", self.recognize_face, embedding)
         self._face_recog_history[oid].append(name)
         if name not in ("UNKNOWN", "SPOOF") and not name.startswith("STRANGER_"):
             return name, conf, reason
@@ -2798,9 +2929,20 @@ class VisionSystem:
 
         self._recognition_cache[oid] = {
             "name": person_name,
+            "identity_name": person_name,
+            "identity_state": "CONFIRMED",
             "conf": 1.0,
+            "cached_identity_confidence": 1.0,
+            "current_observation_similarity": 1.0,
             "reason": "manual_visible_enrollment",
             "embedding": embedding,
+            "stable_frames": self.cfg.get("PERFORMANCE", {}).get(
+                "FACE_RECOG_STABLE_FRAMES", 3),
+            "candidate_hits": self.cfg.get("PERFORMANCE", {}).get(
+                "FACE_RECOG_STABLE_FRAMES", 3),
+            "last_attempt_at": time.time(),
+            "last_observation_at": time.time(),
+            "last_verified_at": time.time(),
             "ts": time.time(),
         }
 
@@ -2852,12 +2994,15 @@ class VisionSystem:
                 if color: self._person_colors[oid] = color
 
     @staticmethod
-    def _draw_face_box(frame, x1, y1, x2, y2, name, conf, oid, is_real):
+    def _draw_face_box(frame, x1, y1, x2, y2, name, conf, oid, is_real,
+                       identity_state=None, confidence_label="similarity"):
         if not is_real: color = (0, 0, 255)
         elif name == "UNKNOWN" or name.startswith("STRANGER_"): color = (0, 165, 255)
         else: color = (0, 255, 0)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        label = f"{name} ({conf:.2f}) ID:{oid}"
+        label = f"{name} ({confidence_label}={conf:.2f}) ID:{oid}"
+        if identity_state and identity_state != "CONFIRMED":
+            label += f" [{identity_state}]"
         cv2.putText(frame, label, (x1, max(15, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
@@ -2913,10 +3058,22 @@ class VisionSystem:
 
         return frame
 
-    def _recognize_and_draw(self, frame, face_objects, tracked):
+    def _recognize_and_draw(self, frame, face_objects, tracked,
+                            recognition_frame=None, recognition_scale=None):
+        recognition_frame = recognition_frame if recognition_frame is not None else frame
+        if recognition_scale is None:
+            processing_h, processing_w = frame.shape[:2]
+            source_h, source_w = recognition_frame.shape[:2]
+            recognition_scale = (
+                float(source_w) / max(1, processing_w),
+                float(source_h) / max(1, processing_h),
+            )
         info = []
         for fobj in face_objects:
             x1, y1, x2, y2 = self.face_analyzer.get_bbox(fobj)
+            recognition_fobj = self.face_analyzer.scale_face(
+                fobj, recognition_scale[0], recognition_scale[1])
+            rx1, ry1, rx2, ry2 = self.face_analyzer.get_bbox(recognition_fobj)
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             oid = -1; best_d = float("inf")
             for t_oid, t_c in tracked.items():
@@ -2924,27 +3081,29 @@ class VisionSystem:
                 if d < best_d and d < 150: best_d, oid = d, t_oid
 
             quality_score, quality_metrics, quality_ok = self._face_quality(
-                frame, (x1, y1, x2, y2))
+                recognition_frame, (rx1, ry1, rx2, ry2))
             if not quality_ok:
                 self._face_quality_rejects += 1
-            embedding = (
-                self.face_analyzer.get_embedding(fobj) if quality_ok else None
-            )
+            # Embedding generation is deliberately deferred until the track
+            # policy below proves that fresh biometric evidence is needed.
+            embedding = None
 
             spoof_status = AntiSpoofDetector.REAL
             spoof_details = {}
             spoof_confirmed = False
-            landmarks = self.face_analyzer.get_landmarks(fobj)
-            pose_keypoints = self.face_analyzer.get_pose_keypoints(fobj)
+            landmarks = self.face_analyzer.get_landmarks(recognition_fobj)
+            pose_keypoints = self.face_analyzer.get_pose_keypoints(recognition_fobj)
             yaw = self.anti_spoof.pose.estimate_yaw(pose_keypoints)
 
-            if self.anti_spoof.enabled:
-                crop = frame[max(0, y1):min(frame.shape[0], y2),
-                             max(0, x1):min(frame.shape[1], x2)]
+            if (self.anti_spoof.enabled and
+                    self.cfg.get("ENABLE_LIVENESS_INFERENCE", True)):
+                crop = recognition_frame[max(0, ry1):min(recognition_frame.shape[0], ry2),
+                                          max(0, rx1):min(recognition_frame.shape[1], rx2)]
                 if quality_ok:
-                    spoof_status, spoof_details = self.anti_spoof.analyze(
-                        crop, frame.shape, landmarks=landmarks,
-                        bbox=(x1, y1, x2, y2), pose_keypoints=pose_keypoints)
+                    spoof_status, spoof_details = self._profile_call(
+                        "liveness", self.anti_spoof.analyze,
+                        crop, recognition_frame.shape, landmarks=landmarks,
+                        bbox=(rx1, ry1, rx2, ry2), pose_keypoints=pose_keypoints)
                 else:
                     spoof_status = AntiSpoofDetector.UNCERTAIN
                     spoof_details = {
@@ -2954,14 +3113,14 @@ class VisionSystem:
             if yaw is not None:
                 spoof_details["yaw"] = yaw
 
-                if oid > 0:
-                    self._spoof_history[oid].append(spoof_status)
-                    needed = self.cfg["ANTI_SPOOFING"].get("SUSPECT_CONFIRM_FRAMES", 4)
-                    recent_suspects = sum(
-                        1 for s in self._spoof_history[oid]
-                        if s == AntiSpoofDetector.SUSPECT
-                    )
-                    spoof_confirmed = recent_suspects >= needed
+            if oid > 0:
+                self._spoof_history[oid].append(spoof_status)
+                needed = self.cfg["ANTI_SPOOFING"].get("SUSPECT_CONFIRM_FRAMES", 4)
+                recent_suspects = sum(
+                    1 for s in self._spoof_history[oid]
+                    if s == AntiSpoofDetector.SUSPECT
+                )
+                spoof_confirmed = recent_suspects >= needed
 
             uncertain_blocks_attendance = bool(
                 self.cfg["ANTI_SPOOFING"].get("UNCERTAIN_BLOCKS_ATTENDANCE", True)
@@ -2988,67 +3147,185 @@ class VisionSystem:
                 continue
 
             perf = self.cfg.get("PERFORMANCE", {})
-            recog_every = max(1, int(perf.get("FACE_RECOG_EVERY_N_FRAMES", 3)))
             cache_ttl = float(perf.get("RECOGNITION_CACHE_TTL_SEC", 4.0))
             refresh_sec = float(perf.get("FACE_RECOG_REFRESH_SEC", 2.5))
             movement_limit = float(perf.get("FACE_RECOG_REFRESH_MOVEMENT_PX", 36.0))
             stable_required = max(1, int(perf.get("FACE_RECOG_STABLE_FRAMES", 3)))
+            unresolved_every = float(perf.get("RECOGNITION_UNRESOLVED_EVERY_SEC", 0.20))
+            candidate_every = float(perf.get("RECOGNITION_CANDIDATE_EVERY_SEC", 0.30))
+            contradiction_limit = max(1, int(
+                perf.get("RECOGNITION_CONTRADICTION_CONFIRMATIONS", 2)))
+            max_attendance_age = float(
+                perf.get("MAX_ATTENDANCE_IDENTITY_AGE_SEC", refresh_sec))
             cached = self._recognition_cache.get(oid) if oid > 0 else None
             now = time.time()
-            cache_age = now - float((cached or {}).get("ts", 0.0))
-            cached_name = str((cached or {}).get("name") or "UNKNOWN")
+            timing = None
+            if oid > 0:
+                self._identity_started_at.setdefault(oid, now)
+                timing = self._identity_timing.setdefault(oid, {"started_at": now})
+                if quality_ok and "first_usable_at" not in timing:
+                    timing["first_usable_at"] = now
+                    self._identity_timing_samples["first_usable_face"].append(
+                        max(0.0, now - timing["started_at"]))
+            cache_age = now - float((cached or {}).get("last_observation_at",
+                                                        (cached or {}).get("ts", 0.0)))
+            cached_name = str((cached or {}).get("identity_name") or
+                              (cached or {}).get("name") or "UNKNOWN")
+            identity_state = str((cached or {}).get("identity_state") or "UNRESOLVED")
+            previous_state = identity_state
             cached_known = (
                 cached is not None
                 and cached_name not in ("UNKNOWN", "SPOOF")
                 and not cached_name.startswith("STRANGER_")
             )
             stable_frames = int((cached or {}).get("stable_frames", 0))
+            candidate_hits = int((cached or {}).get("candidate_hits", 0))
+            unknown_streak = int((cached or {}).get("unknown_streak", 0))
+            identity_name = cached_name if cached_known else None
+            last_verified_at = float((cached or {}).get("last_verified_at", 0.0))
+            verification_age = now - last_verified_at if last_verified_at else float("inf")
             movement = self._bbox_motion((cached or {}).get("bbox"),
                                           (x1, y1, x2, y2))
             stable_cache_valid = (
                 cached_known
+                and identity_state == "CONFIRMED"
                 and stable_frames >= stable_required
                 and cache_age <= min(cache_ttl, refresh_sec)
+                and verification_age <= refresh_sec
                 and movement <= movement_limit
             )
-            quality_hold_valid = cached_known and cache_age <= cache_ttl
+            quality_hold_valid = (
+                cached_known
+                and identity_state in {"CONFIRMED", "STALE", "REVALIDATING"}
+                and cache_age <= cache_ttl
+            )
+            identity_age_valid = (
+                cached_known and last_verified_at > 0
+                and verification_age <= max_attendance_age
+            )
+            attempt_interval = (
+                refresh_sec if identity_state == "CONFIRMED" else
+                candidate_every if identity_state == "CANDIDATE" else
+                unresolved_every
+            )
+            last_attempt_at = float((cached or {}).get("last_attempt_at", 0.0))
+            attempt_due = (
+                not last_attempt_at
+                or now - last_attempt_at >= max(0.01, attempt_interval)
+            )
+            recognition_due = (
+                cached is None
+                or not cached_known
+                or cache_age > cache_ttl
+                or verification_age > refresh_sec
+                or movement > movement_limit
+                or attempt_due
+            )
 
-            if stable_cache_valid or (not quality_ok and quality_hold_valid):
+            if stable_cache_valid and quality_ok:
                 name = cached_name
-                conf = float(cached.get("conf", 0.0))
+                conf = float(cached.get("cached_identity_confidence",
+                                      cached.get("conf", 0.0)))
+                embedding = cached.get("embedding")
                 reason = "stable_track_cache" if quality_ok else "quality_hold"
                 self._recognition_cache_hits += 1
+                self._embeddings_skipped_due_to_cache += 1
             elif not quality_ok:
-                name, conf, reason = "UNKNOWN", 0.0, (
-                    f"low_face_quality={quality_score:.1f}"
-                )
+                if quality_hold_valid:
+                    name, conf = "UNKNOWN", 0.0
+                    reason = "WAITING_FOR_GOOD_FACE"
+                    identity_state = "STALE" if identity_state == "CONFIRMED" else identity_state
+                else:
+                    name, conf, reason = "UNKNOWN", 0.0, (
+                        f"WAITING_FOR_GOOD_FACE quality={quality_score:.1f}")
+                    identity_state = "UNRESOLVED"
+                self._embeddings_skipped_due_to_quality += 1
                 self._recognition_cache_misses += 1
-            elif (cached is None or not cached_known
-                  or cache_age > cache_ttl
-                  or cache_age > refresh_sec
-                  or movement > movement_limit
-                  or self._frame_count % recog_every == 0):
-                name, conf, reason = self._smooth_recognize(oid, embedding)
-                previous_name = cached_name if cached else None
-                stable_frames = (
-                    int((cached or {}).get("stable_frames", 0)) + 1
-                    if name == previous_name else 1
+            elif recognition_due:
+                if timing is not None and "first_embedding_at" not in timing:
+                    timing["first_embedding_at"] = now
+                    self._identity_timing_samples["first_embedding"].append(
+                        max(0.0, now - timing["started_at"]))
+                embedding = self._profile_call(
+                    "face_embedding", self.face_analyzer.get_embedding,
+                    recognition_fobj, recognition_frame)
+                self._recognition_attempts += 1
+                previous_identity = cached_name if cached_known else None
+                if cached_known and identity_state == "CONFIRMED":
+                    name, conf, reason = self._profile_call(
+                        "identity_matching", self.recognize_face, embedding)
+                else:
+                    name, conf, reason = self._profile_call(
+                        "identity_smoothing", self._smooth_recognize, oid, embedding)
+
+                fresh_known = (
+                    name not in ("UNKNOWN", "SPOOF")
+                    and not str(name).startswith("STRANGER_")
                 )
+                if fresh_known:
+                    unknown_streak = 0
+                    candidate_hits = candidate_hits + 1 if name == previous_identity else 1
+                    stable_frames = stable_frames + 1 if name == previous_identity else 1
+                    identity_state = (
+                        "CONFIRMED" if candidate_hits >= stable_required else "CANDIDATE")
+                    identity_name = name
+                    if (identity_state == "CANDIDATE" and timing is not None
+                            and "candidate_at" not in timing):
+                        timing["candidate_at"] = now
+                        self._identity_timing_samples["candidate"].append(
+                            max(0.0, now - timing["started_at"]))
+                    accepted_at = now if identity_state == "CONFIRMED" else last_verified_at
+                    if identity_state == "CONFIRMED" and previous_state != "CONFIRMED":
+                        self._recognition_confirmations += 1
+                        started_at = self._identity_started_at.pop(oid, now)
+                        self._identity_confirmation_times.append(max(0.0, now - started_at))
+                        if timing is not None:
+                            self._identity_timing.pop(oid, None)
+                    if identity_state == "CONFIRMED":
+                        last_verified_at = accepted_at
+                else:
+                    candidate_hits = 0
+                    stable_frames = 0
+                    unknown_streak = unknown_streak + 1 if cached_known else 0
+                    if cached_known and unknown_streak < contradiction_limit:
+                        identity_state = "STALE"
+                        identity_name = cached_name
+                    else:
+                        identity_state = "CONTRADICTED" if cached_known else "UNRESOLVED"
+                        identity_name = None
+                        name = "UNKNOWN"
+                        conf = 0.0
+
                 if oid > 0:
                     self._recognition_cache[oid] = {
                         "name": name,
+                        "identity_name": identity_name,
+                        "identity_state": identity_state,
                         "conf": conf,
+                        "cached_identity_confidence": conf if fresh_known else float(
+                            (cached or {}).get("cached_identity_confidence", 0.0)),
+                        "current_observation_similarity": conf if fresh_known else 0.0,
                         "reason": reason,
                         "embedding": embedding,
                         "bbox": (x1, y1, x2, y2),
                         "stable_frames": stable_frames,
+                        "candidate_hits": candidate_hits,
+                        "unknown_streak": unknown_streak,
                         "quality_score": quality_score,
+                        "last_attempt_at": now,
+                        "last_observation_at": now,
+                        "last_verified_at": last_verified_at if identity_state == "CONFIRMED" else (
+                            last_verified_at if cached_known else 0.0),
                         "ts": now,
                     }
                 self._recognition_cache_misses += 1
             elif cached:
-                name, conf, reason = cached["name"], cached["conf"], cached["reason"]
+                name = cached.get("name", "UNKNOWN")
+                conf = float(cached.get("cached_identity_confidence", 0.0))
+                reason = cached.get("reason", "cached_identity")
+                embedding = cached.get("embedding")
                 self._recognition_cache_hits += 1
+                self._embeddings_skipped_due_to_cache += 1
             else:
                 name, conf, reason = "UNKNOWN", 0.0, "no_recognition_cache"
                 self._recognition_cache_misses += 1
@@ -3077,13 +3354,32 @@ class VisionSystem:
                     sb["last_seen"] = time.time(); sb["frames"] += 1
                     sb["bbox"] = (x1, y1, x2, y2)
                     name = sb["label"]
+            last_verified_at = float((self._recognition_cache.get(oid) or {}).get(
+                "last_verified_at", last_verified_at))
+            identity_age_valid = (
+                identity_state == "CONFIRMED"
+                and last_verified_at > 0
+                and time.time() - last_verified_at <= max_attendance_age
+            )
+            attendance_eligible = (
+                attendance_eligible
+                and identity_state == "CONFIRMED"
+                and identity_age_valid
+            )
             self._current_face_labels[oid] = (name, conf, embedding)
-            self._draw_face_box(frame, x1, y1, x2, y2, name, conf, oid, is_real)
+            self._draw_face_box(
+                frame, x1, y1, x2, y2, name, conf, oid, is_real,
+                identity_state=identity_state,
+                confidence_label=("last" if reason in {
+                    "stable_track_cache", "quality_hold"} else "similarity"))
             age = None
             gender = None
-            if self.cfg.get("SHOW_AGE_GENDER", False):
-                age = self.face_analyzer.get_age(fobj) or "?"
-                gender = self.face_analyzer.get_gender(fobj)
+            if (self.cfg.get("SHOW_AGE_GENDER", False)
+                    and self.cfg.get("ENABLE_AGE_GENDER_INFERENCE", False)):
+                age, gender = self._profile_call(
+                    "age_gender",
+                    lambda: (self.face_analyzer.get_age(recognition_fobj) or "?",
+                             self.face_analyzer.get_gender(recognition_fobj)))
                 emotion = "neutral"
                 if oid > 0:
                     self._draw_person_info(frame, fobj, x1, y2, oid, age, gender, emotion)
@@ -3096,7 +3392,16 @@ class VisionSystem:
                          "quality_metrics": quality_metrics,
                          "reason": reason, "age": age, "gender": gender,
                          "yaw": yaw, "liveness_status": spoof_status,
-                         "liveness_details": spoof_details})
+                         "liveness_details": spoof_details,
+                         "identity_state": identity_state,
+                         "cached_identity_confidence": float(
+                             (self._recognition_cache.get(oid) or {}).get(
+                                 "cached_identity_confidence", conf)),
+                         "current_observation_similarity": 0.0 if reason in {
+                             "stable_track_cache", "quality_hold"} else float(
+                                 (self._recognition_cache.get(oid) or {}).get(
+                                     "current_observation_similarity", conf)),
+                         "last_verified_at": last_verified_at})
         return info
 
     def _reid_stranger(self, embedding) -> Optional[str]:
@@ -3193,7 +3498,7 @@ class VisionSystem:
         self._draw_zones_grid(frame)
         return frame
 
-    def process(self, frame):
+    def process(self, frame, original_frame=None):
         t0 = time.perf_counter()
         stage_started = t0
         stage_timings = {}
@@ -3222,7 +3527,8 @@ class VisionSystem:
         )
         if face_due:
             try:
-                face_objects = self.face_analyzer.detect(analysis)
+                face_objects = self._profile_call(
+                    "face_detection", self.face_analyzer.detect, analysis)
                 self._last_face_objects = face_objects
             except Exception as e:
                 print(f"[ERROR] face detect: {e}")
@@ -3238,14 +3544,16 @@ class VisionSystem:
         object_detections = []
         yolo_every = max(1, int(perf.get("YOLO_EVERY_N_FRAMES", 3)))
 
-        if self.object_detector is not None:
+        if self.object_detector is not None and self.cfg.get(
+                "ENABLE_OBJECT_DETECTION", True):
             yolo_due = self._scheduler.should_run(
                 "yolo", self._frame_count, yolo_every,
                 has_signal=bool(self._last_object_detections),
                 force=not bool(self._last_object_detections),
             )
             if yolo_due:
-                object_detections = self.object_detector.detect(analysis)
+                object_detections = self._profile_call(
+                    "yolo", self.object_detector.detect, analysis)
                 self._last_object_detections = object_detections
                 self._scheduler.complete(
                     "yolo", self._frame_count, yolo_every,
@@ -3264,7 +3572,9 @@ class VisionSystem:
             self._scheduler.complete("supplementary", self._frame_count, 3,
                                      has_signal=bool(object_detections))
 
-        if self.danger_detector is not None:
+        if (self.danger_detector is not None
+                and self.cfg.get("ENABLE_DANGER_INFERENCE", True)
+                and self.cfg.get("DANGER_DETECTION", {}).get("ENABLED", False)):
             danger_cfg = self.cfg.get("DANGER_DETECTION", {})
             danger_every = max(1, int(danger_cfg.get("EVERY_N_FRAMES", 10)))
             allowed = {c.lower() for c in danger_cfg.get("ALLOWED_CLASSES", set())}
@@ -3279,7 +3589,8 @@ class VisionSystem:
                 force=not bool(self._last_danger_detections),
             )
             if danger_due:
-                raw_danger_dets = self.danger_detector.detect(analysis)
+                raw_danger_dets = self._profile_call(
+                    "danger", self.danger_detector.detect, analysis)
                 danger_dets = []
 
                 for d in raw_danger_dets:
@@ -3314,7 +3625,8 @@ class VisionSystem:
 
         roi = self._relevant_roi(analysis, object_detections, face_objects)
         hand_every = max(1, int(perf.get("HAND_EVERY_N_FRAMES", 4)))
-        hand_due = self._scheduler.should_run(
+        hand_enabled = bool(self.cfg.get("ENABLE_HAND_INFERENCE", True))
+        hand_due = hand_enabled and self._scheduler.should_run(
             "hand", self._frame_count, hand_every,
             has_signal=bool(self._last_hand_dets),
             force=not bool(self._last_hand_dets),
@@ -3325,11 +3637,14 @@ class VisionSystem:
                 x1, y1, x2, y2 = roi
                 hand_input = analysis[y1:y2, x1:x2]
                 self._roi_inference_runs += 1
-            self._last_hand_dets = self.hand_detector.detect(hand_input, roi=roi)
+            self._last_hand_dets = self._profile_call(
+                "hands", self.hand_detector.detect, hand_input, roi=roi)
             self._scheduler.complete(
                 "hand", self._frame_count, hand_every,
                 has_signal=bool(self._last_hand_dets),
             )
+        if not hand_enabled:
+            self._last_hand_dets = []
         hand_dets = self._last_hand_dets
 
         if self.cfg.get("SHOW_HAND_LANDMARKS", False):
@@ -3339,7 +3654,10 @@ class VisionSystem:
         if self.cfg.get("SHOW_OBJECT_BOXES", True) and self.object_detector is not None:
             self.object_detector.draw_detections(display, object_detections, skip_person=True)
         
-        if self.custom_objects is not None and self.custom_objects.enabled:
+        if (self.custom_objects is not None
+                and self.custom_objects.enabled
+                and hand_enabled
+                and self.cfg.get("ENABLE_CUSTOM_OBJECT_INFERENCE", True)):
             custom_cfg = self.cfg.get("CUSTOM_OBJECTS", {})
             custom_every = max(1, int(custom_cfg.get("MATCH_EVERY_N_FRAMES", 5)))
 
@@ -3349,7 +3667,10 @@ class VisionSystem:
                 force=not bool(self._last_custom_object_detections),
             )
             if custom_due:
-                custom_dets = self.custom_objects.detect_from_hands(analysis, hand_dets)
+                custom_dets = self._profile_call(
+                    "custom_objects",
+                    self.custom_objects.detect_from_hands,
+                    analysis, hand_dets)
                 self._last_custom_object_detections = custom_dets
                 self._scheduler.complete(
                     "custom", self._frame_count, custom_every,
@@ -3370,35 +3691,51 @@ class VisionSystem:
         mark_stage("tracking_and_behavior")
 
         try:
-            pose_every = max(1, int(perf.get("POSE_EVERY_N_FRAMES", 4)))
-            pose_due = self._scheduler.should_run(
-                "pose", self._frame_count, pose_every,
-                has_signal=bool(self._last_pose_result.get("pose")),
-                force=not bool(self._last_pose_result),
-            )
-            if pose_due:
-                pose_roi = self._relevant_roi(
-                    analysis, object_detections, face_objects, tracked)
-                if pose_roi is not None:
-                    self._roi_inference_runs += 1
-                self._last_pose_result = self.pose_detector.analyze(
-                    analysis, roi=pose_roi)
-                self._scheduler.complete(
+            pose_enabled = bool(self.cfg.get("ENABLE_POSE_INFERENCE", True))
+            if not pose_enabled:
+                self._last_pose_result = {}
+            else:
+                pose_every = max(1, int(perf.get("POSE_EVERY_N_FRAMES", 4)))
+                pose_due = self._scheduler.should_run(
                     "pose", self._frame_count, pose_every,
                     has_signal=bool(self._last_pose_result.get("pose")),
+                    force=not bool(self._last_pose_result),
                 )
-            pose_result = self._last_pose_result
-            if pose_result.get("is_fallen"):
-                events.append(("FALL_DETECTED", "PERSON", 0.85, "Possible fall: torso horizontal"))
-            if pose_result.get("hands_raised"):
-                events.append(("HANDS_RAISED", "PERSON", 0.8, "Both hands raised above head"))
-            if self.cfg.get("SHOW_POSE_LANDMARKS", False):
-                self.pose_detector.draw(display, pose_result)
+                if pose_due:
+                    pose_roi = self._relevant_roi(
+                        analysis, object_detections, face_objects, tracked)
+                    if pose_roi is not None:
+                        self._roi_inference_runs += 1
+                    self._last_pose_result = self._profile_call(
+                        "pose", self.pose_detector.analyze, analysis, roi=pose_roi)
+                    self._scheduler.complete(
+                        "pose", self._frame_count, pose_every,
+                        has_signal=bool(self._last_pose_result.get("pose")),
+                    )
+                pose_result = self._last_pose_result
+                if pose_result.get("is_fallen"):
+                    events.append(("FALL_DETECTED", "PERSON", 0.85,
+                                   "Possible fall: torso horizontal"))
+                if pose_result.get("hands_raised"):
+                    events.append(("HANDS_RAISED", "PERSON", 0.8,
+                                   "Both hands raised above head"))
+                if self.cfg.get("SHOW_POSE_LANDMARKS", False):
+                    self.pose_detector.draw(display, pose_result)
         except Exception as e:
             print(f"[WARN] pose analysis failed: {e}")
         mark_stage("pose")
 
-        faces_info = self._recognize_and_draw(display, face_objects, tracked)
+        recognition_frame = original_frame if original_frame is not None else frame
+        processing_h, processing_w = frame.shape[:2]
+        recognition_h, recognition_w = recognition_frame.shape[:2]
+        recognition_scale = (
+            float(recognition_w) / max(1, processing_w),
+            float(recognition_h) / max(1, processing_h),
+        )
+        faces_info = self._recognize_and_draw(
+            display, face_objects, tracked,
+            recognition_frame=recognition_frame,
+            recognition_scale=recognition_scale)
         mark_stage("recognition_and_liveness")
 
         self._last_faces_seen = []
@@ -3419,6 +3756,12 @@ class VisionSystem:
                 "liveness_status": fi.get("liveness_status"),
                 "quality_score": float(fi.get("quality_score", 0.0)),
                 "quality_ok": bool(fi.get("quality_ok", True)),
+                "identity_state": fi.get("identity_state", "UNRESOLVED"),
+                "cached_identity_confidence": float(
+                    fi.get("cached_identity_confidence", 0.0)),
+                "current_observation_similarity": float(
+                    fi.get("current_observation_similarity", 0.0)),
+                "last_verified_at": fi.get("last_verified_at"),
                 "bbox": fi.get("bbox"),
                 "shirt_color": shirt_color,
             })
@@ -3509,6 +3852,8 @@ class VisionSystem:
         for oid in list(self._recognition_cache.keys()):
             if oid > 0 and oid not in active_ids:
                 self._recognition_cache.pop(oid, None)
+                self._identity_started_at.pop(oid, None)
+                self._identity_timing.pop(oid, None)
 
         self._draw_ui(display, events, tracked, object_detections)
         mark_stage("rendering")
@@ -4289,7 +4634,7 @@ def _multi_angle_enrollment(vision: VisionSystem, db: EventDatabase, cap: cv2.Vi
 
                 now = time.time()
                 if ok and now - last_capture_ts >= min_gap_sec:
-                    embedding = vision.face_analyzer.get_embedding(faces[0])
+                    embedding = vision.face_analyzer.get_embedding(faces[0], display)
                     if embedding is not None:
                         captured_embeddings.append(np.asarray(embedding, dtype=np.float32))
                         captured += 1
@@ -4768,6 +5113,12 @@ def _publish_runtime_state(
                 "passed" if face.get("is_real", True) else "suspect")).lower(),
             "quality_score": float(face.get("quality_score") or 0),
             "quality_ok": bool(face.get("quality_ok", True)),
+            "identity_state": str(face.get("identity_state") or "UNRESOLVED"),
+            "cached_identity_confidence": float(
+                face.get("cached_identity_confidence") or 0),
+            "current_observation_similarity": float(
+                face.get("current_observation_similarity") or 0),
+            "last_verified_at": face.get("last_verified_at"),
             "bbox": face.get("bbox"),
         }
         if name in ("UNKNOWN", "SPOOF") or name.startswith("STRANGER_"):
@@ -4855,6 +5206,26 @@ def _publish_runtime_frame(runtime_dir: str, display, quality: int = 78):
     final = os.path.join(runtime_dir, "latest_frame.jpg")
     if cv2.imwrite(tmp, display, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]):
         os.replace(tmp, final)
+
+
+def _publish_performance_summary(runtime_dir, profiler, vision, started_at,
+                                 operations=None, frame_buffer=None):
+    """Persist one compact benchmark snapshot at shutdown for repeatable review."""
+    performance = profiler.snapshot(
+        queue_depths=operations.queue_depths() if operations else None,
+        latest_frame_age_ms=(frame_buffer.metrics().get("latest_frame_age_ms", 0.0)
+                             if frame_buffer else 0.0),
+        current_source_frame_id=(frame_buffer.metrics().get("frame_id")
+                                 if frame_buffer else None),
+    )
+    performance["vision"] = vision.performance_snapshot() if vision else {}
+    performance["benchmark"] = {
+        "started_at": started_at,
+        "ended_at": _runtime_now(),
+        "duration_sec": performance.get("uptime_sec", 0.0),
+    }
+    _atomic_json_write(os.path.join(runtime_dir, "performance_summary.json"),
+                       performance)
 
 
 def _read_pending_runtime_commands(runtime_dir: str) -> list:
@@ -5147,9 +5518,11 @@ class CameraCaptureWorker(threading.Thread):
                 width, height = self.target_size
                 if frame.shape[1] != width or frame.shape[0] != height:
                     frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
-                replaced = bool(self.frame_buffer.metrics().get("frame_id"))
-                self.frame_buffer.publish(frame, captured_at)
-                self.profiler.record_capture(replaced=replaced)
+                frame_id = self.frame_buffer.publish(frame, captured_at)
+                buffer_metrics = self.frame_buffer.metrics()
+                self.profiler.record_capture(
+                    replaced=bool(buffer_metrics.get("last_publish_replaced")),
+                    frame_id=frame_id)
                 self.frames_read += 1
                 self.last_error = None
         except Exception as exc:
@@ -5176,6 +5549,14 @@ class InferenceWorker(threading.Thread):
         self.max_age_ms = max(1, int(max_age_ms))
         self.last_error = None
         self._last_frame_id = 0
+        self.processing_size = None
+
+    def set_processing_size(self, size):
+        if not size:
+            self.processing_size = None
+            return
+        width, height = (int(value) for value in size)
+        self.processing_size = (max(1, width), max(1, height))
 
     def run(self):
         try:
@@ -5184,13 +5565,25 @@ class InferenceWorker(threading.Thread):
                 if packet is None:
                     continue
                 self._last_frame_id = packet["frame_id"]
+                self.profiler.record_frame_consumed(
+                    packet["frame_id"], packet["age_ms"],
+                    skipped=packet.get("frames_skipped", 0))
                 if packet["age_ms"] > self.max_age_ms:
                     self.profiler.record_stale_drop()
                     continue
                 started = time.perf_counter()
                 try:
+                    source_frame = packet["frame"]
+                    processing_frame = source_frame
+                    if self.processing_size:
+                        width, height = self.processing_size
+                        if (processing_frame.shape[1], processing_frame.shape[0]) != self.processing_size:
+                            processing_frame = cv2.resize(
+                                processing_frame, self.processing_size,
+                                interpolation=cv2.INTER_LINEAR)
                     with self.vision_lock:
-                        processed = self.vision.process(packet["frame"])
+                        processed = self.vision.process(
+                            processing_frame, original_frame=source_frame)
                     (display, faces_info, hand_dets, object_detections,
                      events, tracked_count, dt) = processed
                     completed_at = time.time()
@@ -5218,6 +5611,8 @@ class InferenceWorker(threading.Thread):
                         packet["frame_id"], result["frame_age_ms"],
                         result["inference_ms"],
                         getattr(self.vision, "_last_stage_timings", {}),
+                        frame_age_start_ms=packet["age_ms"],
+                        frame_age_end_ms=result["frame_age_ms"],
                     )
                     self.inference_state.publish(result)
                     self.side_effect_worker.submit(_compact_inference_result(result))
@@ -5345,11 +5740,22 @@ class RuntimeWorker(threading.Thread):
             result = self.inference_state.snapshot()
             packet = self.frame_buffer.snapshot()
             display = result.get("display") if result else (packet.get("frame") if packet else None)
+            display_for_output = display
+            if display is not None:
+                display_size = (
+                    int(CONFIG.get("DISPLAY_WIDTH", display.shape[1])),
+                    int(CONFIG.get("DISPLAY_HEIGHT", display.shape[0])),
+                )
+                if (display.shape[1], display.shape[0]) != display_size:
+                    display_for_output = cv2.resize(
+                        display, display_size, interpolation=cv2.INTER_LINEAR)
             events = result.get("events", []) if result else []
             latest_age = packet.get("age_ms", 0.0) if packet else 0.0
             performance = self.profiler.snapshot(
                 queue_depths=self.operations.queue_depths(),
                 latest_frame_age_ms=latest_age,
+                current_source_frame_id=packet.get("frame_id") if packet else None,
+                current_inference_frame_id=result.get("frame_id") if result else None,
             )
             with self.vision_lock:
                 performance["vision"] = self.vision.performance_snapshot()
@@ -5367,15 +5773,15 @@ class RuntimeWorker(threading.Thread):
                     )
                     with self.vision_lock:
                         _publish_runtime_state(
-                            self.runtime_dir, self.vision, display,
+                            self.runtime_dir, self.vision, display_for_output,
                             self.cam_id, self.cam_location, fps,
                             self.started_epoch, self.started_at, events,
                             worker_error, source_result=result,
                             performance=performance,
                         )
                     self._last_state = now
-                if display is not None and now - self._last_frame >= 0.16:
-                    _publish_runtime_frame(self.runtime_dir, display)
+                if display_for_output is not None and now - self._last_frame >= 0.16:
+                    _publish_runtime_frame(self.runtime_dir, display_for_output)
                     self._last_frame = now
                 if now - self._last_commands >= 0.5:
                     raw = packet.get("frame").copy() if packet and packet.get("frame") is not None else None
@@ -5479,8 +5885,8 @@ def main():
             "Camera could not be opened.",
         )
         return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG.get("CAPTURE_WIDTH", 1280))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG.get("CAPTURE_HEIGHT", 720))
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[INFO] Camera active at {actual_w}x{actual_h}.")
@@ -5600,7 +6006,8 @@ def main():
         now = time.time()
         cfg = CONFIG["ATTENDANCE"]
         total_faces = len(faces_info)
-        width, height = 1280.0, 720.0
+        width = float(CONFIG.get("PROCESSING_WIDTH", 1280))
+        height = float(CONFIG.get("PROCESSING_HEIGHT", 720))
         valid = []
         for face in faces_info:
             if not face.get("attendance_eligible", face.get("is_real", True)):
@@ -5887,7 +6294,11 @@ def main():
     inference_state = LatestInferenceState()
     stop_event = threading.Event()
     capture_worker = CameraCaptureWorker(
-        cap, frame_buffer, profiler, stop_event, target_size=(1280, 720))
+        cap, frame_buffer, profiler, stop_event,
+        target_size=(
+            CONFIG.get("CAPTURE_WIDTH", 1280),
+            CONFIG.get("CAPTURE_HEIGHT", 720),
+        ))
     operations = OperationalWorker(
         db, attendance, alert_mgr, snapshot_dir, cam_id, cam_location,
         attendance_lock, lambda: bool(ui["center_attendance"].get("enabled")),
@@ -5900,6 +6311,10 @@ def main():
         stop_event, vision_lock,
         max_age_ms=performance_cfg.get("MAX_INFERENCE_FRAME_AGE_MS", 250),
     )
+    inference_worker.set_processing_size((
+        CONFIG.get("PROCESSING_WIDTH", CONFIG.get("CAPTURE_WIDTH", 1280)),
+        CONFIG.get("PROCESSING_HEIGHT", CONFIG.get("CAPTURE_HEIGHT", 720)),
+    ))
     runtime_worker = RuntimeWorker(
         runtime_dir, vision, db, attendance, alert_mgr,
         frame_buffer, inference_state, profiler, operations,
@@ -5936,14 +6351,28 @@ def main():
                 display = latest_result["display"].copy()
                 faces_info = latest_result.get("faces_info") or []
                 events = latest_result.get("events") or []
+                display_frame_id = latest_result.get("frame_id")
+                display_captured_at = latest_result.get("captured_at")
             elif packet and packet.get("frame") is not None:
                 display = packet["frame"].copy()
                 faces_info = []
                 events = []
+                display_frame_id = packet.get("frame_id")
+                display_captured_at = packet.get("captured_at")
             else:
                 display = np.zeros((720, 1280, 3), dtype=np.uint8)
                 faces_info = []
                 events = []
+                display_frame_id = None
+                display_captured_at = None
+
+            display_size = (
+                int(CONFIG.get("DISPLAY_WIDTH", display.shape[1])),
+                int(CONFIG.get("DISPLAY_HEIGHT", display.shape[0])),
+            )
+            if (display.shape[1], display.shape[0]) != display_size:
+                display = cv2.resize(display, display_size,
+                                     interpolation=cv2.INTER_LINEAR)
 
             frame_count += 1
             elapsed = time.time() - start_time
@@ -5963,14 +6392,21 @@ def main():
             if frame_count % 15 == 0 or not ui.get("roster"):
                 refresh_roster()
 
+            performance_snapshot = profiler.snapshot(
+                queue_depths=operations.queue_depths(),
+                latest_frame_age_ms=(packet or {}).get("age_ms", 0.0),
+                current_source_frame_id=(packet or {}).get("frame_id"),
+                current_inference_frame_id=(latest_result or {}).get("frame_id"),
+            )
             cv2.imshow("Security & Attendance Feed",
                        _draw_command_panel(display, faces_info, events, vision, db, assistant, ui,
                                            cam_id, cam_location,
-                                           profiler.snapshot(
-                                               queue_depths=operations.queue_depths(),
-                                               latest_frame_age_ms=(packet or {}).get("age_ms", 0.0),
-                                           )))
-            profiler.record_display()
+                                           performance_snapshot))
+            display_age_ms = (
+                max(0.0, (time.time() - float(display_captured_at)) * 1000.0)
+                if display_captured_at else None
+            )
+            profiler.record_display(display_frame_id, display_age_ms)
 
             #Keyboard controls
             display_delay = max(1, int(1000 / max(1, int(
@@ -6248,6 +6684,13 @@ def main():
             print("[PERF] Workers stopped cleanly.")
         except Exception as exc:
             print(f"[PERF] Worker shutdown warning: {exc}")
+        try:
+            _publish_performance_summary(
+                runtime_dir, profiler, vision, started_at,
+                operations=operations, frame_buffer=frame_buffer)
+            print(f"[PERF] Summary written to {os.path.join(runtime_dir, 'performance_summary.json')}")
+        except Exception as exc:
+            print(f"[PERF] Summary write failed: {exc}")
         try:
             _publish_runtime_heartbeat(
                 runtime_dir,

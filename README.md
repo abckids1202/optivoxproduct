@@ -54,9 +54,9 @@ The live engine uses four bounded responsibilities:
 - the display loop renders the newest completed result at a bounded UI rate;
 - operations persist attendance/events and dispatch alerts from bounded regular and critical queues.
 
-Performance metrics are included in `runtime/heartbeat.json` and `runtime/live_state.json` under `performance`. This sprint does not change model thresholds, recognition rules, or model selection. Use the reported `inference_fps`, `latency_ms`, `stages_ms`, queue depths, and drop counters before choosing any later model optimization.
+Performance metrics are included in `runtime/heartbeat.json` and `runtime/live_state.json` under `performance`. A compact final snapshot is written to `runtime/performance_summary.json` when the engine exits. It includes capture/display/inference rates, frame IDs, frame-age percentiles, accurate replacement/skip counters, optional process resource telemetry, and per-subsystem call/latency metrics. Use the reported values before choosing any later model optimization.
 
-Sprint II adds adaptive active/idle schedules, stable-track recognition reuse, live face-quality gating, and padded person ROIs for hand/pose inference. The general object detector and face detector remain full-frame. The System page also reports recognition-cache hits and ROI inference runs so the effect can be checked during a real camera session.
+Sprint II adds adaptive active/idle schedules, stable-track recognition reuse, live face-quality gating, and padded person ROIs for hand/pose inference. Gate III makes confirmed-track reuse bypass face embedding until revalidation, records explicit identity state and fresh attendance evidence, adds per-model workload counters, and separates `CAPTURE_*`, `PROCESSING_*`, and `DISPLAY_*` resolution settings. When processing is downscaled, global inference uses the processing frame while face quality, liveness, and embeddings use mapped coordinates on the original capture frame. The general object detector and face detector remain full-frame. `ENABLE_*_INFERENCE` switches control compute; `SHOW_*` switches only control overlays. GPU/VRAM telemetry remains `NOT MEASURED` unless a hardware-specific collector is added.
 
 ## Demo Mode
 
