@@ -29,6 +29,7 @@ from runtime_performance import (
     ModelCallProfiler,
     PerformanceProfiler,
 )
+from core.correlation import CorrelationCore
 
 #Optional try and error
 try:
@@ -330,6 +331,26 @@ CONFIG: Dict[str, Any] = {
     "RECOGNITION_CANDIDATE_EVERY_SEC": 0.30,
     "MAX_ATTENDANCE_IDENTITY_AGE_SEC": 2.5,
     "RECOGNITION_CONTRADICTION_CONFIRMATIONS": 2,
+    },
+
+    # Correlation Core keeps model outputs fresh, attributable, and bounded
+    # without changing the existing recognition or attendance policies.
+    "CORRELATION_CORE": {
+        "ENABLED": True,
+        "MAX_ENTITIES": 128,
+        "MAX_OBSERVATIONS_PER_TYPE": 12,
+        "ENTITY_CLOSE_AFTER_SEC": 10.0,
+        "TTL_MS": {
+            "PERSON_DETECTED": 350,
+            "FACE_DETECTED": 350,
+            "FACE_QUALITY": 750,
+            "FACE_HEAD_POSE": 500,
+            "FACE_IDENTITY_RESULT": 3000,
+            "LIVENESS_RESULT": 1500,
+            "POSE_STATE": 350,
+            "OBJECT_DETECTED": 750,
+            "TRACK_MOTION": 500,
+        },
     },
 
     #Attendance
@@ -2513,7 +2534,13 @@ class VisionSystem:
         self._face_recog_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=10))
         self._object_interaction_last: Dict[str, float] = {}
         self._last_face_objects = []
+        self._last_face_observation_frame_id = None
+        self._last_face_observation_at = None
+        self._last_face_observation_wallclock = None
         self._last_object_detections = []
+        self._last_object_observation_frame_id = None
+        self._last_object_observation_at = None
+        self._last_object_observation_wallclock = None
         self._last_danger_detections = []
         self._recognition_cache: Dict[int, dict] = {}
         self._spoof_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=self.cfg["ANTI_SPOOFING"].get("SUSPECT_WINDOW_FRAMES", 8)))
@@ -2530,6 +2557,18 @@ class VisionSystem:
         self._last_held_objects: List[dict] = []
         self._last_hand_dets = []
         self._last_pose_result = {}
+        self._last_pose_observation_frame_id = None
+        self._last_pose_observation_at = None
+        self._last_pose_observation_wallclock = None
+        correlation_cfg = self.cfg.get("CORRELATION_CORE", {})
+        self.correlation = CorrelationCore(
+            max_entities=correlation_cfg.get("MAX_ENTITIES", 128),
+            max_observations_per_type=correlation_cfg.get(
+                "MAX_OBSERVATIONS_PER_TYPE", 12),
+            close_after_sec=correlation_cfg.get("ENTITY_CLOSE_AFTER_SEC", 10.0),
+            ttl_overrides_ms=correlation_cfg.get("TTL_MS"),
+        )
+        self._last_correlation_state = {}
         perf_cfg = self.cfg.get("PERFORMANCE", {})
         scheduler_config = {
             "enabled": bool(perf_cfg.get("ADAPTIVE_SCHEDULING", True)),
@@ -2586,6 +2625,7 @@ class VisionSystem:
                 "mean_time_to_candidate_sec": self._mean_timing("candidate"),
             },
             "scheduler": self._scheduler.snapshot(),
+            "correlation": self.correlation.snapshot(),
         }
 
     def _mean_timing(self, name):
@@ -3498,7 +3538,8 @@ class VisionSystem:
         self._draw_zones_grid(frame)
         return frame
 
-    def process(self, frame, original_frame=None):
+    def process(self, frame, original_frame=None, source_frame_id=None,
+                camera_id="cam_0"):
         t0 = time.perf_counter()
         stage_started = t0
         stage_timings = {}
@@ -3518,6 +3559,8 @@ class VisionSystem:
         analysis = frame
         display = frame.copy()
         self._frame_count += 1
+        frame_observed_at = time.monotonic()
+        frame_observed_wallclock = _runtime_now()
         perf = self.cfg.get("PERFORMANCE", {})
         face_every = max(1, int(perf.get("FACE_DETECT_EVERY_N_FRAMES", 2)))
         face_due = self._scheduler.should_run(
@@ -3530,6 +3573,9 @@ class VisionSystem:
                 face_objects = self._profile_call(
                     "face_detection", self.face_analyzer.detect, analysis)
                 self._last_face_objects = face_objects
+                self._last_face_observation_frame_id = source_frame_id
+                self._last_face_observation_at = frame_observed_at
+                self._last_face_observation_wallclock = frame_observed_wallclock
             except Exception as e:
                 print(f"[ERROR] face detect: {e}")
                 face_objects = self._last_face_objects or []
@@ -3555,6 +3601,9 @@ class VisionSystem:
                 object_detections = self._profile_call(
                     "yolo", self.object_detector.detect, analysis)
                 self._last_object_detections = object_detections
+                self._last_object_observation_frame_id = source_frame_id
+                self._last_object_observation_at = frame_observed_at
+                self._last_object_observation_wallclock = frame_observed_wallclock
                 self._scheduler.complete(
                     "yolo", self._frame_count, yolo_every,
                     has_signal=bool(object_detections),
@@ -3612,6 +3661,9 @@ class VisionSystem:
                     danger_dets.append(d)
 
                 self._last_danger_detections = danger_dets
+                self._last_object_observation_frame_id = source_frame_id
+                self._last_object_observation_at = frame_observed_at
+                self._last_object_observation_wallclock = frame_observed_wallclock
                 self._scheduler.complete(
                     "danger", self._frame_count, danger_every,
                     has_signal=bool(danger_dets),
@@ -3690,10 +3742,14 @@ class VisionSystem:
         events.extend(self.crowd_intel.update(tracked, frame_size=(h, w)))
         mark_stage("tracking_and_behavior")
 
+        pose_result = self._last_pose_result
         try:
             pose_enabled = bool(self.cfg.get("ENABLE_POSE_INFERENCE", True))
             if not pose_enabled:
                 self._last_pose_result = {}
+                self._last_pose_observation_frame_id = None
+                self._last_pose_observation_at = None
+                self._last_pose_observation_wallclock = None
             else:
                 pose_every = max(1, int(perf.get("POSE_EVERY_N_FRAMES", 4)))
                 pose_due = self._scheduler.should_run(
@@ -3708,6 +3764,9 @@ class VisionSystem:
                         self._roi_inference_runs += 1
                     self._last_pose_result = self._profile_call(
                         "pose", self.pose_detector.analyze, analysis, roi=pose_roi)
+                    self._last_pose_observation_frame_id = source_frame_id
+                    self._last_pose_observation_at = frame_observed_at
+                    self._last_pose_observation_wallclock = frame_observed_wallclock
                     self._scheduler.complete(
                         "pose", self._frame_count, pose_every,
                         has_signal=bool(self._last_pose_result.get("pose")),
@@ -3738,6 +3797,42 @@ class VisionSystem:
             recognition_scale=recognition_scale)
         mark_stage("recognition_and_liveness")
 
+        correlation_state = {}
+        if self.cfg.get("CORRELATION_CORE", {}).get("ENABLED", True):
+            correlation_state = self.correlation.update(
+                tracked=tracked,
+                faces_info=faces_info,
+                object_detections=object_detections,
+                pose_result=pose_result,
+                source_frame_id=source_frame_id,
+                camera_id=camera_id,
+                observed_at_monotonic=frame_observed_at,
+                observed_at_wallclock=frame_observed_wallclock,
+                provenance={
+                    "faces": {
+                        "frame_id": self._last_face_observation_frame_id,
+                        "monotonic": self._last_face_observation_at,
+                        "wallclock": self._last_face_observation_wallclock,
+                    },
+                    "objects": {
+                        "frame_id": self._last_object_observation_frame_id,
+                        "monotonic": self._last_object_observation_at,
+                        "wallclock": self._last_object_observation_wallclock,
+                    },
+                    "pose": {
+                        "frame_id": self._last_pose_observation_frame_id,
+                        "monotonic": self._last_pose_observation_at,
+                        "wallclock": self._last_pose_observation_wallclock,
+                    },
+                },
+            )
+        self._last_correlation_state = correlation_state
+        entity_by_track = {
+            int(entity["track_id"]): entity
+            for entity in correlation_state.get("entities", [])
+            if entity.get("track_id") is not None
+        }
+
         self._last_faces_seen = []
         for fi in faces_info:
             oid = fi.get("oid", -1)
@@ -3747,6 +3842,7 @@ class VisionSystem:
                 shirt_color = {"rgb": [int(r), int(g), int(b)]}
 
             self._last_faces_seen.append({
+                "entity_id": entity_by_track.get(oid, {}).get("entity_id"),
                 "track_id": oid,
                 "name": fi.get("name"),
                 "confidence": float(fi.get("confidence", 0.0)),
@@ -3762,6 +3858,8 @@ class VisionSystem:
                 "current_observation_similarity": float(
                     fi.get("current_observation_similarity", 0.0)),
                 "last_verified_at": fi.get("last_verified_at"),
+                "identity_age_ms": entity_by_track.get(oid, {}).get(
+                    "identity", {}).get("identity_age_ms"),
                 "bbox": fi.get("bbox"),
                 "shirt_color": shirt_color,
             })
@@ -3788,6 +3886,7 @@ class VisionSystem:
         "faces": self._last_faces_seen,
         "objects": self._last_objects_seen,
         "held_objects": self._last_held_objects,
+        "correlation": correlation_state,
     }
 
         for fi in faces_info:
@@ -5103,6 +5202,7 @@ def _publish_runtime_state(
     for face in faces:
         name = str(face.get("name") or "UNKNOWN")
         item = {
+            "entity_id": face.get("entity_id"),
             "track_id": face.get("track_id"),
             "name": name,
             "temporary_name": name,
@@ -5119,6 +5219,7 @@ def _publish_runtime_state(
             "current_observation_similarity": float(
                 face.get("current_observation_similarity") or 0),
             "last_verified_at": face.get("last_verified_at"),
+            "identity_age_ms": face.get("identity_age_ms"),
             "bbox": face.get("bbox"),
         }
         if name in ("UNKNOWN", "SPOOF") or name.startswith("STRANGER_"):
@@ -5194,6 +5295,7 @@ def _publish_runtime_state(
             "active_event_count": len(active_events),
         },
         "presence": {"registered": registered, "unknown": unknown},
+        "correlation": getattr(vision, "_last_correlation_state", {}),
         "objects": list(object_counts.values()),
         "recent_events": active_events,
     })
@@ -5583,7 +5685,11 @@ class InferenceWorker(threading.Thread):
                                 interpolation=cv2.INTER_LINEAR)
                     with self.vision_lock:
                         processed = self.vision.process(
-                            processing_frame, original_frame=source_frame)
+                            processing_frame,
+                            original_frame=source_frame,
+                            source_frame_id=packet["frame_id"],
+                            camera_id=self.cam_id,
+                        )
                     (display, faces_info, hand_dets, object_detections,
                      events, tracked_count, dt) = processed
                     completed_at = time.time()

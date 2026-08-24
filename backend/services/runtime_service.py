@@ -71,6 +71,7 @@ def live_state() -> dict[str, Any]:
     objects = state.get("objects", [])
     security = state.get("security", {})
     performance = state.get("performance", {})
+    correlation = state.get("correlation", {})
     return {
         "generatedAt": now_iso(),
         "device": {"id": DEVICE_ID, "type": "edge-agent", "biometric_owner": "local_engine"},
@@ -98,6 +99,7 @@ def live_state() -> dict[str, Any]:
             "frameHeight": engine.get("frame_height"),
         },
         "performance": performance,
+        "correlation": correlation,
         "security": {
             "level": security.get("level", "normal"),
             "message": security.get("message", "No active warning"),
@@ -172,9 +174,13 @@ def normalize_people(presence: dict[str, Any]) -> list[dict[str, Any]]:
     for p in presence.get("registered", []):
         out.append({
             "id": f"registered-{p.get('track_id')}",
+            "entityId": p.get("entity_id"),
+            "trackId": p.get("track_id"),
             "label": p.get("name", "Registered person"),
             "type": "registered",
             "confidence": p.get("confidence", 0),
+            "identityState": p.get("identity_state", "UNRESOLVED"),
+            "identityAgeMs": p.get("identity_age_ms"),
             "attendance": p.get("attendance_status", "present"),
             "visibleFor": format_duration(p.get("visible_seconds")),
             "note": "Registered attendance",
@@ -182,9 +188,13 @@ def normalize_people(presence: dict[str, Any]) -> list[dict[str, Any]]:
     for p in presence.get("unknown", []):
         out.append({
             "id": f"unknown-{p.get('track_id')}",
+            "entityId": p.get("entity_id"),
+            "trackId": p.get("track_id"),
             "label": p.get("temporary_name", "Unknown person"),
             "type": "spoof" if p.get("spoof_status") == "suspect" else "unknown",
             "confidence": p.get("confidence", 0.5),
+            "identityState": p.get("identity_state", "UNRESOLVED"),
+            "identityAgeMs": p.get("identity_age_ms"),
             "attendance": "Presence only",
             "visibleFor": format_duration(p.get("visible_seconds")),
             "note": "Unregistered person",

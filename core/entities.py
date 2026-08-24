@@ -1,0 +1,319 @@
+"""Explicit per-track entity state for OptiVox correlation."""
+
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from .observations import Observation, ObservationHistory, ObservationType
+
+
+class EntityLifecycle(str, Enum):
+    NEW = "NEW"
+    ACTIVE = "ACTIVE"
+    OCCLUDED = "OCCLUDED"
+    STALE = "STALE"
+    LOST = "LOST"
+    CLOSED = "CLOSED"
+
+
+@dataclass
+class MotionState:
+    previous_center: Optional[Tuple[float, float]] = None
+    current_center: Optional[Tuple[float, float]] = None
+    velocity: Tuple[float, float] = (0.0, 0.0)
+    speed: float = 0.0
+    last_updated_monotonic: float = 0.0
+
+
+@dataclass
+class IdentityState:
+    state: str = "UNRESOLVED"
+    candidate_name: Optional[str] = None
+    confirmed_name: Optional[str] = None
+    best_score: Optional[float] = None
+    second_score: Optional[float] = None
+    margin: Optional[float] = None
+    last_verified_monotonic: Optional[float] = None
+    last_observation_monotonic: Optional[float] = None
+
+
+@dataclass
+class LivenessState:
+    state: str = "NOT_EVALUATED"
+    last_checked_monotonic: Optional[float] = None
+    last_verified_monotonic: Optional[float] = None
+
+
+@dataclass
+class EntityState:
+    entity_id: str
+    entity_type: str
+    camera_id: str
+    track_id: int
+    created_monotonic: float
+    first_seen_monotonic: float
+    last_seen_monotonic: float
+    lifecycle_state: EntityLifecycle = EntityLifecycle.NEW
+    bbox: Optional[Tuple[float, float, float, float]] = None
+    previous_bbox: Optional[Tuple[float, float, float, float]] = None
+    track_confidence: Optional[float] = None
+    motion: MotionState = field(default_factory=MotionState)
+    current_zone: Optional[str] = None
+    face_visible: bool = False
+    last_face_observation_monotonic: Optional[float] = None
+    face_quality: Optional[float] = None
+    yaw: Optional[float] = None
+    identity: IdentityState = field(default_factory=IdentityState)
+    liveness: LivenessState = field(default_factory=LivenessState)
+    pose_state: Optional[str] = None
+    last_pose_observation_monotonic: Optional[float] = None
+    associated_objects: Tuple[str, ...] = ()
+    presence_started_monotonic: float = 0.0
+    attendance_eligibility: bool = False
+    missing_updates: int = 0
+    recent_observation_count: int = 0
+
+    @property
+    def presence_duration_sec(self) -> float:
+        return max(0.0, self.last_seen_monotonic - self.presence_started_monotonic)
+
+    @property
+    def identity_age_ms(self) -> Optional[float]:
+        if self.identity.last_verified_monotonic is None:
+            return None
+        return max(0.0, (time.monotonic() - self.identity.last_verified_monotonic) * 1000.0)
+
+    def update_center(self, center: Tuple[float, float], now: float) -> None:
+        previous = self.motion.current_center
+        self.motion.previous_center = previous
+        self.motion.current_center = (float(center[0]), float(center[1]))
+        if previous is not None and self.motion.last_updated_monotonic > 0:
+            elapsed = max(1e-6, now - self.motion.last_updated_monotonic)
+            self.motion.velocity = (
+                (self.motion.current_center[0] - previous[0]) / elapsed,
+                (self.motion.current_center[1] - previous[1]) / elapsed,
+            )
+            self.motion.speed = math.hypot(*self.motion.velocity)
+        self.motion.last_updated_monotonic = now
+
+    def attach(self, observation: Observation) -> None:
+        self.recent_observation_count += 1
+        self.last_seen_monotonic = max(self.last_seen_monotonic, observation.observed_at_monotonic)
+        if observation.observation_type == ObservationType.FACE_DETECTED:
+            self.face_visible = True
+            self.last_face_observation_monotonic = observation.observed_at_monotonic
+            if observation.bbox:
+                self.bbox = observation.bbox
+        elif observation.observation_type == ObservationType.FACE_QUALITY:
+            self.face_quality = observation.quality
+        elif observation.observation_type == ObservationType.FACE_HEAD_POSE:
+            self.yaw = observation.metadata.get("yaw", observation.value)
+        elif observation.observation_type == ObservationType.FACE_IDENTITY_RESULT:
+            metadata = observation.metadata
+            name = metadata.get("name") or observation.value
+            self.identity.candidate_name = str(name) if name else None
+            self.identity.best_score = observation.confidence
+            self.identity.second_score = metadata.get("second_score")
+            self.identity.margin = metadata.get("margin")
+            self.identity.state = str(metadata.get("identity_state") or "UNRESOLVED")
+            self.identity.last_observation_monotonic = observation.observed_at_monotonic
+            if self.identity.state == "CONFIRMED":
+                self.identity.confirmed_name = self.identity.candidate_name
+                self.identity.last_verified_monotonic = observation.observed_at_monotonic
+        elif observation.observation_type == ObservationType.LIVENESS_RESULT:
+            self.liveness.state = str(observation.value or "NOT_EVALUATED")
+            self.liveness.last_checked_monotonic = observation.observed_at_monotonic
+            if self.liveness.state == "REAL":
+                self.liveness.last_verified_monotonic = observation.observed_at_monotonic
+        elif observation.observation_type == ObservationType.POSE_STATE:
+            self.pose_state = str(observation.value) if observation.value is not None else None
+            self.last_pose_observation_monotonic = observation.observed_at_monotonic
+        elif observation.observation_type == ObservationType.ZONE_MEMBERSHIP:
+            self.current_zone = str(observation.value) if observation.value is not None else None
+        elif observation.observation_type == ObservationType.TRACK_MOTION:
+            velocity = observation.metadata.get("velocity")
+            if velocity and len(velocity) >= 2:
+                self.motion.velocity = (float(velocity[0]), float(velocity[1]))
+                self.motion.speed = math.hypot(*self.motion.velocity)
+
+    def refresh(self, now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else now
+        self.face_visible = bool(
+            self.last_face_observation_monotonic is not None
+            and current - self.last_face_observation_monotonic <= 0.5
+        )
+        if self.identity.last_observation_monotonic is not None and current - self.identity.last_observation_monotonic > 3.0:
+            if self.identity.state == "CONFIRMED":
+                self.identity.state = "STALE"
+            self.attendance_eligibility = False
+
+    def summary(self, now: Optional[float] = None) -> Dict[str, object]:
+        current = time.monotonic() if now is None else now
+        return {
+            "entity_id": self.entity_id,
+            "entity_type": self.entity_type,
+            "camera_id": self.camera_id,
+            "track_id": self.track_id,
+            "lifecycle_state": self.lifecycle_state.value,
+            "first_seen_monotonic": self.first_seen_monotonic,
+            "last_seen_monotonic": self.last_seen_monotonic,
+            "age_since_last_seen_ms": round(max(0.0, current - self.last_seen_monotonic) * 1000.0, 2),
+            "bbox": self.bbox,
+            "velocity": self.motion.velocity,
+            "speed": round(self.motion.speed, 3),
+            "identity": {
+                "state": self.identity.state,
+                "candidate_name": self.identity.candidate_name,
+                "confirmed_name": self.identity.confirmed_name,
+                "best_score": self.identity.best_score,
+                "second_score": self.identity.second_score,
+                "margin": self.identity.margin,
+                "identity_age_ms": self.identity_age_ms,
+            },
+            "face": {
+                "visible": self.face_visible,
+                "quality": self.face_quality,
+                "yaw": self.yaw,
+            },
+            "liveness": {
+                "state": self.liveness.state,
+                "last_checked_monotonic": self.liveness.last_checked_monotonic,
+            },
+            "pose_state": self.pose_state,
+            "current_zone": self.current_zone,
+            "attendance_eligibility": self.attendance_eligibility,
+            "recent_observation_count": self.recent_observation_count,
+        }
+
+
+class EntityStateStore:
+    """Owns entity lifecycle and bounded observation history."""
+
+    def __init__(self, max_entities: int = 128, max_observations_per_type: int = 12,
+                 occluded_after_updates: int = 3, close_after_sec: float = 10.0,
+                 identity_stale_after_sec: float = 3.0):
+        self.max_entities = max(1, int(max_entities))
+        self.occluded_after_updates = max(1, int(occluded_after_updates))
+        self.close_after_sec = max(1.0, float(close_after_sec))
+        self.identity_stale_after_sec = max(0.1, float(identity_stale_after_sec))
+        self.entities: Dict[int, EntityState] = {}
+        self.history = ObservationHistory(max_per_type=max_observations_per_type, max_entities=max_entities)
+        self._next_entity_number = 1
+        self.closed_entities = 0
+        self.expired_observations_rejected = 0
+
+    def _new_entity(self, track_id: int, camera_id: str, now: float) -> EntityState:
+        entity = EntityState(
+            entity_id=f"{camera_id}:entity:{self._next_entity_number}",
+            entity_type="PERSON",
+            camera_id=camera_id,
+            track_id=int(track_id),
+            created_monotonic=now,
+            first_seen_monotonic=now,
+            last_seen_monotonic=now,
+            presence_started_monotonic=now,
+        )
+        self._next_entity_number += 1
+        self.entities[int(track_id)] = entity
+        return entity
+
+    def update_tracks(
+        self,
+        tracked: Dict[int, Tuple[int, int]],
+        camera_id: str = "cam_0",
+        now: Optional[float] = None,
+    ) -> List[EntityState]:
+        current = time.monotonic() if now is None else now
+        active_ids = {int(track_id) for track_id in tracked}
+        for track_id, center in tracked.items():
+            track_id = int(track_id)
+            entity = self.entities.get(track_id) or self._new_entity(track_id, camera_id, current)
+            entity.camera_id = camera_id
+            entity.lifecycle_state = EntityLifecycle.ACTIVE
+            entity.missing_updates = 0
+            entity.last_seen_monotonic = current
+            entity.update_center(center, current)
+        for track_id, entity in list(self.entities.items()):
+            if track_id in active_ids:
+                continue
+            entity.missing_updates += 1
+            elapsed = max(0.0, current - entity.last_seen_monotonic)
+            if elapsed >= self.close_after_sec:
+                entity.lifecycle_state = EntityLifecycle.CLOSED
+                self.history.clear_entity(track_id)
+                self.entities.pop(track_id, None)
+                self.closed_entities += 1
+            elif entity.missing_updates >= self.occluded_after_updates:
+                entity.lifecycle_state = EntityLifecycle.OCCLUDED
+            else:
+                entity.lifecycle_state = EntityLifecycle.STALE
+        if len(self.entities) > self.max_entities:
+            removable = sorted(
+                self.entities.values(),
+                key=lambda item: (item.lifecycle_state == EntityLifecycle.ACTIVE,
+                                  item.last_seen_monotonic),
+            )
+            for entity in removable[:len(self.entities) - self.max_entities]:
+                self.history.clear_entity(entity.track_id)
+                self.entities.pop(entity.track_id, None)
+                self.closed_entities += 1
+        self.history.prune(current)
+        return [self.entities[track_id] for track_id in sorted(active_ids) if track_id in self.entities]
+
+    def attach(self, observation: Observation) -> Optional[EntityState]:
+        if observation.entity_track_id is None:
+            return None
+        if observation.is_expired():
+            self.expired_observations_rejected += 1
+            return None
+        entity = self.entities.get(int(observation.entity_track_id))
+        if entity is None or entity.lifecycle_state == EntityLifecycle.CLOSED:
+            return None
+        self.history.add(observation)
+        entity.attach(observation)
+        return entity
+
+    def get(self, track_id: int) -> Optional[EntityState]:
+        return self.entities.get(int(track_id))
+
+    def active(self) -> List[EntityState]:
+        return [entity for entity in self.entities.values() if entity.lifecycle_state in {
+            EntityLifecycle.NEW, EntityLifecycle.ACTIVE, EntityLifecycle.OCCLUDED, EntityLifecycle.STALE
+        }]
+
+    def prune(self, now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else now
+        self.update_tracks({}, now=current)
+
+    def snapshot(self, now: Optional[float] = None) -> List[Dict[str, object]]:
+        current = time.monotonic() if now is None else now
+        for entity in self.active():
+            latest_face = self.history.latest(entity.track_id, ObservationType.FACE_DETECTED, current)
+            latest_quality = self.history.latest(entity.track_id, ObservationType.FACE_QUALITY, current)
+            latest_identity = self.history.latest(entity.track_id, ObservationType.FACE_IDENTITY_RESULT, current)
+            latest_liveness = self.history.latest(entity.track_id, ObservationType.LIVENESS_RESULT, current)
+            latest_pose = self.history.latest(entity.track_id, ObservationType.POSE_STATE, current)
+            entity.face_visible = latest_face is not None
+            if latest_quality is None:
+                entity.face_quality = None
+            if latest_identity is None and entity.identity.state == "CONFIRMED":
+                entity.identity.state = "STALE"
+                entity.attendance_eligibility = False
+            if latest_liveness is None:
+                entity.liveness.state = "NOT_EVALUATED"
+            if latest_pose is None:
+                entity.pose_state = None
+            entity.refresh(current)
+        return [entity.summary(current) for entity in sorted(self.active(), key=lambda item: item.track_id)]
+
+    def stats(self) -> Dict[str, int]:
+        return {
+            "active_entities": len(self.entities),
+            "closed_entities": self.closed_entities,
+            "expired_observations_rejected": self.expired_observations_rejected,
+            **self.history.stats(),
+        }
