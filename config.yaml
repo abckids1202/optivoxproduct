@@ -1,0 +1,25 @@
+camera:
+  sources: [0]
+  width: 1280
+  height: 720
+  fps_limit: 30
+
+detection:
+  yolo_model: yolov8n.pt
+  conf: 0.4
+  iou: 0.5
+  classes: [0]  
+
+tracking:
+  tracker: bytetrack
+  max_lost: 30
+
+face:
+  recognition_threshold: 0.45
+  analyze_every_n_frames: 10
+
+behavior:
+  loitering_seconds: 15
+
+logging:
+  log_dir: logs

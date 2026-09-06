@@ -1,6 +1,6 @@
 import { CalendarDays, ChevronLeft, ChevronRight, Clock, Download, Edit3, Search } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { correctAttendance, fetchAcademicOverview, fetchAttendanceCalendar } from "../services/api";
+import { correctAttendance, fetchAcademicOverview, fetchAttendanceCalendar, recordAbsence } from "../services/api";
 import StatCard from "../components/StatCard";
 
 export default function Attendance({ state }) {
@@ -9,6 +9,8 @@ export default function Attendance({ state }) {
   const [monthDate, setMonthDate] = useState(() => new Date());
   const [calendar, setCalendar] = useState(null);
   const [academic, setAcademic] = useState(null);
+  const [absenceForm, setAbsenceForm] = useState({ personId: "", date: new Date().toISOString().slice(0, 10), status: "excused", subject: "", reason: "" });
+  const [absenceSaving, setAbsenceSaving] = useState(false);
   const rows = state.attendance?.length ? state.attendance : [];
   const filteredRows = useMemo(() => rows.filter((person) => `${person.name} ${person.role} ${person.className}`.toLowerCase().includes(query.toLowerCase())), [rows, query]);
   useEffect(() => {
@@ -33,6 +35,23 @@ export default function Attendance({ state }) {
       window.alert("Attendance correction saved and added to the audit trail.");
     } catch (error) {
       window.alert(error.message);
+    }
+  }
+
+  async function saveAbsence(event) {
+    event.preventDefault();
+    if (!absenceForm.personId || !absenceForm.date) return;
+    setAbsenceSaving(true);
+    try {
+      await recordAbsence(Number(absenceForm.personId), { date: absenceForm.date, status: absenceForm.status, subject: absenceForm.subject || null, reason: absenceForm.reason || null });
+      const [nextCalendar, nextAcademic] = await Promise.all([fetchAttendanceCalendar(monthDate.getFullYear(), monthDate.getMonth() + 1), fetchAcademicOverview(monthDate.getFullYear(), monthDate.getMonth() + 1)]);
+      setCalendar(nextCalendar);
+      setAcademic(nextAcademic);
+      setAbsenceForm((current) => ({ ...current, reason: "" }));
+    } catch (error) {
+      window.alert(error.message);
+    } finally {
+      setAbsenceSaving(false);
     }
   }
 
@@ -107,7 +126,7 @@ export default function Attendance({ state }) {
         <div className="view-tabs"><button className={view === "today" ? "selected" : ""} type="button" onClick={() => setView("today")}>Daily logs</button><button className={view === "month" ? "selected" : ""} type="button" onClick={() => setView("month")}>Monthly matrix</button><button className={view === "subjects" ? "selected" : ""} type="button" onClick={() => setView("subjects")}>Subjects & absences</button></div>
         {view === "today" && <div className="attendance-summary-strip"><span><strong>{present}</strong> present today</span><span><strong>{late}</strong> late</span><span><strong>{left}</strong> clocked out</span><span><strong>{pending}</strong> not detected</span></div>}
         {view === "month" && <AttendanceMatrix calendar={calendar} query={query} />}
-        {view === "subjects" && <SubjectAbsencePanel academic={academic} />}
+        {view === "subjects" && <SubjectAbsencePanel academic={academic} people={state.people || []} absenceForm={absenceForm} setAbsenceForm={setAbsenceForm} absenceSaving={absenceSaving} onSaveAbsence={saveAbsence} />}
       </section>
     </div>
   );
@@ -125,9 +144,9 @@ function matrixMark(record) {
   return <span className={`matrix-mark ${record.status === "Late" ? "late" : "present"}`} aria-label={record.status}>{record.status === "Late" ? "L" : "✓"}</span>;
 }
 
-function SubjectAbsencePanel({ academic }) {
+function SubjectAbsencePanel({ academic, people, absenceForm, setAbsenceForm, absenceSaving, onSaveAbsence }) {
   if (!academic) return <p className="empty-copy">Loading academic profile data.</p>;
-  return <div className="academic-grid"><div><p className="eyebrow">Subjects in roster metadata</p><div className="subject-chips">{academic.subjects.length ? academic.subjects.map((subject) => <span className="subject-chip" key={subject}>{subject}</span>) : <span className="empty-copy">No subjects assigned yet.</span>}</div></div><div><p className="eyebrow">Person subject assignments</p><div className="subject-list">{academic.profiles.map((profile) => <div key={profile.person_id}><strong>{profile.name}</strong><span>{profile.subjects.length ? profile.subjects.join(" · ") : "No subjects assigned"}</span></div>)}</div></div><div className="absence-callout"><p className="eyebrow">Absence list</p><strong>{academic.absence_records.length} recorded exceptions</strong><p>{academic.absence_note}</p></div></div>;
+  return <div className="academic-stack"><div className="academic-grid"><div><p className="eyebrow">Subjects in roster metadata</p><div className="subject-chips">{academic.subjects.length ? academic.subjects.map((subject) => <span className="subject-chip" key={subject}>{subject}</span>) : <span className="empty-copy">No subjects assigned yet.</span>}</div></div><div><p className="eyebrow">Person subject assignments</p><div className="subject-list">{academic.profiles.map((profile) => <div key={profile.person_id}><strong>{profile.name}</strong><span>{profile.subjects.length ? profile.subjects.join(" · ") : "No subjects assigned"}</span></div>)}</div></div><div className="absence-callout"><p className="eyebrow">Absence list</p><strong>{academic.absence_records.length} recorded exceptions</strong><p>{academic.absence_note}</p></div></div><form className="absence-form" onSubmit={onSaveAbsence}><div><p className="eyebrow">Operator absence decision</p><p className="panel-note">Record official or excused absence separately from inferred non-detection.</p></div><select value={absenceForm.personId} onChange={(event) => setAbsenceForm((current) => ({ ...current, personId: event.target.value }))} required><option value="">Select person</option>{people.map((person) => <option value={person.id} key={person.id}>{person.name}</option>)}</select><input type="date" value={absenceForm.date} onChange={(event) => setAbsenceForm((current) => ({ ...current, date: event.target.value }))} required /><select value={absenceForm.status} onChange={(event) => setAbsenceForm((current) => ({ ...current, status: event.target.value }))}><option value="excused">Excused</option><option value="official">Official absence</option><option value="inferred">Inferred</option></select><input value={absenceForm.subject} onChange={(event) => setAbsenceForm((current) => ({ ...current, subject: event.target.value }))} placeholder="Subject optional" /><input value={absenceForm.reason} onChange={(event) => setAbsenceForm((current) => ({ ...current, reason: event.target.value }))} placeholder="Reason or evidence" /><button type="submit" disabled={absenceSaving}>{absenceSaving ? "Saving..." : "Record absence"}</button></form><div className="absence-record-list">{academic.absence_records.slice(0, 12).map((absence) => <div key={`${absence.person_id}-${absence.date}-${absence.subject || "all"}`}><strong>{absence.date} · {absence.name}</strong><span>{absence.status} {absence.subject ? `· ${absence.subject}` : ""} {absence.reason ? `· ${absence.reason}` : ""}</span></div>)}</div></div>;
 }
 
 function shiftMonth(setter, amount) { setter((current) => new Date(current.getFullYear(), current.getMonth() + amount, 1)); }

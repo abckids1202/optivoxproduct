@@ -1,8 +1,10 @@
 import { BellRing, Camera, Cpu, Database, Gauge, HardDrive, Radio } from "lucide-react";
+import { useEffect, useState } from "react";
 import StatCard from "../components/StatCard";
-import { sendCommand } from "../services/api";
+import { fetchPerformanceReport, sendCommand } from "../services/api";
 
 export default function System({ state, connection }) {
+  const [performanceReport, setPerformanceReport] = useState(null);
   const runtime = state.runtime || {};
   const capabilities = runtime.capabilities || {};
   const performance = state.performance || {};
@@ -12,6 +14,15 @@ export default function System({ state, connection }) {
   const visionCounters = visionPerformance;
   const models = visionPerformance.models || {};
   const resources = performance.resource || {};
+  const operational = state.operational || {};
+
+  useEffect(() => {
+    fetchPerformanceReport().then(setPerformanceReport).catch(() => setPerformanceReport(null));
+  }, [state.generatedAt]);
+
+  function metric(value, suffix = "") {
+    return value === null || value === undefined ? "Not measured" : `${value}${suffix}`;
+  }
 
   async function runCommand(command, confirmText) {
     if (confirmText && !window.confirm(confirmText)) return;
@@ -61,6 +72,27 @@ export default function System({ state, connection }) {
       <section className="panel">
         <div className="section-heading">
           <div>
+            <p className="eyebrow">Correlation core</p>
+            <h2>Operational state</h2>
+          </div>
+          <Radio size={20} aria-hidden="true" />
+        </div>
+        <div className="system-grid">
+          {[
+            ["Active presence sessions", operational.activePresenceSessions],
+            ["Confirmed entities", operational.activeConfirmedEntities],
+            ["Unresolved entities", operational.activeUnresolvedEntities],
+            ["Recognition evidence", operational.recognitionEvidence],
+            ["Confirmed evidence", operational.confirmedEvidence],
+            ["Rejected or uncertain evidence", operational.rejectedEvidence],
+          ].map(([name, value]) => <div className="system-row" key={name}><span>{name}</span><strong>{metric(value)}</strong></div>)}
+        </div>
+        <p className="panel-note">Sessions represent correlated presence. Evidence represents recognition decisions. Neither count is a frame total.</p>
+      </section>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
             <p className="eyebrow">Performance telemetry</p>
             <h2>Live pipeline health</h2>
           </div>
@@ -68,25 +100,25 @@ export default function System({ state, connection }) {
         </div>
         <div className="system-grid">
           {[
-            ["Inference rate", `${performance.inference_fps || 0} FPS`],
-            ["Capture rate", `${performance.capture_fps || 0} FPS`],
-            ["Display rate", `${performance.display_fps || 0} FPS`],
-            ["Inference p95", `${latency.inference_p95 || 0} ms`],
-            ["Frame age at start", `${latency.frame_age_start_avg || 0} ms avg`],
-            ["Frame age at completion", `${latency.frame_age_end_avg || 0} ms avg`],
-            ["Frame age at display", `${latency.display_frame_age_avg || 0} ms avg`],
-            ["Latest frame age", `${latency.latest_frame_age || 0} ms`],
-            ["Frames consumed", counters.frames_consumed || 0],
-            ["Frames replaced", counters.frames_replaced || 0],
-            ["Frame IDs skipped", counters.frame_ids_skipped || 0],
-            ["Stale frames dropped", counters.stale_frames_dropped || 0],
-            ["Side-effect queue", performance.queue_depths?.side_effects || 0],
-            ["Critical queue drops", counters.critical_queue_drops || 0],
-            ["Recognition cache hits", visionCounters.recognition_cache_hits || 0],
-            ["Embedding skips", visionCounters.embeddings_skipped_due_to_cache || 0],
-            ["Embedding calls/sec", models.face_embedding?.calls_per_second || 0],
-            ["Matcher calls/sec", models.identity_matching?.calls_per_second || 0],
-            ["ROI inference runs", visionCounters.roi_inference_runs || 0],
+            ["Inference rate", metric(performance.inference_fps, " FPS")],
+            ["Capture rate", metric(performance.capture_fps, " FPS")],
+            ["Display rate", metric(performance.display_fps, " FPS")],
+            ["Inference p95", metric(latency.inference_p95, " ms")],
+            ["Frame age at start", metric(latency.frame_age_start_avg, " ms avg")],
+            ["Frame age at completion", metric(latency.frame_age_end_avg, " ms avg")],
+            ["Frame age at display", metric(latency.display_frame_age_avg, " ms avg")],
+            ["Latest frame age", metric(latency.latest_frame_age, " ms")],
+            ["Frames consumed", metric(counters.frames_consumed)],
+            ["Frames replaced", metric(counters.frames_replaced)],
+            ["Frame IDs skipped", metric(counters.frame_ids_skipped)],
+            ["Stale frames dropped", metric(counters.stale_frames_dropped)],
+            ["Side-effect queue", metric(performance.queue_depths?.side_effects)],
+            ["Critical queue drops", metric(counters.critical_queue_drops)],
+            ["Recognition cache hits", metric(visionCounters.recognition_cache_hits)],
+            ["Embedding skips", metric(visionCounters.embeddings_skipped_due_to_cache)],
+            ["Embedding calls/sec", metric(models.face_embedding?.calls_per_second)],
+            ["Matcher calls/sec", metric(models.identity_matching?.calls_per_second)],
+            ["ROI inference runs", metric(visionCounters.roi_inference_runs)],
             ["Process CPU", resources.cpu_percent == null ? "Not measured" : `${resources.cpu_percent}%`],
             ["Process RAM", resources.process_rss_mb == null ? "Not measured" : `${resources.process_rss_mb} MB`],
           ].map(([name, value]) => (
@@ -96,6 +128,7 @@ export default function System({ state, connection }) {
             </div>
           ))}
         </div>
+        {performanceReport && <p className="panel-note">Saved benchmark: <strong>{performanceReport.measurement_status}</strong>{performanceReport.benchmark_age_seconds != null ? ` · ${Math.round(performanceReport.benchmark_age_seconds / 3600)}h old` : ""}. GPU and VRAM remain explicitly unmeasured when the runtime cannot provide them.</p>}
       </section>
 
       <section className="panel">

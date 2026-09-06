@@ -17,6 +17,13 @@ class CorrectionRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
+class AbsenceRequest(BaseModel):
+    date: str = Field(min_length=10, max_length=10)
+    status: str = Field(min_length=1, max_length=20)
+    subject: str | None = Field(default=None, max_length=120)
+    reason: str | None = Field(default=None, max_length=500)
+
+
 @router.get("/today")
 def today():
     return svc.today_attendance()
@@ -42,21 +49,31 @@ def person(person_id: int):
     return svc.person_attendance(person_id)
 
 
+@router.get("/absences")
+def absences(person_id: int | None = None, start: str | None = None, end: str | None = None):
+    return svc.list_absences(person_id=person_id, start=start, end=end)
+
+
 @router.get("/export")
 def export():
     return svc.export_csv()
 
 
-@router.post("/{person_id}/clock-in", dependencies=[Depends(require_operator)])
-def clock_in(person_id: int):
-    return svc.clock_in(person_id)
+@router.post("/{person_id}/clock-in")
+def clock_in(person_id: int, actor: str = Depends(require_operator)):
+    return svc.clock_in(person_id, actor_id=actor)
 
 
-@router.post("/{person_id}/clock-out", dependencies=[Depends(require_operator)])
-def clock_out(person_id: int):
-    return svc.clock_out(person_id)
+@router.post("/{person_id}/clock-out")
+def clock_out(person_id: int, actor: str = Depends(require_operator)):
+    return svc.clock_out(person_id, actor_id=actor)
 
 
-@router.post("/{person_id}/correct", dependencies=[Depends(require_admin)])
-def correct(person_id: int, payload: CorrectionRequest):
-    return svc.correct_attendance(person_id, payload.date, payload.clock_in, payload.clock_out, payload.late_minutes, payload.reason)
+@router.post("/{person_id}/correct")
+def correct(person_id: int, payload: CorrectionRequest, actor: str = Depends(require_admin)):
+    return svc.correct_attendance(person_id, payload.date, payload.clock_in, payload.clock_out, payload.late_minutes, payload.reason, actor_id=actor)
+
+
+@router.post("/{person_id}/absence")
+def absence(person_id: int, payload: AbsenceRequest, actor: str = Depends(require_admin)):
+    return svc.record_absence(person_id, payload.date, payload.status, payload.subject, payload.reason, actor_id=actor)

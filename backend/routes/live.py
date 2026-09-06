@@ -8,6 +8,7 @@ from ..services.analytics_service import attendance as attendance_analytics, sec
 from ..services.attendance_service import attendance_summary, today_attendance
 from ..services.event_service import event_summary, list_events
 from ..services.incident_service import list_incidents
+from ..services.operational_service import summary as operational_summary
 from ..services.people_service import list_people
 
 router = APIRouter(tags=["live"])
@@ -26,6 +27,7 @@ def live_status():
     state["summary"]["openIncidents"] = sum(1 for incident in state["incidents"] if incident["status"] not in {"dismissed", "resolved"})
     state["summary"]["securityObservations"] = event_summary()["total"]
     state["summary"]["securityEvents"] = state["summary"]["openIncidents"]
+    state["operational"] = operational_summary()
     state["analytics"] = {
         **attendance_analytics(),
         **security_analytics(),

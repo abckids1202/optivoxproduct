@@ -8,7 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import FRONTEND_ORIGINS
 from .platform_schema import ensure_platform_schema
-from .routes import academic, analytics, attendance, commands, events, health, incidents, live, people, system
+from .routes import academic, analytics, attendance, auth, commands, events, health, incidents, live, operations, people, system
+from .services.auth_service import bootstrap_configured_users
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("optivox.backend")
@@ -16,6 +17,7 @@ logger = logging.getLogger("optivox.backend")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_platform_schema()
+    bootstrap_configured_users()
     logger.info("OptiVox backend started")
     yield
     logger.info("OptiVox backend stopped")
@@ -36,16 +38,18 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 for router in [
     health.router,
+    auth.router,
     live.router,
     attendance.router,
     events.router,
     incidents.router,
+    operations.router,
     people.router,
     analytics.router,
     commands.router,

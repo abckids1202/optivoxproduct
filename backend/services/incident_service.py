@@ -6,7 +6,7 @@ from fastapi import HTTPException
 
 from ..database import get_connection, fetch_all, fetch_one, execute
 from .audit_service import record_action
-from .event_service import event_category, severity_label
+from .event_service import event_category, normalize_event, severity_label
 
 
 def _severity(value: Any) -> int:
@@ -21,7 +21,8 @@ def sync_incidents() -> None:
     with get_connection() as con:
         rows = con.execute(
             """
-            select id, event_type, severity, timestamp, details_json
+            select id, event_type, severity, timestamp, details_json,
+                   entity_id, camera_id, location
             from events
             where coalesce(severity, 0) >= 1
                or upper(event_type) like '%SPOOF%'
@@ -39,11 +40,14 @@ def sync_incidents() -> None:
             incident = con.execute(
                 """
                 select id, severity from incidents
-                where category=? and status not in ('dismissed', 'resolved')
+                where category=? and coalesce(entity_id, '')=coalesce(?, '')
+                  and coalesce(camera_id, '')=coalesce(?, '')
+                  and coalesce(location, '')=coalesce(?, '')
+                  and status not in ('dismissed', 'resolved')
                   and abs(julianday(last_event_at) - julianday(?)) <= (10.0 / 1440.0)
                 order by last_event_at desc limit 1
                 """,
-                [category, row["timestamp"]],
+                [category, row["entity_id"], row["camera_id"], row["location"], row["timestamp"]],
             ).fetchone()
             if incident:
                 incident_id = incident["id"]
@@ -57,13 +61,35 @@ def sync_incidents() -> None:
             else:
                 cur = con.execute(
                     """
-                    insert into incidents (status, category, severity, summary, first_event_at, last_event_at)
-                    values ('open', ?, ?, ?, ?, ?)
+                    insert into incidents (status, category, severity, summary, first_event_at, last_event_at, entity_id, camera_id, location)
+                    values ('open', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    [category, _severity(row["severity"]), f"{category} activity requires review", row["timestamp"], row["timestamp"]],
+                    [category, _severity(row["severity"]), f"{category} activity requires review", row["timestamp"], row["timestamp"], row["entity_id"], row["camera_id"], row["location"]],
                 )
                 incident_id = cur.lastrowid
             con.execute("insert or ignore into incident_events (incident_id, event_id) values (?, ?)", [incident_id, event_id])
+            # Alert delivery is recorded separately from the incident decision.
+            # Match the runtime's alert log to the source observation by type and
+            # a narrow timestamp window, then make the link idempotent.
+            if con.execute("select 1 from sqlite_master where type='table' and name='alert_log'").fetchone():
+                alert_rows = con.execute(
+                    """
+                    select id, channel, status, error, timestamp
+                    from alert_log
+                    where event_type=? and abs(julianday(timestamp)-julianday(?)) <= (2.0 / 1440.0)
+                    """,
+                    [row["event_type"], row["timestamp"]],
+                ).fetchall()
+                for alert in alert_rows:
+                    con.execute(
+                        """
+                        insert into incident_alerts
+                            (incident_id, channel, status, attempted_at, delivered_at, error, source_alert_id)
+                        select ?, ?, ?, ?, case when lower(coalesce(?, '')) in ('sent','delivered','success') then ? else null end, ?, ?
+                        where not exists (select 1 from incident_alerts where incident_id=? and source_alert_id=? )
+                        """,
+                        [incident_id, alert["channel"], alert["status"] or "unknown", alert["timestamp"], alert["timestamp"], alert["error"], alert["id"], incident_id, alert["id"]],
+                    )
         con.commit()
 
 
@@ -79,6 +105,11 @@ def _normalize(row: dict[str, Any]) -> dict[str, Any]:
         "event_count": int(row.get("event_count") or 0),
         "resolution_note": row.get("resolution_note"),
         "updated_at": row.get("updated_at"),
+        "entityId": row.get("entity_id"),
+        "cameraId": row.get("camera_id"),
+        "location": row.get("location"),
+        "assignedTo": row.get("assigned_to"),
+        "falsePositive": bool(row.get("false_positive")),
     }
 
 
@@ -117,7 +148,7 @@ def get_incident(incident_id: int) -> dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail={"code": "INCIDENT_NOT_FOUND", "message": "Incident was not found."})
     result = _normalize(row)
-    result["events"] = fetch_all(
+    result["events"] = [normalize_event(row) for row in fetch_all(
         """
         select e.*, p.name as person_name
         from incident_events ie join events e on e.id=ie.event_id
@@ -125,20 +156,45 @@ def get_incident(incident_id: int) -> dict[str, Any]:
         where ie.incident_id=? order by e.timestamp desc
         """,
         [incident_id],
+    )]
+    result["review_actions"] = fetch_all(
+        "select * from incident_review_actions where incident_id=? order by created_at desc, id desc",
+        [incident_id],
+    )
+    result["alerts"] = fetch_all(
+        "select * from incident_alerts where incident_id=? order by attempted_at desc, id desc",
+        [incident_id],
     )
     return result
 
 
-def review_incident(incident_id: int, action: str, note: str | None = None) -> dict[str, Any]:
-    allowed = {"confirm": "confirmed", "dismiss": "dismissed", "escalate": "escalated", "resolve": "resolved"}
+def review_incident(incident_id: int, action: str, note: str | None = None, actor_id: str | None = None) -> dict[str, Any]:
+    allowed = {"confirm": "confirmed", "dismiss": "dismissed", "false_positive": "dismissed", "escalate": "escalated", "resolve": "resolved"}
     status = allowed.get(action)
     if not status:
-        raise HTTPException(status_code=400, detail={"code": "INVALID_REVIEW_ACTION", "message": "Use confirm, dismiss, escalate, or resolve."})
+        raise HTTPException(status_code=400, detail={"code": "INVALID_REVIEW_ACTION", "message": "Use confirm, dismiss, false_positive, escalate, or resolve."})
     if not fetch_one("select id from incidents where id=?", [incident_id]):
         raise HTTPException(status_code=404, detail={"code": "INCIDENT_NOT_FOUND", "message": "Incident was not found."})
     execute(
-        "update incidents set status=?, resolution_note=?, updated_at=datetime('now'), resolved_at=case when ? in ('resolved','dismissed') then datetime('now') else resolved_at end, resolved_by=case when ? in ('resolved','dismissed') then 'operator' else resolved_by end where id=?",
-        [status, (note or "").strip()[:500] or None, status, status, incident_id],
+        "update incidents set status=?, resolution_note=?, false_positive=case when ?='false_positive' then 1 else false_positive end, updated_at=datetime('now'), resolved_at=case when ? in ('resolved','dismissed') then datetime('now') else resolved_at end, resolved_by=case when ? in ('resolved','dismissed') then ? else resolved_by end where id=?",
+        [status, (note or "").strip()[:500] or None, action, status, status, actor_id or "operator", incident_id],
     )
-    record_action("incident.review", "incident", incident_id, {"status": status, "note": note or ""})
+    execute(
+        "insert into incident_review_actions (incident_id, action, note, actor_id) values (?, ?, ?, ?)",
+        [incident_id, action, (note or "").strip()[:500] or None, actor_id or "operator"],
+    )
+    record_action("incident.review", "incident", incident_id, {"status": status, "note": note or "", "action": action}, actor_id=actor_id)
+    return get_incident(incident_id)
+
+
+def assign_incident(incident_id: int, assignee: str | None, actor_id: str | None = None) -> dict[str, Any]:
+    if not fetch_one("select id from incidents where id=?", [incident_id]):
+        raise HTTPException(status_code=404, detail={"code": "INCIDENT_NOT_FOUND", "message": "Incident was not found."})
+    assignee = (assignee or "").strip()[:120] or None
+    execute("update incidents set assigned_to=?, updated_at=datetime('now') where id=?", [assignee, incident_id])
+    execute(
+        "insert into incident_review_actions (incident_id, action, note, actor_id) values (?, 'assign', ?, ?)",
+        [incident_id, assignee, actor_id or "operator"],
+    )
+    record_action("incident.assign", "incident", incident_id, {"assignee": assignee}, actor_id=actor_id)
     return get_incident(incident_id)

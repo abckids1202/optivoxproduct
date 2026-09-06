@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
 
-from ..config import CAPABILITY_PATH, DEVICE_ID, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, TIMEZONE
+from ..config import CAPABILITY_PATH, DEVICE_ID, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, PERFORMANCE_SUMMARY_PATH, TIMEZONE
 
 
 def now_iso() -> str:
@@ -71,6 +71,7 @@ def live_state() -> dict[str, Any]:
     objects = state.get("objects", [])
     security = state.get("security", {})
     performance = state.get("performance", {})
+    performance_summary = read_json(PERFORMANCE_SUMMARY_PATH, {}) or {}
     correlation = state.get("correlation", {})
     return {
         "generatedAt": now_iso(),
@@ -99,6 +100,7 @@ def live_state() -> dict[str, Any]:
             "frameHeight": engine.get("frame_height"),
         },
         "performance": performance,
+        "performanceSummary": performance_summary,
         "correlation": correlation,
         "security": {
             "level": security.get("level", "normal"),
@@ -116,6 +118,64 @@ def live_state() -> dict[str, Any]:
         "objects": normalize_objects(objects),
         "events": state.get("recent_events", []),
     }
+
+
+def performance_report() -> dict[str, Any]:
+    """Return measured values when a fresh benchmark exists, otherwise explicit unknowns."""
+    report = read_json(PERFORMANCE_SUMMARY_PATH, {}) or {}
+    required = {
+        "capture_fps": None,
+        "inference_fps": None,
+        "display_fps": None,
+        "face_detection_latency_ms": None,
+        "recognition_latency_ms": None,
+        "yolo_latency_ms": None,
+        "pose_latency_ms": None,
+        "frame_age_p95_ms": None,
+        "end_to_end_latency_ms": None,
+        "cpu_percent": None,
+        "gpu_percent": None,
+        "vram_used_mb": None,
+        "recognition_attempts_per_second": None,
+        "identity_confirmation_ms": None,
+        "frames_replaced": None,
+    }
+    latency = report.get("latency_ms", {}) if isinstance(report.get("latency_ms", {}), dict) else {}
+    vision = report.get("vision", {}) if isinstance(report.get("vision", {}), dict) else {}
+    models = vision.get("models", {}) if isinstance(vision.get("models", {}), dict) else {}
+    resources = report.get("resource", {}) if isinstance(report.get("resource", {}), dict) else {}
+    matching = models.get("identity_matching", {}) if isinstance(models.get("identity_matching", {}), dict) else {}
+    identity_timing = vision.get("identity_timing", {}) if isinstance(vision.get("identity_timing", {}), dict) else {}
+    values = {**required, **report}
+    values.update({
+        "face_detection_latency_ms": (models.get("face_detection") or {}).get("average_latency_ms"),
+        "recognition_latency_ms": matching.get("average_latency_ms"),
+        "yolo_latency_ms": (models.get("yolo") or {}).get("average_latency_ms"),
+        "pose_latency_ms": (models.get("pose") or {}).get("average_latency_ms"),
+        "frame_age_p95_ms": latency.get("frame_age_p95"),
+        "cpu_percent": resources.get("cpu_percent"),
+        "gpu_percent": resources.get("gpu_percent"),
+        "vram_used_mb": resources.get("vram_used_mb"),
+        "recognition_attempts_per_second": matching.get("calls_per_second"),
+        "identity_confirmation_ms": round(float(identity_timing.get("mean_time_to_confirm_sec")) * 1000, 2) if identity_timing.get("mean_time_to_confirm_sec") is not None else None,
+        "frames_replaced": (report.get("counters") or {}).get("frames_replaced"),
+        "end_to_end_latency_ms": None,
+    })
+    ended_at = (report.get("benchmark") or {}).get("ended_at")
+    age_seconds = None
+    if ended_at:
+        try:
+            parsed = datetime.fromisoformat(str(ended_at).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_seconds = max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    values["measurement_status"] = "NOT_MEASURED" if not report else ("FRESH" if age_seconds is not None and age_seconds <= 86400 else "STALE")
+    values["benchmark_age_seconds"] = round(age_seconds, 1) if age_seconds is not None else None
+    values["benchmark"] = report.get("benchmark", {})
+    values["source"] = str(PERFORMANCE_SUMMARY_PATH)
+    return values
 
 
 def live_detections() -> dict[str, Any]:

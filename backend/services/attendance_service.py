@@ -41,7 +41,22 @@ def normalize_attendance(row: dict[str, Any]) -> dict[str, Any]:
         "work_minutes": row.get("work_minutes") or 0,
         "late": int(row.get("late_minutes") or 0) > 0,
         "late_minutes": row.get("late_minutes") or 0,
+        "attendanceStatus": row.get("attendance_status") or "recorded",
+        "absenceType": row.get("absence_type"),
+        "official": bool(row.get("is_official", 1)),
+        "subject": row.get("subject"),
+        "scheduleKey": row.get("schedule_key"),
+        "expectedStart": row.get("expected_start"),
+        "expectedEnd": row.get("expected_end"),
+        "earlyDepartureMinutes": row.get("early_departure_minutes") or 0,
         "confidence": row.get("recognition_confidence"),
+        "presenceSessionId": row.get("presence_session_id"),
+        "recognitionEvidenceId": row.get("recognition_evidence_id"),
+        "decisionSource": row.get("decision_source") or attendance_method(row.get("notes")),
+        "identityState": row.get("identity_state"),
+        "livenessStatus": row.get("liveness_status"),
+        "sourceFrameId": row.get("source_frame_id"),
+        "evidencePath": row.get("evidence_path"),
         "method": attendance_method(row.get("notes")),
         "camera": row.get("camera_id"),
         "location": row.get("location"),
@@ -112,6 +127,10 @@ def attendance_summary() -> dict[str, Any]:
     rows = today_attendance()
     roster = fetch_one("select count(*) as c from people where lower(coalesce(metadata_json,'')) not like '%\"active\": false%'") or {"c": 0}
     detected = len(rows)
+    today_absences = fetch_one(
+        "select sum(case when is_official=1 then 1 else 0 end) as official, sum(case when is_official=0 then 1 else 0 end) as inferred from absence_records where absence_date=?",
+        [local_today().isoformat()],
+    ) or {}
     return {
         "total": int(roster.get("c") or 0),
         "present": sum(1 for r in rows if r["status"] in ("Present", "Late")),
@@ -119,6 +138,8 @@ def attendance_summary() -> dict[str, Any]:
         "left": sum(1 for r in rows if r["status"] == "Left"),
         "detected": detected,
         "not_yet_detected": max(0, int(roster.get("c") or 0) - detected),
+        "official_absences": int(today_absences.get("official") or 0),
+        "inferred_absences": int(today_absences.get("inferred") or 0),
     }
 
 
@@ -149,6 +170,34 @@ def attendance_calendar(year: int | None = None, month: int | None = None) -> di
     for row in rows:
         normalized = normalize_attendance(row)
         records[f"{row['person_id']}:{row['date']}"] = normalized
+    absence_rows = fetch_all(
+        """
+        select a.*, p.name, p.role, p.metadata_json
+        from absence_records a join people p on p.id=a.person_id
+        where a.absence_date between ? and ?
+        order by a.absence_date desc, p.name
+        """,
+        [start, end],
+    )
+    for absence in absence_rows:
+        key = f"{absence['person_id']}:{absence['absence_date']}"
+        if key in records:
+            continue
+        records[key] = {
+            "id": None,
+            "person_id": absence["person_id"],
+            "name": absence.get("name"),
+            "person": absence.get("name"),
+            "role": absence.get("role"),
+            "className": metadata_class(absence.get("metadata_json")),
+            "date": absence["absence_date"],
+            "status": absence["status"].replace("_", " ").title(),
+            "absenceStatus": absence["status"],
+            "absenceReason": absence.get("reason"),
+            "official": bool(absence.get("is_official")),
+            "subject": absence.get("subject") or None,
+            "decisionSource": absence.get("source") or "system",
+        }
     days = [f"{year:04d}-{month:02d}-{day:02d}" for day in range(1, days_in_month + 1)]
     roster = [{
         "id": person["id"],
@@ -157,7 +206,25 @@ def attendance_calendar(year: int | None = None, month: int | None = None) -> di
         "subjects": metadata_subjects(person.get("metadata_json")),
         "records": {day: records.get(f"{person['id']}:{day}") for day in days},
     } for person in people]
-    return {"year": year, "month": month, "days": days, "people": roster}
+    return {
+        "year": year,
+        "month": month,
+        "days": days,
+        "people": roster,
+        "absenceRecords": [
+            {
+                "id": row["id"],
+                "person_id": row["person_id"],
+                "date": row["absence_date"],
+                "subject": row.get("subject") or None,
+                "status": row["status"],
+                "reason": row.get("reason"),
+                "official": bool(row.get("is_official")),
+                "source": row.get("source"),
+            }
+            for row in absence_rows
+        ],
+    }
 
 
 def metadata_subjects(value: Any) -> list[str]:
@@ -172,10 +239,88 @@ def metadata_subjects(value: Any) -> list[str]:
     return [str(subject) for subject in subjects if str(subject).strip()]
 
 
-def clock_in(person_id: int) -> dict[str, Any]:
-    person = fetch_one("select id from people where id=?", [person_id])
+def list_absences(person_id: int | None = None, start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
+    where = []
+    params: list[Any] = []
+    if person_id is not None:
+        where.append("a.person_id=?")
+        params.append(person_id)
+    if start:
+        where.append("a.absence_date>=?")
+        params.append(start)
+    if end:
+        where.append("a.absence_date<=?")
+        params.append(end)
+    sql = """
+        select a.*, p.name, p.role, p.metadata_json
+        from absence_records a join people p on p.id=a.person_id
+    """
+    if where:
+        sql += " where " + " and ".join(where)
+    sql += " order by a.absence_date desc, p.name"
+    return [
+        {
+            "id": row["id"], "person_id": row["person_id"], "name": row["name"],
+            "date": row["absence_date"], "subject": row.get("subject") or None,
+            "status": row["status"], "reason": row.get("reason"),
+            "official": bool(row.get("is_official")), "source": row.get("source"),
+            "actor_id": row.get("actor_id"), "created_at": row.get("created_at"),
+        }
+        for row in fetch_all(sql, params)
+    ]
+
+
+def record_absence(
+    person_id: int,
+    absence_date: str,
+    status: str,
+    subject: str | None = None,
+    reason: str | None = None,
+    actor_id: str | None = None,
+) -> dict[str, Any]:
+    if not fetch_one("select id from people where id=?", [person_id]):
+        raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
+    try:
+        datetime.strptime(absence_date, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail={"code": "INVALID_DATE", "message": "Use an absence date in YYYY-MM-DD format."})
+    status = str(status or "").strip().lower()
+    if status not in {"inferred", "official", "excused"}:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_ABSENCE_STATUS", "message": "Use inferred, official, or excused."})
+    reason = (reason or "").strip()[:500] or None
+    official = 1 if status in {"official", "excused"} else 0
+    execute(
+        """
+        insert into absence_records (person_id, absence_date, subject, status, reason, source, is_official, actor_id)
+        values (?, ?, ?, ?, ?, 'operator', ?, ?)
+        on conflict(person_id, absence_date, subject) do update set
+          status=excluded.status, reason=excluded.reason, source=excluded.source,
+          is_official=excluded.is_official, actor_id=excluded.actor_id, updated_at=datetime('now')
+        """,
+        [person_id, absence_date, (subject or "").strip()[:120], status, reason, official, actor_id],
+    )
+    record_action("attendance.absence_record", "absence", person_id, {"date": absence_date, "status": status, "subject": subject or ""}, actor_id=actor_id)
+    row = fetch_one(
+        "select a.*, p.name from absence_records a join people p on p.id=a.person_id where a.person_id=? and a.absence_date=? and a.subject=?",
+        [person_id, absence_date, (subject or "").strip()[:120]],
+    )
+    return {
+        "id": row["id"], "person_id": row["person_id"], "name": row["name"],
+        "date": row["absence_date"], "subject": row.get("subject") or None,
+        "status": row["status"], "reason": row.get("reason"), "official": bool(row.get("is_official")),
+    }
+
+
+def clock_in(person_id: int, actor_id: str | None = None) -> dict[str, Any]:
+    person = fetch_one("select id, metadata_json from people where id=?", [person_id])
     if not person:
         raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
+    try:
+        person_metadata = json.loads(person.get("metadata_json") or "{}")
+    except (TypeError, ValueError):
+        person_metadata = {}
+    if isinstance(person_metadata, dict) and not person_metadata.get("active", True):
+        raise HTTPException(status_code=409, detail={"code": "PERSON_INACTIVE", "message": "Inactive profiles cannot be clocked in."})
     today = local_today().isoformat()
     now = local_now().isoformat(timespec="seconds")
     existing = fetch_one("select * from attendance where person_id=? and date=?", [person_id, today])
@@ -183,17 +328,17 @@ def clock_in(person_id: int) -> dict[str, Any]:
         return {"status": "already_clocked_in", "record": normalize_attendance({**existing, "name": None, "role": None, "metadata_json": None})}
     execute(
         """
-        insert into attendance (person_id, date, clock_in, late_minutes, notes)
-        values (?, ?, ?, 0, 'manual_web')
-        on conflict(person_id, date) do update set clock_in=coalesce(attendance.clock_in, excluded.clock_in), notes='manual_web'
+        insert into attendance (person_id, date, clock_in, late_minutes, notes, attendance_status, decision_source, is_official)
+        values (?, ?, ?, 0, 'manual_web', 'manual', 'manual', 1)
+        on conflict(person_id, date) do update set clock_in=coalesce(attendance.clock_in, excluded.clock_in), notes='manual_web', decision_source='manual'
         """,
         [person_id, today, now],
     )
-    record_action("attendance.clock_in", "attendance", person_id, {"method": "Manual", "date": today})
+    record_action("attendance.clock_in", "attendance", person_id, {"method": "Manual", "date": today}, actor_id=actor_id)
     return {"status": "clocked_in", "person_id": person_id}
 
 
-def clock_out(person_id: int) -> dict[str, Any]:
+def clock_out(person_id: int, actor_id: str | None = None) -> dict[str, Any]:
     person = fetch_one("select id from people where id=?", [person_id])
     if not person:
         raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
@@ -202,8 +347,8 @@ def clock_out(person_id: int) -> dict[str, Any]:
     existing = fetch_one("select * from attendance where person_id=? and date=?", [person_id, today])
     if not existing or not existing.get("clock_in"):
         raise HTTPException(status_code=400, detail={"code": "NOT_CLOCKED_IN", "message": "Person is not clocked in today."})
-    execute("update attendance set clock_out=?, notes='manual_web' where person_id=? and date=?", [now, person_id, today])
-    record_action("attendance.clock_out", "attendance", person_id, {"method": "Manual", "date": today})
+    execute("update attendance set clock_out=?, notes='manual_web', decision_source='manual' where person_id=? and date=?", [now, person_id, today])
+    record_action("attendance.clock_out", "attendance", person_id, {"method": "Manual", "date": today}, actor_id=actor_id)
     return {"status": "clocked_out", "person_id": person_id}
 
 
@@ -214,6 +359,7 @@ def correct_attendance(
     clock_out: str | None,
     late_minutes: int,
     reason: str,
+    actor_id: str | None = None,
 ) -> dict[str, Any]:
     person = fetch_one("select id from people where id=?", [person_id])
     if not person:
@@ -238,21 +384,22 @@ def correct_attendance(
     notes = f"corrected: {reason[:350]}"
     if existing:
         execute(
-            "update attendance set clock_in=?, clock_out=?, work_minutes=?, late_minutes=?, notes=? where person_id=? and date=?",
+            "update attendance set clock_in=?, clock_out=?, work_minutes=?, late_minutes=?, notes=?, attendance_status='corrected', decision_source='manual_correction', is_official=1 where person_id=? and date=?",
             [clock_in, clock_out, work_minutes, max(0, min(int(late_minutes), 1440)), notes, person_id, attendance_date],
         )
         attendance_id = existing["id"]
     else:
         attendance_id = execute(
-            "insert into attendance (person_id, date, clock_in, clock_out, work_minutes, late_minutes, notes) values (?, ?, ?, ?, ?, ?, ?)",
+            "insert into attendance (person_id, date, clock_in, clock_out, work_minutes, late_minutes, notes, attendance_status, decision_source, is_official) values (?, ?, ?, ?, ?, ?, ?, 'corrected', 'manual_correction', 1)",
             [person_id, attendance_date, clock_in, clock_out, work_minutes, max(0, min(int(late_minutes), 1440)), notes],
         )
     after = fetch_one("select * from attendance where id=?", [attendance_id]) or {}
-    execute(
+    correction_id = execute(
         "insert into attendance_corrections (attendance_id, person_id, attendance_date, before_json, after_json, reason, actor_id) values (?, ?, ?, ?, ?, ?, 'operator')",
         [attendance_id, person_id, attendance_date, json.dumps(before, default=str), json.dumps(after, default=str), reason],
     )
-    record_action("attendance.correct", "attendance", attendance_id, {"person_id": person_id, "date": attendance_date, "reason": reason})
+    execute("update attendance_corrections set actor_id=? where id=?", [actor_id, correction_id])
+    record_action("attendance.correct", "attendance", attendance_id, {"person_id": person_id, "date": attendance_date, "reason": reason}, actor_id=actor_id)
     return normalize_attendance({**after, "name": None, "role": None, "metadata_json": None})
 
 

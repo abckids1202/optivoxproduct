@@ -34,6 +34,11 @@ def alerts():
     return svc.alerts_status()
 
 
+@router.get("/performance")
+def performance():
+    return svc.performance_report()
+
+
 @router.post("/test-alert", dependencies=[Depends(require_operator)])
 def test_alert():
     return command_service.create_command("test_alert", {})

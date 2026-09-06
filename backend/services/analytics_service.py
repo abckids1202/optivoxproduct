@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections import defaultdict
 from datetime import timedelta
 
 from ..config import local_today
@@ -56,6 +58,33 @@ def attendance(days: int = 7) -> dict:
     roster = fetch_one("select count(*) as registered, sum(case when lower(coalesce(metadata_json,'')) not like '%\"active\": false%' then 1 else 0 end) as active from people") or {}
     seen = fetch_one("select count(distinct person_id) as seen from attendance where date=?", [local_today().isoformat()]) or {}
     event_total = fetch_one("select count(*) as total from events where date(timestamp) between ? and ?", [start.isoformat(), end.isoformat()]) or {}
+    absence_rows = fetch_all(
+        "select status as name, count(*) as value from absence_records where absence_date between ? and ? group by status order by value desc",
+        [start.isoformat(), end.isoformat()],
+    )
+    class_people = fetch_all("select id, metadata_json from people", [])
+    class_attendance = fetch_all(
+        "select distinct person_id from attendance where date between ? and ? and clock_in is not null",
+        [start.isoformat(), end.isoformat()],
+    )
+    present_ids = {row["person_id"] for row in class_attendance}
+    class_totals: dict[str, dict[str, int]] = defaultdict(lambda: {"present": 0, "roster": 0})
+    for person in class_people:
+        try:
+            metadata = json.loads(person.get("metadata_json") or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        class_name = metadata.get("class") or metadata.get("class_name") or "Unassigned" if isinstance(metadata, dict) else "Unassigned"
+        totals = class_totals[str(class_name)]
+        totals["roster"] += 1
+        if person["id"] in present_ids:
+            totals["present"] += 1
+    class_rows = [{"name": name, **totals} for name, totals in sorted(class_totals.items())]
+    evidence_rows = fetch_all(
+        "select decision as name, count(*) as value from recognition_evidence where date(observed_at) between ? and ? group by decision order by value desc",
+        [start.isoformat(), end.isoformat()],
+    )
+    incidents = fetch_one("select count(*) as total, sum(case when status not in ('dismissed','resolved') then 1 else 0 end) as open from incidents") or {}
     return {
         "attendanceByDay": list(reversed(by_day)),
         "summary": attendance_summary(),
@@ -63,6 +92,10 @@ def attendance(days: int = 7) -> dict:
         "methodSplit": methods,
         "rosterTotals": {"registered": roster.get("registered", 0) or 0, "active": roster.get("active", 0) or 0, "seenToday": seen.get("seen", 0) or 0},
         "totalEvents": event_total.get("total", 0) or 0,
+        "absenceSplit": absence_rows,
+        "classCoverage": class_rows,
+        "recognitionDecisions": evidence_rows,
+        "incidentTotals": {"total": incidents.get("total", 0) or 0, "open": incidents.get("open", 0) or 0},
     }
 
 

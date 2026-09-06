@@ -5,7 +5,7 @@ import shutil
 
 from ..config import DATABASE_PATH, EXPORTS_DIR, MODELS_DIR, REPORTS_DIR, SNAPSHOTS_DIR
 from ..database import table_counts
-from .runtime_service import heartbeat_state, live_state
+from .runtime_service import heartbeat_state, live_state, performance_report
 
 
 def system_status() -> dict:
@@ -72,4 +72,3 @@ def alerts_status() -> dict:
         "telegram_enabled": bool(data.get("telegram", {}).get("enabled")),
         "webhook_enabled": bool(data.get("webhook", {}).get("enabled")),
     }
-

@@ -34,6 +34,6 @@ def snapshot(event_id: int):
     return svc.snapshot_response(event_id)
 
 
-@router.post("/{event_id}/review", dependencies=[Depends(require_operator)])
-def review(event_id: int, payload: ReviewRequest):
-    return svc.review_event(event_id, payload.action, payload.note)
+@router.post("/{event_id}/review")
+def review(event_id: int, payload: ReviewRequest, actor: str = Depends(require_operator)):
+    return svc.review_event(event_id, payload.action, payload.note, actor_id=actor)

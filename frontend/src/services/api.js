@@ -1,8 +1,12 @@
 import { getDemoState } from "./mockData";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
+export const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
 const USE_DEMO_DATA = import.meta.env.VITE_USE_DEMO_DATA === "true";
 const API_KEY = import.meta.env.VITE_OPTIVOX_API_KEY || "";
+
+function sessionToken() {
+  return window.localStorage.getItem("optivox_access_token") || "";
+}
 
 export const FRAME_URL = `${API_BASE}/api/live/frame`;
 
@@ -15,7 +19,8 @@ async function getJson(path) {
 }
 
 function requestHeaders(extra = {}) {
-  return { ...(API_KEY ? { "X-Optivox-Key": API_KEY } : {}), ...extra };
+  const token = sessionToken();
+  return { ...(API_KEY ? { "X-Optivox-Key": API_KEY } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extra };
 }
 
 async function errorMessage(response) {
@@ -56,6 +61,49 @@ export async function sendCommand(command, payload = {}) {
   }
 }
 
+export async function fetchEnrollmentStatus() {
+  if (USE_DEMO_DATA) return { stage: "idle", message: "Demo mode does not control the local camera." };
+  return getJson("/api/enrollment/status");
+}
+
+export async function fetchPerson(personId) {
+  if (USE_DEMO_DATA) return getDemoState().people.find((person) => person.id === personId) || null;
+  return getJson(`/api/people/${personId}`);
+}
+
+export async function updatePerson(personId, payload) {
+  const response = await fetch(`${API_BASE}/api/people/${personId}`, {
+    method: "PATCH",
+    headers: requestHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+export async function cancelEnrollment() {
+  if (USE_DEMO_DATA) return { stage: "cancelled", message: "Demo enrollment cancelled." };
+  return sendCommand("cancel_enrollment");
+}
+
+export async function fetchOperationalSummary() {
+  if (USE_DEMO_DATA) return {
+    presenceSessions: 0,
+    activePresenceSessions: 0,
+    activeConfirmedEntities: 0,
+    activeUnresolvedEntities: 0,
+    recognitionEvidence: 0,
+    confirmedEvidence: 0,
+    rejectedEvidence: 0,
+  };
+  return getJson("/api/operations/summary");
+}
+
+export async function fetchPerformanceReport() {
+  if (USE_DEMO_DATA) return { measurement_status: "NOT_MEASURED" };
+  return getJson("/api/system/performance");
+}
+
 export async function reviewEvent(eventId, action, note = "") {
   const response = await fetch(`${API_BASE}/api/events/${eventId}/review`, {
     method: "POST",
@@ -71,6 +119,31 @@ export async function reviewIncident(incidentId, action, note = "") {
     method: "POST",
     headers: requestHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ action, note }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+export async function fetchIncident(incidentId) {
+  if (USE_DEMO_DATA) return null;
+  return getJson(`/api/incidents/${incidentId}`);
+}
+
+export async function assignIncident(incidentId, assignee) {
+  const response = await fetch(`${API_BASE}/api/incidents/${incidentId}/assign`, {
+    method: "POST",
+    headers: requestHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ assignee }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+export async function recordAbsence(personId, payload) {
+  const response = await fetch(`${API_BASE}/api/attendance/${personId}/absence`, {
+    method: "POST",
+    headers: requestHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
   });
   if (!response.ok) throw new Error(await errorMessage(response));
   return response.json();
@@ -170,5 +243,14 @@ function getEmptyState() {
       securityCategories: [],
     },
     incidents: [],
+    operational: {
+      presenceSessions: 0,
+      activePresenceSessions: 0,
+      activeConfirmedEntities: 0,
+      activeUnresolvedEntities: 0,
+      recognitionEvidence: 0,
+      confirmedEvidence: 0,
+      rejectedEvidence: 0,
+    },
   };
 }

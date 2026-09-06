@@ -14,6 +14,10 @@ class ReviewRequest(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
+class AssignmentRequest(BaseModel):
+    assignee: str | None = Field(default=None, max_length=120)
+
+
 @router.get("")
 def incidents(limit: int = 100, status: str | None = None):
     return svc.list_incidents(limit=limit, status=status)
@@ -24,6 +28,11 @@ def incident(incident_id: int):
     return svc.get_incident(incident_id)
 
 
-@router.post("/{incident_id}/review", dependencies=[Depends(require_operator)])
-def review(incident_id: int, payload: ReviewRequest):
-    return svc.review_incident(incident_id, payload.action, payload.note)
+@router.post("/{incident_id}/review")
+def review(incident_id: int, payload: ReviewRequest, actor: str = Depends(require_operator)):
+    return svc.review_incident(incident_id, payload.action, payload.note, actor_id=actor)
+
+
+@router.post("/{incident_id}/assign")
+def assign(incident_id: int, payload: AssignmentRequest, actor: str = Depends(require_operator)):
+    return svc.assign_incident(incident_id, payload.assignee, actor_id=actor)

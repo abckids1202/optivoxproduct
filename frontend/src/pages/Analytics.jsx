@@ -27,6 +27,8 @@ export default function Analytics({ state }) {
   const present = byStatus.find((item) => item.name === "Present")?.value || state.summary.presentToday || 0;
   const late = byStatus.find((item) => item.name === "Late")?.value || 0;
   const lateRate = present + late ? Math.round((late / (present + late)) * 100) : 0;
+  const absenceTotal = (data.absenceSplit || []).reduce((sum, item) => sum + Number(item.value || 0), 0);
+  const openIncidents = data.incidentTotals?.open || state.summary?.openIncidents || 0;
   return (
     <div className="page-stack">
       <div className="stats-grid four">
@@ -34,6 +36,8 @@ export default function Analytics({ state }) {
         <StatCard label="Attendance rate" value={`${roster.registered ? Math.round((present / roster.registered) * 100) : 0}%`} detail="Present against roster" icon={CalendarCheck} tone="success" />
         <StatCard label="Late rate" value={`${lateRate}%`} detail="Among clocked-in records" icon={Clock3} tone="warning" />
         <StatCard label="Tracked events" value={data.totalEvents || state.events.length} detail="Stored security observations" icon={Activity} tone="neutral" />
+        <StatCard label="Open incidents" value={openIncidents} detail="Human review queue" icon={Activity} tone="danger" />
+        <StatCard label="Absence records" value={absenceTotal} detail="Official and inferred" icon={CalendarCheck} tone="warning" />
       </div>
       <div className="analytics-grid">
       <ChartPanel title="Attendance trend · people per day" note="Present and late records from the attendance table.">
@@ -82,6 +86,14 @@ export default function Analytics({ state }) {
 
       <ChartPanel title="Attendance method mix">
         <ResponsiveContainer width="100%" height={260}><BarChart data={methodSplit}><CartesianGrid strokeDasharray="3 3" stroke="#263244" /><XAxis dataKey="name" stroke="#91a3b8" /><YAxis stroke="#91a3b8" /><Tooltip /><Bar dataKey="value" fill="#2dd4bf" radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer>
+      </ChartPanel>
+
+      <ChartPanel title="Recognition decision mix" note="Evidence decisions, not model accuracy. Unresolved and spoof-suspect states remain in review.">
+        <ResponsiveContainer width="100%" height={260}><BarChart data={data.recognitionDecisions || []}><CartesianGrid strokeDasharray="3 3" stroke="#263244" /><XAxis dataKey="name" stroke="#91a3b8" /><YAxis stroke="#91a3b8" /><Tooltip /><Bar dataKey="value" fill="#60a5fa" radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer>
+      </ChartPanel>
+
+      <ChartPanel title="Absence status mix" note="Inferred absence is a planning signal until an operator confirms it.">
+        <ResponsiveContainer width="100%" height={260}><PieChart><Pie data={data.absenceSplit || []} dataKey="value" nameKey="name" outerRadius={94}>{(data.absenceSplit || []).map((entry, index) => <Cell key={entry.name} fill={colors[index % colors.length]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer>
       </ChartPanel>
 
       <section className="panel analytics-summary">

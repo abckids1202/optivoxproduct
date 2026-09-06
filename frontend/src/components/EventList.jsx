@@ -1,5 +1,6 @@
-import { AlertTriangle, Check, CheckCircle2, ShieldAlert, X } from "lucide-react";
+import { AlertTriangle, Camera, Check, CheckCircle2, ShieldAlert, X } from "lucide-react";
 import { severityTone, StatusBadge } from "./StatusBadge";
+import { API_BASE } from "../services/api";
 
 export default function EventList({ events, compact = false, onReview }) {
   return (
@@ -26,6 +27,12 @@ export default function EventList({ events, compact = false, onReview }) {
               <span>{event.person}</span>
               <span>{event.location}</span>
             </div>
+            {(event.entityId || event.presenceSessionId || event.sourceFrameId || event.snapshot_url) && <div className="event-provenance">
+              {event.entityId && <span>Entity {event.entityId}</span>}
+              {event.presenceSessionId && <span>Session {event.presenceSessionId}</span>}
+              {event.sourceFrameId && <span>Frame {event.sourceFrameId}</span>}
+              {event.snapshot_url && <a href={`${API_BASE}${event.snapshot_url}`} target="_blank" rel="noreferrer"><Camera size={13} /> Evidence</a>}
+            </div>}
             {onReview && !event.reviewed && (
               <div className="event-actions">
                 <button type="button" onClick={() => onReview(event.id, "confirm")}><Check size={14} /> Confirm</button>

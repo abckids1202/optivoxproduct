@@ -8,6 +8,8 @@ from collections import defaultdict, deque
 
 from fastapi import Header, HTTPException, Request
 
+from .services.auth_service import resolve_session
+
 
 _RATE_LIMIT = 120
 _RATE_WINDOW_SECONDS = 60
@@ -32,7 +34,7 @@ def _is_loopback(request: Request) -> bool:
     return host in {"127.0.0.1", "::1", "localhost", "testclient"}
 
 
-def _guard(request: Request, x_optivox_key: str | None, authorization: str | None, admin: bool = False) -> None:
+def _guard(request: Request, x_optivox_key: str | None, authorization: str | None, admin: bool = False) -> str:
     client = request.client.host if request.client else "unknown"
     now = time.monotonic()
     with _rate_lock:
@@ -44,28 +46,34 @@ def _guard(request: Request, x_optivox_key: str | None, authorization: str | Non
         history.append(now)
     operator_key, admin_key = _configured_keys()
     supplied = _supplied_key(x_optivox_key, authorization)
+    session = resolve_session(supplied)
+    if session:
+        if admin and session.get("role") != "admin":
+            raise HTTPException(status_code=403, detail={"code": "ADMIN_REQUIRED", "message": "This operation requires an administrator role."})
+        return str(session.get("username") or "session-user")
     expected = admin_key if admin and admin_key else (operator_key or admin_key)
     if expected:
         if not supplied or not hmac.compare_digest(supplied, expected):
             raise HTTPException(status_code=401, detail={"code": "INVALID_API_KEY", "message": "A valid OptiVox API key is required."})
         if admin and admin_key and not hmac.compare_digest(supplied, admin_key):
             raise HTTPException(status_code=403, detail={"code": "ADMIN_REQUIRED", "message": "This operation requires an administrator key."})
-        return
+        return "api-key-admin" if admin else "api-key-operator"
     if not _is_loopback(request):
         raise HTTPException(status_code=503, detail={"code": "API_KEY_NOT_CONFIGURED", "message": "Configure OPTIVOX_API_KEY before exposing the backend beyond localhost."})
+    return "local-operator"
 
 
 def require_operator(
     request: Request,
     x_optivox_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
-) -> None:
-    _guard(request, x_optivox_key, authorization)
+) -> str:
+    return _guard(request, x_optivox_key, authorization)
 
 
 def require_admin(
     request: Request,
     x_optivox_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
-) -> None:
-    _guard(request, x_optivox_key, authorization, admin=True)
+) -> str:
+    return _guard(request, x_optivox_key, authorization, admin=True)

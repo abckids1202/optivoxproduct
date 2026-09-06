@@ -46,7 +46,7 @@ export default function CinematicHero() {
   }
 
   return <section className={`cinematic-hero ${stageIndex === stages.length - 1 ? "is-final" : ""}`} ref={heroRef} onPointerMove={handlePointerMove} onPointerLeave={resetPointer} aria-labelledby="cinematic-hero-title">
-    <img className="cinematic-hero-image" src="/images/hero/optivox-hero-poster.png" alt="" aria-hidden="true" />
+    <img className="cinematic-hero-image" src={`${import.meta.env.BASE_URL}images/hero/optivox-hero-poster.png`} alt="" aria-hidden="true" />
     <div className="cinematic-hero-shade"></div><div className="cinematic-hero-grid"></div><div className="cinematic-hero-scan"></div>
     <div className="cinematic-hero-top"><span className="cinematic-kicker"><i></i> Local-first computer vision</span><button type="button" className="cinematic-motion-toggle" onClick={() => setPaused((value) => !value)} aria-pressed={paused}>{paused ? "Resume motion" : "Pause motion"}</button></div>
     <div className="cinematic-hero-center"><div className="cinematic-stage-label"><span className="stage-pulse"></span><span>{stage[0]}</span><small>{stage[1]}</small></div><p className="cinematic-eyebrow">AI Attendance and Security System</p><h1 id="cinematic-hero-title">OPTI<span>VOX</span></h1><p className="cinematic-subtitle">A camera becomes a system that observes, recognises, remembers, and responds.</p><p className="cinematic-philosophy">Observation becomes understanding.<br /><span>Understanding leads to action.</span></p><div className="cinematic-actions"><Link to="/how-it-works" className="btn btn-primary">Enter the System <span>→</span></Link><Link to="/features" className="btn btn-ghost">Explore Features</Link></div></div>

@@ -20,6 +20,36 @@ class EntityLifecycle(str, Enum):
     CLOSED = "CLOSED"
 
 
+class IdentityDecisionState(str, Enum):
+    """Canonical identity states shared by the runtime and platform layers."""
+
+    UNRESOLVED = "UNRESOLVED"
+    CANDIDATE = "CANDIDATE"
+    CONFIRMED = "CONFIRMED"
+    CONTRADICTED = "CONTRADICTED"
+    OCCLUDED = "OCCLUDED"
+    EXPIRED = "EXPIRED"
+    SPOOF_SUSPECT = "SPOOF_SUSPECT"
+
+
+_IDENTITY_STATE_ALIASES = {
+    "STALE": IdentityDecisionState.OCCLUDED.value,
+    "REVALIDATING": IdentityDecisionState.CANDIDATE.value,
+    "SPOOF": IdentityDecisionState.SPOOF_SUSPECT.value,
+    "SUSPECT": IdentityDecisionState.SPOOF_SUSPECT.value,
+    "UNKNOWN": IdentityDecisionState.UNRESOLVED.value,
+}
+
+
+def normalize_identity_state(value: object) -> str:
+    """Normalize legacy runtime labels without weakening attendance rules."""
+    state = str(value or IdentityDecisionState.UNRESOLVED.value).strip().upper()
+    state = _IDENTITY_STATE_ALIASES.get(state, state)
+    if state not in {item.value for item in IdentityDecisionState}:
+        return IdentityDecisionState.UNRESOLVED.value
+    return state
+
+
 @dataclass
 class MotionState:
     previous_center: Optional[Tuple[float, float]] = None
@@ -31,7 +61,7 @@ class MotionState:
 
 @dataclass
 class IdentityState:
-    state: str = "UNRESOLVED"
+    state: str = IdentityDecisionState.UNRESOLVED.value
     candidate_name: Optional[str] = None
     confirmed_name: Optional[str] = None
     best_score: Optional[float] = None
@@ -39,6 +69,8 @@ class IdentityState:
     margin: Optional[float] = None
     last_verified_monotonic: Optional[float] = None
     last_observation_monotonic: Optional[float] = None
+    contradiction_count: int = 0
+    occluded_since_monotonic: Optional[float] = None
 
 
 @dataclass
@@ -76,6 +108,8 @@ class EntityState:
     attendance_eligibility: bool = False
     missing_updates: int = 0
     recent_observation_count: int = 0
+    identity_stale_after_sec: float = 3.0
+    identity_expired_after_sec: float = 9.0
 
     @property
     def presence_duration_sec(self) -> float:
@@ -115,20 +149,38 @@ class EntityState:
         elif observation.observation_type == ObservationType.FACE_IDENTITY_RESULT:
             metadata = observation.metadata
             name = metadata.get("name") or observation.value
-            self.identity.candidate_name = str(name) if name else None
+            candidate_name = str(name).strip() if name else None
+            incoming_state = normalize_identity_state(metadata.get("identity_state"))
+            if (
+                self.identity.state == IdentityDecisionState.CONFIRMED.value
+                and candidate_name
+                and self.identity.confirmed_name
+                and candidate_name.casefold() != self.identity.confirmed_name.casefold()
+            ):
+                incoming_state = IdentityDecisionState.CONTRADICTED.value
+                self.identity.contradiction_count += 1
+            self.identity.candidate_name = candidate_name
             self.identity.best_score = observation.confidence
             self.identity.second_score = metadata.get("second_score")
             self.identity.margin = metadata.get("margin")
-            self.identity.state = str(metadata.get("identity_state") or "UNRESOLVED")
+            self.identity.state = incoming_state
             self.identity.last_observation_monotonic = observation.observed_at_monotonic
-            if self.identity.state == "CONFIRMED":
+            if self.identity.state == IdentityDecisionState.CONFIRMED.value and candidate_name:
                 self.identity.confirmed_name = self.identity.candidate_name
                 self.identity.last_verified_monotonic = observation.observed_at_monotonic
+                self.identity.occluded_since_monotonic = None
+            elif self.identity.state in {
+                IdentityDecisionState.CANDIDATE.value,
+                IdentityDecisionState.UNRESOLVED.value,
+            } and self.identity.state != IdentityDecisionState.CONFIRMED.value:
+                self.identity.occluded_since_monotonic = None
         elif observation.observation_type == ObservationType.LIVENESS_RESULT:
             self.liveness.state = str(observation.value or "NOT_EVALUATED")
             self.liveness.last_checked_monotonic = observation.observed_at_monotonic
             if self.liveness.state == "REAL":
                 self.liveness.last_verified_monotonic = observation.observed_at_monotonic
+            elif self.liveness.state in {"SUSPECT", "SPOOF_SUSPECT"}:
+                self.identity.state = IdentityDecisionState.SPOOF_SUSPECT.value
         elif observation.observation_type == ObservationType.POSE_STATE:
             self.pose_state = str(observation.value) if observation.value is not None else None
             self.last_pose_observation_monotonic = observation.observed_at_monotonic
@@ -146,10 +198,28 @@ class EntityState:
             self.last_face_observation_monotonic is not None
             and current - self.last_face_observation_monotonic <= 0.5
         )
-        if self.identity.last_observation_monotonic is not None and current - self.identity.last_observation_monotonic > 3.0:
-            if self.identity.state == "CONFIRMED":
-                self.identity.state = "STALE"
-            self.attendance_eligibility = False
+        if self.identity.last_observation_monotonic is not None:
+            identity_age = current - self.identity.last_observation_monotonic
+            if self.identity.state in {
+                IdentityDecisionState.CONFIRMED.value,
+                IdentityDecisionState.OCCLUDED.value,
+            }:
+                if identity_age > self.identity_stale_after_sec:
+                    if self.identity.occluded_since_monotonic is None:
+                        self.identity.occluded_since_monotonic = current
+                    self.identity.state = (
+                        IdentityDecisionState.EXPIRED.value
+                        if identity_age > self.identity_expired_after_sec
+                        else IdentityDecisionState.OCCLUDED.value
+                    )
+            elif self.identity.state == IdentityDecisionState.CONTRADICTED.value and identity_age > self.identity_expired_after_sec:
+                self.identity.state = IdentityDecisionState.EXPIRED.value
+        self.attendance_eligibility = bool(
+            self.lifecycle_state in {EntityLifecycle.NEW, EntityLifecycle.ACTIVE}
+            and self.face_visible
+            and self.identity.state == IdentityDecisionState.CONFIRMED.value
+            and self.liveness.state == "REAL"
+        )
 
     def summary(self, now: Optional[float] = None) -> Dict[str, object]:
         current = time.monotonic() if now is None else now
@@ -173,6 +243,8 @@ class EntityState:
                 "second_score": self.identity.second_score,
                 "margin": self.identity.margin,
                 "identity_age_ms": self.identity_age_ms,
+                "contradiction_count": self.identity.contradiction_count,
+                "occluded_since_monotonic": self.identity.occluded_since_monotonic,
             },
             "face": {
                 "visible": self.face_visible,
@@ -216,6 +288,8 @@ class EntityStateStore:
             first_seen_monotonic=now,
             last_seen_monotonic=now,
             presence_started_monotonic=now,
+            identity_stale_after_sec=self.identity_stale_after_sec,
+            identity_expired_after_sec=max(self.identity_stale_after_sec, self.identity_stale_after_sec * 3.0),
         )
         self._next_entity_number += 1
         self.entities[int(track_id)] = entity
@@ -300,8 +374,8 @@ class EntityStateStore:
             entity.face_visible = latest_face is not None
             if latest_quality is None:
                 entity.face_quality = None
-            if latest_identity is None and entity.identity.state == "CONFIRMED":
-                entity.identity.state = "STALE"
+            if latest_identity is None and entity.identity.state == IdentityDecisionState.CONFIRMED.value:
+                entity.identity.state = IdentityDecisionState.OCCLUDED.value
                 entity.attendance_eligibility = False
             if latest_liveness is None:
                 entity.liveness.state = "NOT_EVALUATED"

@@ -1,7 +1,8 @@
-"""The first OptiVox correlation-core adapter.
+"""Correlation boundary for turning model outputs into operational entity state.
 
-This adapter consumes existing runtime outputs and makes their provenance and
-freshness explicit. It does not replace recognition or attendance policies.
+The vision models remain responsible for observations. This module is the
+authoritative in-memory reducer for identity, liveness, presence, and
+attendance eligibility decisions consumed by the persistence bridge.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import math
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .entities import EntityState, EntityStateStore
+from .entities import EntityState, EntityStateStore, normalize_identity_state
 from .observations import Observation, ObservationHistory, ObservationType
 
 
@@ -193,7 +194,7 @@ class CorrelationCore:
                 value=face.get("name"),
                 metadata={
                     "name": face.get("name"),
-                    "identity_state": face.get("identity_state", "UNRESOLVED"),
+                    "identity_state": normalize_identity_state(face.get("identity_state")),
                     "cached_identity_confidence": face.get("cached_identity_confidence"),
                     "current_observation_similarity": face.get("current_observation_similarity"),
                     "last_verified_at": face.get("last_verified_at"),

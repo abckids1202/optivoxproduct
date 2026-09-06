@@ -135,6 +135,35 @@ def test_correlation_core_attaches_faces_and_keeps_multi_person_pose_explicit():
     assert state["stats"]["observations_created"] >= 8
 
 
+def test_entity_attendance_requires_confirmed_identity_and_real_liveness():
+    core = CorrelationCore(max_entities=2)
+    state = core.update(
+        tracked={1: (20, 20)},
+        source_frame_id=7,
+        faces_info=[{
+            "oid": 1,
+            "bbox": (0, 0, 40, 40),
+            "name": "Ada",
+            "identity_state": "CONFIRMED",
+            "liveness_status": "UNCERTAIN",
+        }],
+    )
+    assert state["entities"][0]["attendance_eligibility"] is False
+
+    state = core.update(
+        tracked={1: (20, 20)},
+        source_frame_id=8,
+        faces_info=[{
+            "oid": 1,
+            "bbox": (0, 0, 40, 40),
+            "name": "Ada",
+            "identity_state": "CONFIRMED",
+            "liveness_status": "REAL",
+        }],
+    )
+    assert state["entities"][0]["attendance_eligibility"] is True
+
+
 def test_cached_module_provenance_is_not_rewritten_as_current_frame():
     core = CorrelationCore(max_entities=4, max_observations_per_type=4)
     now = time.monotonic()
