@@ -24,6 +24,7 @@ class ObservationType(str, Enum):
     LIVENESS_RESULT = "LIVENESS_RESULT"
     POSE_STATE = "POSE_STATE"
     OBJECT_DETECTED = "OBJECT_DETECTED"
+    SECURITY_SIGNAL = "SECURITY_SIGNAL"
     ZONE_MEMBERSHIP = "ZONE_MEMBERSHIP"
     TRACK_MOTION = "TRACK_MOTION"
 
@@ -39,6 +40,7 @@ DEFAULT_TTL_MS: Dict[ObservationType, int] = {
     ObservationType.LIVENESS_RESULT: 1500,
     ObservationType.POSE_STATE: 350,
     ObservationType.OBJECT_DETECTED: 750,
+    ObservationType.SECURITY_SIGNAL: 1500,
     ObservationType.ZONE_MEMBERSHIP: 500,
     ObservationType.TRACK_MOTION: 500,
 }

@@ -27,6 +27,8 @@ def severity_label(value: Any) -> str:
 
 def event_category(event_type: str) -> str:
     text = event_type.upper()
+    if any(token in text for token in ["ZONE_", "INTRUS", "LOITER", "RUNNING", "PPE_"]):
+        return "Security"
     if any(token in text for token in ["ATTENDANCE", "RECOGNITION", "SPOOF", "UNKNOWN"]):
         return "Identity"
     if any(token in text for token in ["FALL", "HANDS", "CROWD", "CONGESTION", "EVACUATION"]):

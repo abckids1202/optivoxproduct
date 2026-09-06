@@ -86,6 +86,27 @@ export async function cancelEnrollment() {
   return sendCommand("cancel_enrollment");
 }
 
+export async function confirmEnrollment(overrideDuplicate = false) {
+  if (USE_DEMO_DATA) return { stage: "completed", message: "Demo enrollment confirmed." };
+  return sendCommand("confirm_enrollment", { override_duplicate: Boolean(overrideDuplicate) });
+}
+
+export async function retrainPerson(name) {
+  return sendCommand("retrain_person", { name });
+}
+
+export async function disablePerson(name) {
+  return sendCommand("disable_person", { name });
+}
+
+export async function mergePeople(sourceName, targetName) {
+  return sendCommand("merge_people", { source_name: sourceName, target_name: targetName });
+}
+
+export async function deletePerson(name) {
+  return sendCommand("delete_person", { name, confirm: true });
+}
+
 export async function fetchOperationalSummary() {
   if (USE_DEMO_DATA) return {
     presenceSessions: 0,

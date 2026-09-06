@@ -60,7 +60,8 @@ def normalize_attendance(row: dict[str, Any]) -> dict[str, Any]:
         "method": attendance_method(row.get("notes")),
         "camera": row.get("camera_id"),
         "location": row.get("location"),
-        "lastSeen": row.get("last_seen") or row.get("clock_in"),
+        "lastSeen": row.get("last_seen_at") or row.get("last_seen") or row.get("clock_in"),
+        "clockOutSource": row.get("clock_out_source"),
         "active": True,
     }
 

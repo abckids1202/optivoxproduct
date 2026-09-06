@@ -100,6 +100,31 @@ def test_incident_context_review_assignment_and_false_positive(platform_db):
     assert len(reviewed["review_actions"]) == 2
 
 
+def test_incident_evidence_and_alert_are_linked_to_source_event(platform_db, tmp_path):
+    evidence_path = tmp_path / "intrusion.jpg"
+    evidence_path.write_bytes(b"test-evidence")
+    event_id = database.execute(
+        """insert into events
+           (event_type, severity, details_json, timestamp, entity_id,
+            presence_session_id, camera_id, location, snapshot_path, source_frame_id)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ["ZONE_INTRUSION", 2,
+         json.dumps({"security_metadata": {"zone_id": "lab", "track_id": 3}}),
+         "2026-09-02T09:00:00", "cam_0:entity:3", 8, "cam_0", "Lab",
+         str(evidence_path), 77],
+    )
+    database.execute(
+        "insert into alert_log (channel, event_type, target, status, timestamp, source_event_id) values (?, ?, ?, ?, ?, ?)",
+        ["webhook", "ZONE_INTRUSION", "ID_3", "delivered", "2026-09-02T09:00:01", event_id],
+    )
+    incident = incident_service.list_incidents()[0]
+    detail = incident_service.get_incident(incident["id"])
+    assert detail["zoneId"] == "lab"
+    assert detail["presenceSessionId"] == 8
+    assert detail["evidence"][0]["status"] == "available"
+    assert detail["alerts"][0]["status"] == "delivered"
+
+
 def test_password_sessions_store_only_hashes(platform_db):
     database.execute(
         "insert into platform_users (username, password_hash, role) values (?, ?, ?)",

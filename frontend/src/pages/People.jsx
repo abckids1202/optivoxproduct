@@ -1,6 +1,6 @@
-import { CheckCircle2, Loader2, Play, Search, UserPlus, Users, XCircle } from "lucide-react";
+import { AlertTriangle, Ban, CheckCircle2, Loader2, Play, RefreshCcw, Search, Trash2, UserPlus, Users, XCircle } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { cancelEnrollment, fetchEnrollmentStatus, fetchPerson, sendCommand, updatePerson } from "../services/api";
+import { cancelEnrollment, confirmEnrollment, deletePerson, disablePerson, fetchEnrollmentStatus, fetchPerson, mergePeople, retrainPerson, sendCommand, updatePerson } from "../services/api";
 
 export default function People({ state }) {
   const [query, setQuery] = useState("");
@@ -11,6 +11,7 @@ export default function People({ state }) {
   const [profile, setProfile] = useState(null);
   const [profileEdit, setProfileEdit] = useState(null);
   const [profileSaving, setProfileSaving] = useState(false);
+  const [mergeTargetId, setMergeTargetId] = useState("");
   const people = useMemo(() => (state.people || []).filter((person) => `${person.name} ${person.role || ""} ${person.className || ""} ${(person.subjects || []).join(" ")}`.toLowerCase().includes(query.toLowerCase())), [state.people, query]);
 
   useEffect(() => {
@@ -41,6 +42,7 @@ export default function People({ state }) {
     fetchPerson(selectedId).then((next) => {
       if (!active) return;
       setProfile(next);
+      setMergeTargetId("");
       setProfileEdit({
         name: next?.name || "",
         role: next?.role || "",
@@ -73,6 +75,56 @@ export default function People({ state }) {
       setEnrollment((current) => ({ ...current, stage: "cancelled", message: "Cancellation queued for the local engine." }));
     } catch (error) {
       setEnrollment((current) => ({ ...current, stage: "failed", message: error.message }));
+    }
+  }
+
+  async function confirmCapturedEnrollment(overrideDuplicate = false) {
+    try {
+      await confirmEnrollment(overrideDuplicate);
+      setEnrollment((current) => ({ ...current, stage: "queued", message: "Saving the verified enrollment to the local roster." }));
+    } catch (error) {
+      setEnrollment((current) => ({ ...current, stage: "failed", message: error.message }));
+    }
+  }
+
+  async function startRetraining(person) {
+    try {
+      await retrainPerson(person.name);
+      setEnrollment({ stage: "queued", person_name: person.name, message: "Retraining queued. Keep exactly one face visible to the local camera." });
+    } catch (error) {
+      window.alert(error.message);
+    }
+  }
+
+  async function deactivate(person) {
+    if (!window.confirm(`Disable ${person.name} for future recognition and attendance?`)) return;
+    try {
+      await disablePerson(person.name);
+    } catch (error) {
+      window.alert(error.message);
+    }
+  }
+
+  async function permanentlyDelete(person) {
+    if (!window.confirm(`Permanently delete ${person.name} and their biometric identity? This cannot be undone.`)) return;
+    try {
+      await deletePerson(person.name);
+      setSelectedId(null);
+    } catch (error) {
+      window.alert(error.message);
+    }
+  }
+
+  async function mergeProfile(person) {
+    const target = (state.people || []).find((candidate) => String(candidate.id) === String(mergeTargetId));
+    if (!target || target.id === person.id) return;
+    if (!window.confirm(`Merge ${person.name} into ${target.name}? The source profile will be removed and its history moved.`)) return;
+    try {
+      await mergePeople(person.name, target.name);
+      setSelectedId(null);
+      setProfile(null);
+    } catch (error) {
+      window.alert(error.message);
     }
   }
 
@@ -141,10 +193,22 @@ export default function People({ state }) {
             </div>
             {enrollment.stage === "completed" && <CheckCircle2 size={20} />}
           </div>
-          {(enrollment.stage === "capturing" || enrollment.stage === "completed") && <>
+          {(enrollment.stage === "capturing" || enrollment.stage === "completed" || enrollment.stage === "duplicate_warning") && <>
             <div className="progress-track"><span style={{ width: `${progress}%` }} /></div>
             <div className="progress-meta"><span>{accepted} accepted</span><span>target {enrollment.minimum || 5}-{maximum}</span>{enrollment.quality_score != null && <span>quality {Math.round(enrollment.quality_score)}</span>}</div>
           </>}
+          {enrollment.stage === "completed" && <div className="enrollment-warning">
+            <CheckCircle2 size={17} />
+            <span>Samples passed quality checks. Save this identity to the local roster.</span>
+            <button type="button" onClick={() => confirmCapturedEnrollment(false)}>Save enrollment</button>
+            <button type="button" className="button-quiet" onClick={stopEnrollment}>Discard</button>
+          </div>}
+          {enrollment.stage === "duplicate_warning" && <div className="enrollment-warning">
+            <AlertTriangle size={17} />
+            <span>Similar active identities: {(enrollment.duplicate_candidates || []).map((candidate) => `${candidate.name} (${Math.round(Number(candidate.similarity || 0) * 100)}%)`).join(", ") || "review required"}.</span>
+            <button type="button" onClick={() => confirmCapturedEnrollment(true)}>Confirm override</button>
+            <button type="button" className="button-quiet" onClick={stopEnrollment}>Cancel</button>
+          </div>}
         </div>
 
         <div className="flow-list">
@@ -175,6 +239,10 @@ export default function People({ state }) {
                 <div className="profile-subjects">{(person.subjects || []).length ? person.subjects.map((subject) => <span key={subject}>{subject}</span>) : <em>No subjects assigned</em>}</div>
               </div>
               <em>{person.status}</em>
+              <div className="profile-card-actions" onClick={(event) => event.stopPropagation()}>
+                <button type="button" title={`Retrain ${person.name}`} aria-label={`Retrain ${person.name}`} onClick={() => startRetraining(person)}><RefreshCcw size={15} /></button>
+                {person.active !== false && <button type="button" title={`Disable ${person.name}`} aria-label={`Disable ${person.name}`} onClick={() => deactivate(person)}><Ban size={15} /></button>}
+              </div>
             </article>
           ))}
         </div>
@@ -195,6 +263,9 @@ export default function People({ state }) {
             <label><span>Student ID</span><input value={profileEdit.studentId} onChange={(event) => setProfileEdit((current) => ({ ...current, studentId: event.target.value }))} /></label>
             <label className="profile-edit-wide"><span>Subjects, comma separated</span><input value={profileEdit.subjects} onChange={(event) => setProfileEdit((current) => ({ ...current, subjects: event.target.value }))} /></label>
             <button type="button" onClick={saveProfile} disabled={profileSaving}>{profileSaving ? <Loader2 className="spin" size={16} /> : <CheckCircle2 size={16} />} Save profile metadata</button>
+            <button type="button" className="button-danger" onClick={() => permanentlyDelete(profile)}><Trash2 size={16} /> Delete biometric identity</button>
+            <label className="profile-edit-wide"><span>Merge this identity into</span><select value={mergeTargetId} onChange={(event) => setMergeTargetId(event.target.value)}><option value="">Choose a target profile</option>{(state.people || []).filter((person) => person.id !== profile.id).map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></label>
+            <button type="button" className="button-danger" disabled={!mergeTargetId} onClick={() => mergeProfile(profile)}><Users size={16} /> Merge into target</button>
           </div>}
           <div className="profile-detail-grid">
             <div><p className="eyebrow">Attendance history</p>{(profile.attendance_summary || []).slice(0, 8).map((record) => <div className="detail-row" key={record.id}><strong>{record.date}</strong><span>{record.clock_in || "No clock-in"} · {record.clock_out || "Open"}</span></div>)}{!profile.attendance_summary?.length && <p className="empty-copy">No attendance records.</p>}</div>

@@ -91,6 +91,13 @@ def get_person(person_id: int) -> dict[str, Any]:
            order by observed_at desc limit 50""",
         [person_id],
     )
+    person["enrollment_operations"] = fetch_all(
+        """select id, person_name, operation, status, sample_count,
+                  quality_json, provenance_json, actor_id, created_at
+           from enrollment_operations where person_id=?
+           order by created_at desc, id desc limit 20""",
+        [person_id],
+    )
     return person
 
 

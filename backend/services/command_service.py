@@ -17,10 +17,22 @@ ALLOWED_COMMANDS = {
     "manual_clock_in",
     "manual_clock_out",
     "start_enrollment",
+    "confirm_enrollment",
     "register_visible_unknown",
     "cancel_enrollment",
+    "retrain_person",
+    "disable_person",
+    "merge_people",
+    "delete_person",
     "test_alert",
     "reset_demo_data",
+}
+
+ADMIN_COMMANDS = {
+    "retrain_person",
+    "disable_person",
+    "merge_people",
+    "delete_person",
 }
 
 _COMMAND_LOCK = threading.Lock()

@@ -44,7 +44,8 @@ def ensure_platform_schema() -> None:
                 target text,
                 status text,
                 error text,
-                timestamp text not null
+                timestamp text not null,
+                source_event_id integer
             );
             create table if not exists attendance (
                 id integer primary key autoincrement,
@@ -62,10 +63,12 @@ def ensure_platform_schema() -> None:
                 is_official integer not null default 1,
                 subject text,
                 schedule_key text,
-                expected_start text,
-                expected_end text,
-                early_departure_minutes integer default 0,
-                unique(person_id, date),
+                 expected_start text,
+                 expected_end text,
+                 early_departure_minutes integer default 0,
+                 last_seen_at text,
+                 clock_out_source text,
+                 unique(person_id, date),
                 foreign key(person_id) references people(id) on delete cascade
             );
             create table if not exists absence_records (
@@ -98,6 +101,7 @@ def ensure_platform_schema() -> None:
                 id integer primary key autoincrement,
                 entity_id text not null,
                 track_id integer,
+                track_generation integer default 1,
                 person_id integer,
                 label text not null default 'UNKNOWN',
                 identity_state text not null default 'UNRESOLVED',
@@ -107,10 +111,11 @@ def ensure_platform_schema() -> None:
                 last_seen_at text not null,
                 ended_at text,
                 status text not null default 'active',
-                confidence real default 0.0,
-                first_frame_id integer,
-                last_frame_id integer,
-                foreign key(person_id) references people(id) on delete set null
+                 confidence real default 0.0,
+                 first_frame_id integer,
+                 last_frame_id integer,
+                 closed_reason text,
+                 foreign key(person_id) references people(id) on delete set null
             );
             create table if not exists recognition_evidence (
                 id integer primary key autoincrement,
@@ -132,6 +137,19 @@ def ensure_platform_schema() -> None:
                 foreign key(presence_session_id) references presence_sessions(id) on delete set null,
                 foreign key(person_id) references people(id) on delete set null
             );
+            create table if not exists enrollment_operations (
+                id integer primary key autoincrement,
+                person_id integer,
+                person_name text not null,
+                operation text not null,
+                status text not null,
+                sample_count integer default 0,
+                quality_json text,
+                provenance_json text,
+                actor_id text,
+                created_at text not null default (datetime('now')),
+                foreign key(person_id) references people(id) on delete set null
+            );
             """
         )
         event_columns = {row[1] for row in con.execute("pragma table_info(events)").fetchall()}
@@ -149,6 +167,10 @@ def ensure_platform_schema() -> None:
         for name, definition in additions.items():
             if name not in event_columns:
                 con.execute(f"alter table events add column {name} {definition}")
+
+        alert_columns = {row[1] for row in con.execute("pragma table_info(alert_log)").fetchall()}
+        if "source_event_id" not in alert_columns:
+            con.execute("alter table alert_log add column source_event_id integer")
 
         attendance_columns = {row[1] for row in con.execute("pragma table_info(attendance)").fetchall()}
         attendance_additions = {
@@ -168,10 +190,19 @@ def ensure_platform_schema() -> None:
             "expected_start": "text",
             "expected_end": "text",
             "early_departure_minutes": "integer default 0",
+            "last_seen_at": "text",
+            "clock_out_source": "text",
         }
         for name, definition in attendance_additions.items():
             if name not in attendance_columns:
                 con.execute(f"alter table attendance add column {name} {definition}")
+
+        presence_columns = {row[1] for row in con.execute(
+            "pragma table_info(presence_sessions)").fetchall()}
+        if "track_generation" not in presence_columns:
+            con.execute("alter table presence_sessions add column track_generation integer default 1")
+        if "closed_reason" not in presence_columns:
+            con.execute("alter table presence_sessions add column closed_reason text")
         con.execute("update events set review_status='open' where review_status is null")
         con.execute("update attendance set decision_source='automatic' where decision_source is null")
 
@@ -181,6 +212,8 @@ def ensure_platform_schema() -> None:
                 "entity_id": "text",
                 "camera_id": "text",
                 "location": "text",
+                "zone_id": "text",
+                "presence_session_id": "integer",
                 "assigned_to": "text",
                 "false_positive": "integer not null default 0",
             }
@@ -219,6 +252,8 @@ def ensure_platform_schema() -> None:
                 entity_id text,
                 camera_id text,
                 location text,
+                zone_id text,
+                presence_session_id integer,
                 assigned_to text,
                 false_positive integer not null default 0
             );
@@ -255,6 +290,22 @@ def ensure_platform_schema() -> None:
                 attempt_count integer not null default 1,
                 source_alert_id integer,
                 foreign key (incident_id) references incidents(id) on delete cascade
+            );
+
+            create table if not exists incident_evidence (
+                id integer primary key autoincrement,
+                incident_id integer not null,
+                event_id integer,
+                path text not null,
+                evidence_type text not null default 'snapshot',
+                source_frame_id integer,
+                captured_at text not null,
+                checksum text,
+                status text not null default 'available',
+                created_at text not null default (datetime('now')),
+                unique(incident_id, event_id, path),
+                foreign key (incident_id) references incidents(id) on delete cascade,
+                foreign key (event_id) references events(id) on delete set null
             );
 
             create table if not exists platform_users (
@@ -306,7 +357,9 @@ def ensure_platform_schema() -> None:
             create index if not exists idx_absence_person_date on absence_records(person_id, absence_date);
             create index if not exists idx_absence_date on absence_records(absence_date, status);
             create index if not exists idx_incident_entity on incidents(entity_id, camera_id, location);
+            create index if not exists idx_incident_session on incidents(presence_session_id);
             create index if not exists idx_incident_review on incident_review_actions(incident_id, created_at);
+            create index if not exists idx_incident_evidence on incident_evidence(incident_id, captured_at);
             create index if not exists idx_session_expiry on platform_sessions(expires_at);
             """
         )

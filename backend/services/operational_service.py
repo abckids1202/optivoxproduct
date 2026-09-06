@@ -31,6 +31,7 @@ def _normalize_session(row: dict[str, Any]) -> dict[str, Any]:
         "startedAt": row.get("started_at"),
         "lastSeenAt": row.get("last_seen_at"),
         "endedAt": row.get("ended_at"),
+        "closedReason": row.get("closed_reason"),
         "status": status,
         "active": status == "active",
         "confidence": row.get("confidence") or 0.0,

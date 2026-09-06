@@ -26,11 +26,21 @@ class CorrelationCore:
     """Normalizes frame outputs into bounded observations and entity state."""
 
     def __init__(self, max_entities: int = 128, max_observations_per_type: int = 12,
-                 close_after_sec: float = 10.0, ttl_overrides_ms: Optional[Dict[str, int]] = None):
+                 close_after_sec: float = 10.0, ttl_overrides_ms: Optional[Dict[str, int]] = None,
+                 face_visible_after_sec: float = 1.0,
+                 quality_valid_after_sec: float = 1.5,
+                 liveness_valid_after_sec: float = 2.0,
+                 identity_confirmation_observations: int = 1,
+                 track_switch_distance: float = 250.0):
         self.entities = EntityStateStore(
             max_entities=max_entities,
             max_observations_per_type=max_observations_per_type,
             close_after_sec=close_after_sec,
+            face_visible_after_sec=face_visible_after_sec,
+            quality_valid_after_sec=quality_valid_after_sec,
+            liveness_valid_after_sec=liveness_valid_after_sec,
+            identity_confirmation_observations=identity_confirmation_observations,
+            track_switch_distance=track_switch_distance,
         )
         self.global_history = ObservationHistory(
             max_per_type=max_observations_per_type,
@@ -85,6 +95,7 @@ class CorrelationCore:
         observed_at_monotonic: Optional[float] = None,
         observed_at_wallclock: Optional[str] = None,
         provenance: Optional[Dict[str, Dict[str, object]]] = None,
+        security_events: Optional[Iterable[tuple]] = None,
     ) -> Dict[str, object]:
         started = time.perf_counter()
         now = time.monotonic() if observed_at_monotonic is None else observed_at_monotonic
@@ -197,6 +208,10 @@ class CorrelationCore:
                     "identity_state": normalize_identity_state(face.get("identity_state")),
                     "cached_identity_confidence": face.get("cached_identity_confidence"),
                     "current_observation_similarity": face.get("current_observation_similarity"),
+                    "second_score": face.get("second_score"),
+                    "margin": face.get("margin"),
+                    "candidate_hits": face.get("candidate_hits"),
+                    "stable_frames": face.get("stable_frames"),
                     "last_verified_at": face.get("last_verified_at"),
                 },
             ))
@@ -252,6 +267,34 @@ class CorrelationCore:
                 metadata={"category": detection.get("category"), "entity_association": "not_established"},
             ))
 
+        for event in security_events or ():
+            if not event:
+                continue
+            event_type = str(event[0])
+            metadata = dict(event[4]) if len(event) > 4 and isinstance(event[4], dict) else {}
+            track_id = metadata.get("track_id")
+            try:
+                track_id = int(track_id) if track_id is not None else None
+            except (TypeError, ValueError):
+                track_id = None
+            self._add(Observation(
+                ObservationType.SECURITY_SIGNAL,
+                camera_id=camera_id,
+                source_frame_id=source_frame_id,
+                observed_at_monotonic=now,
+                observed_at_wallclock=observed_at_wallclock or "",
+                producer="SecuritySignalEngine",
+                entity_track_id=track_id,
+                confidence=float(event[2]) if len(event) > 2 else None,
+                confidence_type="security_signal_confidence",
+                value=event_type,
+                metadata={
+                    **metadata,
+                    "event_type": event_type,
+                    "details": event[3] if len(event) > 3 else "",
+                },
+            ))
+
         self.entities.history.prune(now)
         self.global_history.prune(now)
         self.last_update_ms = (time.perf_counter() - started) * 1000.0
@@ -259,6 +302,16 @@ class CorrelationCore:
             "frame_id": source_frame_id,
             "camera_id": camera_id,
             "entities": self.entities.snapshot(now),
+            "security_events": [
+                {
+                    "event_type": str(event[0]),
+                    "target": str(event[1]) if len(event) > 1 else "SYSTEM",
+                    "confidence": float(event[2]) if len(event) > 2 else 0.0,
+                    "details": event[3] if len(event) > 3 else "",
+                    "metadata": dict(event[4]) if len(event) > 4 and isinstance(event[4], dict) else {},
+                }
+                for event in (security_events or ())
+            ],
             "stats": self.stats(),
         }
 
@@ -272,6 +325,48 @@ class CorrelationCore:
             "expired_observations_rejected": self.entities.expired_observations_rejected,
             "entities": self.entities.stats(),
             "global_history": self.global_history.stats(),
+        }
+
+    def attendance_decision(
+        self,
+        track_id: int,
+        expected_name: Optional[str] = None,
+        active_roster: bool = True,
+    ) -> Dict[str, object]:
+        """Return the single authoritative attendance gate for one entity.
+
+        This is intentionally stricter than recognition display. A cached or
+        visually plausible name is not enough; the current correlated entity
+        must still be visible, quality-valid, live, and confirmed.
+        """
+        entity = self.entities.get(track_id)
+        if entity is None:
+            return {"eligible": False, "reason": "entity_not_active"}
+        entity.refresh()
+        identity = entity.identity
+        reasons = []
+        if entity.lifecycle_state.value not in {"NEW", "ACTIVE"}:
+            reasons.append("entity_not_active")
+        if not entity.face_visible:
+            reasons.append("face_not_visible")
+        if not entity.quality_ok:
+            reasons.append("face_quality_rejected")
+        if identity.state != "CONFIRMED":
+            reasons.append(f"identity_{identity.state.lower()}")
+        if not entity.liveness.last_checked_monotonic or entity.liveness.state != "REAL":
+            reasons.append("liveness_not_real")
+        if not active_roster:
+            reasons.append("person_not_active_in_roster")
+        if expected_name and identity.confirmed_name != expected_name:
+            reasons.append("identity_name_mismatch")
+        return {
+            "eligible": not reasons,
+            "reason": "eligible" if not reasons else ",".join(reasons),
+            "entity_id": entity.entity_id,
+            "person_name": identity.confirmed_name,
+            "identity_state": identity.state,
+            "liveness_state": entity.liveness.state,
+            "quality_ok": entity.quality_ok,
         }
 
     def snapshot(self) -> Dict[str, object]:

@@ -145,6 +145,8 @@ def test_entity_attendance_requires_confirmed_identity_and_real_liveness():
             "bbox": (0, 0, 40, 40),
             "name": "Ada",
             "identity_state": "CONFIRMED",
+            "quality_score": 90,
+            "quality_ok": True,
             "liveness_status": "UNCERTAIN",
         }],
     )
@@ -158,6 +160,8 @@ def test_entity_attendance_requires_confirmed_identity_and_real_liveness():
             "bbox": (0, 0, 40, 40),
             "name": "Ada",
             "identity_state": "CONFIRMED",
+            "quality_score": 90,
+            "quality_ok": True,
             "liveness_status": "REAL",
         }],
     )

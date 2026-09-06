@@ -19,8 +19,13 @@ class AssignmentRequest(BaseModel):
 
 
 @router.get("")
-def incidents(limit: int = 100, status: str | None = None):
-    return svc.list_incidents(limit=limit, status=status)
+def incidents(limit: int = 100, status: str | None = None,
+              category: str | None = None, zone_id: str | None = None,
+              camera_id: str | None = None, severity: int | None = None,
+              assignee: str | None = None):
+    return svc.list_incidents(
+        limit=limit, status=status, category=category, zone_id=zone_id,
+        camera_id=camera_id, severity=severity, assignee=assignee)
 
 
 @router.get("/{incident_id}")
