@@ -157,6 +157,11 @@ export async function fetchOperationalSummary() {
   return getJson("/api/operations/summary");
 }
 
+export async function fetchAttendanceDecisions(limit = 40) {
+  if (USE_DEMO_DATA) return [];
+  return getJson(`/api/operations/attendance-decisions?limit=${Math.max(1, Math.min(Number(limit) || 40, 500))}`);
+}
+
 export async function fetchPerformanceReport() {
   if (USE_DEMO_DATA) return { measurement_status: "NOT_MEASURED" };
   return getJson("/api/system/performance");

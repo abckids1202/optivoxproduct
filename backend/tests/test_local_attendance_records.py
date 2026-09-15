@@ -116,6 +116,39 @@ def test_rollover_closes_presence_sessions_with_explicit_reason(tmp_path):
         database.conn.close()
 
 
+def test_attendance_decision_audit_is_idempotent_and_keeps_rejections(tmp_path):
+    database = _database(tmp_path)
+    person_id = database.upsert_person("Ada")
+    first = database.record_attendance_decision(
+        decision_key="cam_0:entity:1:44:rejected",
+        decision="rejected",
+        reason="identity_unresolved",
+        entity_id="cam_0:entity:1",
+        person_id=None,
+        identity_state="UNRESOLVED",
+        liveness_status="NOT_EVALUATED",
+        source_frame_id=44,
+        observed_at="2026-09-15T10:00:00+00:00",
+    )
+    second = database.record_attendance_decision(
+        decision_key="cam_0:entity:1:44:rejected",
+        decision="rejected",
+        reason="should_not_duplicate",
+        entity_id="cam_0:entity:1",
+        source_frame_id=44,
+        observed_at="2026-09-15T10:00:00+00:00",
+    )
+    assert first == second
+    row = database._fetchone(
+        "select decision, reason, person_id from attendance_decisions where id=?",
+        (first,),
+    )
+    assert row["decision"] == "rejected"
+    assert row["reason"] == "identity_unresolved"
+    assert row["person_id"] is None
+    database.conn.close()
+
+
 def test_face_matching_uses_indexed_samples_and_records_margin():
     indexer = FAISSIndexer(dim=3)
     indexer.add_embeddings(

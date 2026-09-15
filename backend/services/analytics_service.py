@@ -7,6 +7,7 @@ from datetime import timedelta
 from ..config import local_today
 from ..database import fetch_all, fetch_one
 from .attendance_service import attendance_summary
+from .event_service import event_category
 from .runtime_service import live_state
 
 
@@ -103,10 +104,40 @@ def security(days: int = 30) -> dict:
     days = max(1, min(int(days), 366))
     end = local_today()
     start = end - timedelta(days=days - 1)
+    rows = fetch_all(
+        "select event_type, severity, timestamp from events where date(timestamp) between ? and ?",
+        [start.isoformat(), end.isoformat()],
+    )
+    security_rows = [
+        row for row in rows
+        if event_category(str(row.get("event_type") or "")) in {"Security", "Safety", "Object"}
+        or "SPOOF" in str(row.get("event_type") or "").upper()
+    ]
+    category_totals: dict[str, int] = defaultdict(int)
+    hour_totals: dict[str, int] = defaultdict(int)
+    severity_totals: dict[int, int] = defaultdict(int)
+    for row in security_rows:
+        category_totals[str(row.get("event_type") or "UNKNOWN")] += 1
+        timestamp = str(row.get("timestamp") or "")
+        hour_totals[timestamp[11:13] if len(timestamp) >= 13 else "--"] += 1
+        try:
+            severity_totals[int(row.get("severity") or 0)] += 1
+        except (TypeError, ValueError):
+            severity_totals[0] += 1
     return {
-        "securityCategories": fetch_all("select event_type as name, count(*) as value from events where date(timestamp) between ? and ? group by event_type order by value desc limit 8", [start.isoformat(), end.isoformat()]),
-        "eventsByHour": fetch_all("select substr(timestamp,12,2) as hour, count(*) as events from events where date(timestamp) between ? and ? group by substr(timestamp,12,2) order by hour", [start.isoformat(), end.isoformat()]),
-        "bySeverity": fetch_all("select severity, count(*) as count from events where date(timestamp) between ? and ? group by severity", [start.isoformat(), end.isoformat()]),
+        "securityObservationTotal": len(security_rows),
+        "securityCategories": [
+            {"name": name, "value": value}
+            for name, value in sorted(category_totals.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ],
+        "eventsByHour": [
+            {"hour": hour, "events": hour_totals[hour]}
+            for hour in sorted(hour_totals)
+        ],
+        "bySeverity": [
+            {"severity": severity, "count": count}
+            for severity, count in sorted(severity_totals.items())
+        ],
     }
 
 

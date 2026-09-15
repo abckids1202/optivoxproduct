@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+import os
 import shutil
 
 from ..config import DATABASE_PATH, EXPORTS_DIR, MODELS_DIR, REPORTS_DIR, SNAPSHOTS_DIR
@@ -20,16 +22,32 @@ def system_status() -> dict:
 
 
 def models_status() -> dict:
+    object_model = next(
+        (path for path in (MODELS_DIR / "yolov8n.pt", MODELS_DIR.parent / "yolov8n.pt") if path.exists()),
+        None,
+    )
+    danger_model = next(
+        (path for path in (
+            MODELS_DIR / "best_weapon.onnx",
+            MODELS_DIR / "best_weapon.pt",
+        ) if path.exists()),
+        None,
+    )
     return {
-        "face_detector": "unknown",
-        "face_recognizer": "unknown",
-        "faiss": "unknown",
-        "object_detector": "active" if (MODELS_DIR.parent / "yolov8n.pt").exists() else "missing",
-        "pose_detector": "unknown",
-        "hand_detector": "unknown",
-        "anti_spoofing": "unknown",
-        "danger_model": "active" if (MODELS_DIR / "best_weapon.onnx").exists() else "missing",
-        "ai_assistant": "unknown",
+        # These are capability probes, not claims that a live runtime is
+        # currently serving inference. The live handshake remains the source
+        # of truth for runtime availability.
+        "face_detector": "installed" if importlib.util.find_spec("insightface") else "missing",
+        "face_recognizer": "installed" if importlib.util.find_spec("insightface") else "missing",
+        "faiss": "installed" if importlib.util.find_spec("faiss") else "numpy_fallback",
+        "object_detector": "configured" if object_model else "missing",
+        "object_model_path": str(object_model) if object_model else None,
+        "pose_detector": "installed" if importlib.util.find_spec("mediapipe") else "missing",
+        "hand_detector": "installed" if importlib.util.find_spec("mediapipe") else "missing",
+        "anti_spoofing": "experimental_heuristics",
+        "danger_model": "configured" if danger_model else "not_configured",
+        "danger_model_path": str(danger_model) if danger_model else None,
+        "ai_assistant": "configured" if os.getenv("OPENAI_API_KEY") else "not_configured",
     }
 
 

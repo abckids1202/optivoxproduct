@@ -127,11 +127,19 @@ def get_event(event_id: int) -> dict[str, Any]:
 
 def event_summary() -> dict[str, Any]:
     rows = fetch_all("select event_type, severity, count(*) as count from events group by event_type, severity")
+    security_rows = [
+        row for row in rows
+        if event_category(str(row.get("event_type") or "")) in {"Security", "Safety", "Object"}
+        or "SPOOF" in str(row.get("event_type") or "").upper()
+    ]
     return {
         "total": sum(r["count"] for r in rows),
         "by_type": rows,
         "critical": sum(r["count"] for r in rows if int(r["severity"] or 0) >= 3),
         "warning": sum(r["count"] for r in rows if 1 <= int(r["severity"] or 0) < 3),
+        # Raw observation volume stays separate from operational incidents.
+        "security_total": sum(r["count"] for r in security_rows),
+        "security_by_type": security_rows,
     }
 
 

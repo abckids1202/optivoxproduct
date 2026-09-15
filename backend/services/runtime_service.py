@@ -132,7 +132,7 @@ def performance_report() -> dict[str, Any]:
         "yolo_latency_ms": None,
         "pose_latency_ms": None,
         "frame_age_p95_ms": None,
-        "end_to_end_latency_ms": None,
+        "end_to_end_latency_ms": latency.get("end_to_end_p95"),
         "cpu_percent": None,
         "gpu_percent": None,
         "vram_used_mb": None,

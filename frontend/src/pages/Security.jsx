@@ -122,7 +122,7 @@ export default function Security({ state }) {
               <div>
                 <div className="event-title"><strong>{incident.summary}</strong><span className={`status-badge ${incidentTone(incident.status)}`}>{incident.status}</span></div>
                 <p>{incident.category} · {incident.event_count} linked observations</p>
-                <div className="event-meta"><span>Last seen {incident.last_event_at}</span><span>Severity {incident.severity}</span><span>{incident.cameraId || "No camera"}{incident.location ? ` · ${incident.location}` : ""}</span></div>
+                <div className="event-meta"><span>Last seen {incident.last_event_at}</span><span>Severity {incident.severity}</span><span>{incident.cameraId || "No camera"}{incident.location ? ` · ${incident.location}` : ""}</span><span>{incident.evidence_count || 0} evidence · {incident.alert_count || 0} alerts</span></div>
               </div>
               <div className="incident-actions"><button type="button" onClick={() => setSelectedIncidentId(incident.id)}>View timeline</button>
               {!['dismissed', 'resolved'].includes(incident.status) && <>
@@ -142,7 +142,7 @@ export default function Security({ state }) {
         {!incidentDetail && <p className="empty-copy">Loading incident evidence and review history.</p>}
         {incidentDetail && <>
           <div className="section-heading"><div><p className="eyebrow">Evidence timeline</p><h2>{incidentDetail.summary}</h2><p className="panel-note">Unknown presence, identity uncertainty, and confirmed danger remain separate signals.</p></div><button type="button" className="button-quiet" onClick={() => setSelectedIncidentId(null)}>Close timeline</button></div>
-          <div className="incident-context"><span>{incidentDetail.category}</span><span>{incidentDetail.cameraId || "Camera unknown"}</span><span>{incidentDetail.location || "Location unknown"}</span><span>{incidentDetail.event_count} observations</span></div>
+          <div className="incident-context"><span>{incidentDetail.category}</span><span>{incidentDetail.cameraId || "Camera unknown"}</span><span>{incidentDetail.location || "Location unknown"}</span><span>{incidentDetail.event_count} observations</span><span>{incidentDetail.evidence_count || 0} evidence</span><span>{incidentDetail.alert_count || 0} alerts</span><span>{incidentDetail.review_action_count || 0} reviews</span></div>
           <div className="incident-operator-row"><label><span>Assigned operator</span><input value={assignee} onChange={(event) => setAssignee(event.target.value)} placeholder="e.g. security lead" /></label><button type="button" onClick={saveAssignment}>Save assignment</button></div>
           <div className="incident-timeline">{(incidentDetail.events || []).map((event) => <div className="timeline-item" key={event.id}><div><strong>{event.event_type}</strong><span>{event.timestamp} · {event.camera || "camera unknown"}</span></div>{event.snapshot_url && <a href={event.snapshot_url} target="_blank" rel="noreferrer">Open evidence</a>}</div>)}</div>
           <div className="incident-records">

@@ -19,13 +19,17 @@ def _details(value: Any) -> Any:
 
 def _normalize_session(row: dict[str, Any]) -> dict[str, Any]:
     status = row.get("status") or "active"
+    identity_state = row.get("identity_state") or "UNRESOLVED"
+    label = row.get("label") or "UNKNOWN"
+    if str(identity_state).upper() != "CONFIRMED":
+        label = "UNKNOWN"
     return {
         "id": row.get("id"),
         "entityId": row.get("entity_id"),
         "trackId": row.get("track_id"),
         "personId": row.get("person_id"),
-        "label": row.get("label") or "UNKNOWN",
-        "identityState": row.get("identity_state") or "UNRESOLVED",
+        "label": label,
+        "identityState": identity_state,
         "livenessStatus": row.get("liveness_status"),
         "cameraId": row.get("camera_id"),
         "startedAt": row.get("started_at"),
@@ -60,6 +64,27 @@ def _normalize_evidence(row: dict[str, Any]) -> dict[str, Any]:
         "sourceFrameId": row.get("source_frame_id"),
         "observedAt": row.get("observed_at"),
         "details": _details(row.get("details_json")),
+    }
+
+
+def _normalize_decision(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "decisionKey": row.get("decision_key"),
+        "personId": row.get("person_id"),
+        "entityId": row.get("entity_id"),
+        "presenceSessionId": row.get("presence_session_id"),
+        "recognitionEvidenceId": row.get("recognition_evidence_id"),
+        "decision": row.get("decision"),
+        "reason": row.get("reason"),
+        "identityState": row.get("identity_state"),
+        "livenessStatus": row.get("liveness_status"),
+        "qualityScore": row.get("quality_score"),
+        "recognitionConfidence": row.get("recognition_confidence"),
+        "sourceFrameId": row.get("source_frame_id"),
+        "observedAt": row.get("observed_at"),
+        "details": _details(row.get("details_json")),
+        "createdAt": row.get("created_at"),
     }
 
 
@@ -171,6 +196,36 @@ def list_recognition_evidence(
                 left join people p on p.id=r.person_id
                 {where}
                 order by r.observed_at desc, r.id desc limit ?""",
+            params,
+        )
+    ]
+
+
+def list_attendance_decisions(
+    limit: int = 100,
+    entity_id: str | None = None,
+    person_id: int | None = None,
+    decision: str | None = None,
+) -> list[dict[str, Any]]:
+    """Expose the automatic gate audit trail without exposing biometrics."""
+    clauses = []
+    params: list[Any] = []
+    if entity_id:
+        clauses.append("d.entity_id=?")
+        params.append(entity_id)
+    if person_id is not None:
+        clauses.append("d.person_id=?")
+        params.append(person_id)
+    if decision:
+        clauses.append("d.decision=?")
+        params.append(decision)
+    where = f"where {' and '.join(clauses)}" if clauses else ""
+    params.append(max(1, min(int(limit), 500)))
+    return [
+        _normalize_decision(row)
+        for row in fetch_all(
+            f"""select d.* from attendance_decisions d {where}
+                order by d.observed_at desc, d.id desc limit ?""",
             params,
         )
     ]

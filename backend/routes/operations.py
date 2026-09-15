@@ -44,3 +44,19 @@ def recognition_evidence(
         person_id=person_id,
         decision=decision,
     )
+
+
+@router.get("/attendance-decisions")
+def attendance_decisions(
+    limit: int = Query(default=100, ge=1, le=500),
+    entity_id: str | None = None,
+    person_id: int | None = Query(default=None, ge=1),
+    decision: str | None = Query(default=None, max_length=32),
+    actor: str = Depends(require_operator),
+):
+    return svc.list_attendance_decisions(
+        limit=limit,
+        entity_id=entity_id,
+        person_id=person_id,
+        decision=decision,
+    )

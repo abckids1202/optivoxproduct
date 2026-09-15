@@ -716,6 +716,27 @@ class DatabaseMigrationManager:
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
                 );
+                CREATE TABLE IF NOT EXISTS attendance_decisions (
+                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision_key            TEXT NOT NULL UNIQUE,
+                    person_id               INTEGER,
+                    entity_id               TEXT,
+                    presence_session_id    INTEGER,
+                    recognition_evidence_id INTEGER,
+                    decision                TEXT NOT NULL,
+                    reason                  TEXT,
+                    identity_state          TEXT,
+                    liveness_status         TEXT,
+                    quality_score           REAL,
+                    recognition_confidence REAL,
+                    source_frame_id        INTEGER,
+                    observed_at            TEXT NOT NULL,
+                    details_json           TEXT,
+                    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL,
+                    FOREIGN KEY(presence_session_id) REFERENCES presence_sessions(id) ON DELETE SET NULL,
+                    FOREIGN KEY(recognition_evidence_id) REFERENCES recognition_evidence(id) ON DELETE SET NULL
+                );
                 CREATE TABLE IF NOT EXISTS absence_records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     person_id INTEGER NOT NULL,
@@ -1073,6 +1094,27 @@ class EventDatabase:
                     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
                     FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
                 );
+                CREATE TABLE IF NOT EXISTS attendance_decisions (
+                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision_key            TEXT NOT NULL UNIQUE,
+                    person_id               INTEGER,
+                    entity_id               TEXT,
+                    presence_session_id    INTEGER,
+                    recognition_evidence_id INTEGER,
+                    decision                TEXT NOT NULL,
+                    reason                  TEXT,
+                    identity_state          TEXT,
+                    liveness_status         TEXT,
+                    quality_score           REAL,
+                    recognition_confidence REAL,
+                    source_frame_id        INTEGER,
+                    observed_at            TEXT NOT NULL,
+                    details_json           TEXT,
+                    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL,
+                    FOREIGN KEY(presence_session_id) REFERENCES presence_sessions(id) ON DELETE SET NULL,
+                    FOREIGN KEY(recognition_evidence_id) REFERENCES recognition_evidence(id) ON DELETE SET NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     action          TEXT NOT NULL,
@@ -1090,6 +1132,10 @@ class EventDatabase:
                 CREATE INDEX IF NOT EXISTS idx_attendance_pers  ON attendance(person_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_time       ON audit_log(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_alert_time       ON alert_log(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_attendance_decisions_entity
+                    ON attendance_decisions(entity_id, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_attendance_decisions_person
+                    ON attendance_decisions(person_id, observed_at);
             """)
             self.conn.commit()
             DatabaseMigrationManager(self.conn, self.lock).run()
@@ -1161,11 +1207,14 @@ class EventDatabase:
             return row["id"] if row else None
 
     def get_person_id(self, name: str):
-        row = self._fetchone("SELECT id FROM people WHERE name=?", (name,))
+        row = self._fetchone("SELECT id FROM people WHERE lower(name)=lower(?)", (name,))
         return row["id"] if row else None
 
     def get_active_person_id(self, name: str):
-        row = self._fetchone("SELECT id, metadata_json FROM people WHERE name=?", (name,))
+        row = self._fetchone(
+            "SELECT id, metadata_json FROM people WHERE lower(name)=lower(?)",
+            (name,),
+        )
         if not row:
             return None
         metadata = _safe_json_parse(row["metadata_json"])
@@ -1311,8 +1360,8 @@ class EventDatabase:
                 session_id = row["id"]
                 existing_person_id = row["person_id"]
                 effective_person_id = existing_person_id or person_id
-                effective_label = row["label"] if existing_person_id else str(label or "UNKNOWN")
                 effective_state = str(identity_state or "UNRESOLVED")
+                effective_label = row["label"] if existing_person_id else str(label or "UNKNOWN")
                 if (existing_person_id and person_id
                         and int(existing_person_id) != int(person_id)):
                     # A tracker or recognizer disagreement must be visible and
@@ -1438,6 +1487,43 @@ class EventDatabase:
             )
             self.conn.commit()
             return cur.lastrowid
+
+    def record_attendance_decision(
+        self, decision_key, decision, reason=None, person_id=None,
+        entity_id=None, presence_session_id=None, recognition_evidence_id=None,
+        identity_state=None, liveness_status=None, quality_score=None,
+        recognition_confidence=None, source_frame_id=None, observed_at=None,
+        details=None,
+    ):
+        """Persist one idempotent attendance eligibility decision.
+
+        Rejected decisions are retained as well as accepted ones. This keeps
+        the automatic gate explainable without turning frame detections into
+        attendance records.
+        """
+        if not decision_key:
+            return None
+        observed_at = observed_at or _utc_now()
+        with self.lock:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO attendance_decisions
+                   (decision_key, person_id, entity_id, presence_session_id,
+                    recognition_evidence_id, decision, reason, identity_state,
+                    liveness_status, quality_score, recognition_confidence,
+                    source_frame_id, observed_at, details_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(decision_key), person_id, entity_id, presence_session_id,
+                 recognition_evidence_id, str(decision or "rejected"),
+                 str(reason or ""), identity_state, liveness_status,
+                 quality_score, recognition_confidence, source_frame_id,
+                 observed_at, json.dumps(details or {}, default=str)),
+            )
+            row = self.conn.execute(
+                "SELECT id FROM attendance_decisions WHERE decision_key=?",
+                (str(decision_key),),
+            ).fetchone()
+            self.conn.commit()
+            return int(row["id"]) if row else None
 
     def _schedule_for_person(self, person_id: int, local_now: dt_datetime) -> Optional[dict]:
         """Resolve an optional class schedule, falling back to global policy."""
@@ -5057,6 +5143,12 @@ class VisionSystem:
 
         events.extend(self.behavior.update(tracked))
         events.extend(self.crowd_intel.update(tracked, frame_size=(h, w)))
+        # SecuritySignalEngine owns debounced operational versions of these
+        # signals. Behavior/Crowd still update their internal analytics, but
+        # their duplicate tuples must not reach the persistence/alert path.
+        events = [event for event in events if str(event[0]) not in {
+            "LOITERING", "RUNNING", "EVACUATION_ALERT",
+        }]
         mark_stage("tracking_and_behavior")
 
         pose_result = self._last_pose_result
@@ -5114,18 +5206,6 @@ class VisionSystem:
             recognition_scale=recognition_scale)
         mark_stage("recognition_and_liveness")
 
-        # Security signals run after the current face result is available, so
-        # zone intrusion can distinguish a confirmed roster identity from an
-        # unresolved presence. They remain independent from attendance.
-        security_events = self.security_signals.update(
-            tracked,
-            faces_info=faces_info,
-            object_detections=object_detections,
-            now=frame_observed_at,
-            wallclock=frame_observed_wallclock,
-        )
-        events.extend(security_events)
-
         correlation_state = {}
         if self.cfg.get("CORRELATION_CORE", {}).get("ENABLED", True):
             correlation_state = self.correlation.update(
@@ -5154,11 +5234,12 @@ class VisionSystem:
                         "wallclock": self._last_pose_observation_wallclock,
                     },
                 },
-                # Correlate every operational signal, including danger,
-                # behavior, and zone events, before persistence or alerts.
+                # Behavior, crowd, pose, and other pre-correlation signals are
+                # reduced first. Zone policy is evaluated in a second stage
+                # after canonical identity state is available.
                 security_events=events,
             )
-            events = correlation_state.get("security_event_tuples") or events
+            events = list(correlation_state.get("security_event_tuples") or [])
         self._last_correlation_state = correlation_state
         entity_by_track = {
             int(entity["track_id"]): entity
@@ -5188,6 +5269,32 @@ class VisionSystem:
                 "quality_ok", fi.get("quality_ok", False)))
             fi["correlation_reason"] = (
                 "authoritative_entity_state" if entity else "entity_not_found")
+
+        # Security policy consumes canonical entity state. This prevents a
+        # stale raw recognition label from authorizing a restricted-zone
+        # presence before the correlation reducer has checked continuity,
+        # quality, liveness, and contradiction state.
+        security_events = self.security_signals.update(
+            tracked,
+            faces_info=faces_info,
+            object_detections=object_detections,
+            now=frame_observed_at,
+            wallclock=frame_observed_wallclock,
+        )
+        if self.cfg.get("CORRELATION_CORE", {}).get("ENABLED", True):
+            correlated_security = self.correlation.correlate_security_events(
+                security_events,
+                source_frame_id=source_frame_id,
+                camera_id=camera_id,
+                observed_at_monotonic=frame_observed_at,
+                observed_at_wallclock=frame_observed_wallclock,
+            )
+            events.extend(correlated_security.get("security_event_tuples") or [])
+            correlation_state.setdefault("security_events", []).extend(
+                correlated_security.get("security_events") or [])
+            correlation_state["stats"] = self.correlation.stats()
+        else:
+            events.extend(security_events)
 
         self._last_faces_seen = []
         for fi in faces_info:
@@ -7330,6 +7437,38 @@ def _process_runtime_side_effects(
                     "liveness_details": face.get("liveness_details", {}),
                 },
             )
+            active_person_id = db.get_active_person_id(name) if identity_state == "CONFIRMED" else None
+            attendance_reasons = []
+            if identity_state != "CONFIRMED":
+                attendance_reasons.append(f"identity_{identity_state.lower()}")
+            if not bool(correlated_entity.get("attendance_eligibility")):
+                attendance_reasons.append("entity_gate_rejected")
+            if not bool(face.get("quality_ok", False)):
+                attendance_reasons.append("face_quality_rejected")
+            correlated_liveness = correlated_entity.get("liveness") or {}
+            if str(face.get("liveness_status") or correlated_liveness.get("state") or "NOT_EVALUATED").upper() != "REAL":
+                attendance_reasons.append("liveness_not_real")
+            if active_person_id is None:
+                attendance_reasons.append("person_not_active_in_roster")
+            attendance_decision = "eligible" if not attendance_reasons else "rejected"
+            decision_frame_id = face.get("source_frame_id") or task.get("frame_id")
+            decision_key = f"{entity_id}:{decision_frame_id}:{attendance_decision}"
+            db.record_attendance_decision(
+                decision_key=decision_key,
+                decision=attendance_decision,
+                reason="eligible" if not attendance_reasons else ",".join(dict.fromkeys(attendance_reasons)),
+                person_id=active_person_id,
+                entity_id=entity_id,
+                presence_session_id=sessions_by_entity.get(str(entity_id)),
+                recognition_evidence_id=evidence_by_entity[str(entity_id)],
+                identity_state=identity_state,
+                liveness_status=face.get("liveness_status") or correlated_liveness.get("state"),
+                quality_score=face.get("quality_score"),
+                recognition_confidence=face.get("current_observation_similarity", face.get("confidence", 0.0)),
+                source_frame_id=decision_frame_id,
+                observed_at=face.get("observed_at") or task.get("completed_at") or _utc_now(),
+                details={"method": "automatic_gate", "gate_reasons": list(dict.fromkeys(attendance_reasons))},
+            )
         except Exception as exc:
             print(f"[ERROR] Recognition evidence failed: {exc}")
 
@@ -7447,10 +7586,15 @@ def _process_runtime_side_effects(
                 snapshot_path=snapshot_path,
                 camera_id=cam_id,
                 location=cam_location,
-                severity=_SEVERITY_MAP.get(event_type, 0),
+                # Zone policy may raise severity above the generic event
+                # default. Preserve that policy value in the durable record.
+                severity=max(
+                    _SEVERITY_MAP.get(event_type, 0),
+                    int(metadata.get("severity", 0) or 0),
+                ),
                 entity_id=event_entity_id,
                 presence_session_id=event_session_id,
-                source_frame_id=task.get("frame_id"),
+                source_frame_id=metadata.get("source_frame_id") or task.get("frame_id"),
                 observation_type=event_type,
                 evidence_path=snapshot_path,
             )
@@ -7959,6 +8103,7 @@ def main():
             "liveness_passed": False,
             "liveness_first_turn": None,
             "liveness_yaw": None,
+            "last_gate_key": None,
         },
         "show_details": True,
         "roster": [],
@@ -8064,6 +8209,7 @@ def main():
                 "liveness_passed": False,
                 "liveness_first_turn": None,
                 "liveness_yaw": None,
+                "last_gate_key": None,
             })
             ui["message"] = state["status"]
             return
@@ -8088,6 +8234,7 @@ def main():
                 "liveness_hold_started_at": None,
                 "liveness_passed": not cfg.get("CENTER_MODE_REQUIRE_LIVENESS", True),
                 "liveness_first_turn": None,
+                "last_gate_key": None,
             })
         else:
             state["stable_frames"] += 1
@@ -8129,48 +8276,93 @@ def main():
             expected_name=name,
             active_roster=person_id is not None,
         )
-        if not correlation_gate.get("eligible"):
-            state.update({
-                "phase": "VERIFYING",
-                "status": f"Verification paused: {correlation_gate.get('reason', 'not eligible')}.",
-            })
-            ui["message"] = state["status"]
-            return
-
         session_id = None
         evidence_id = None
         entity_id = face.get("entity_id")
-        if entity_id:
+        track_id = face.get("oid")
+        entity_state = vision.correlation.entities.get(int(track_id or -1))
+        track_generation = entity_state.track_generation if entity_state else 1
+        observed_at = face.get("observed_at") or _utc_now()
+        gate_eligible = bool(correlation_gate.get("eligible"))
+        gate_reason = str(correlation_gate.get("reason") or (
+            "eligible" if gate_eligible else "not_eligible"))
+        gate_key = f"center:{entity_id or f'track:{track_id}'}:{'eligible' if gate_eligible else gate_reason}"
+
+        # Center mode has its own focused path, so persist the same evidence
+        # chain as normal automatic attendance without writing one row per
+        # display frame. A new row is created only when the gate state/reason
+        # changes for the current focused entity.
+        if entity_id and state.get("last_gate_key") != gate_key:
+            canonical_person_id = person_id if correlation_gate.get("identity_state") == "CONFIRMED" else None
+            canonical_label = name if canonical_person_id is not None else "UNKNOWN"
             session_id = db.upsert_presence_session(
                 entity_id=entity_id,
-                track_id=face.get("oid"),
-                person_id=person_id,
-                label=name,
+                track_id=track_id,
+                person_id=canonical_person_id,
+                label=canonical_label,
                 identity_state=correlation_gate.get("identity_state", "CONFIRMED"),
                 liveness_status=correlation_gate.get("liveness_state", "REAL"),
                 camera_id=cam_id,
                 confidence=confidence,
                 source_frame_id=face.get("source_frame_id"),
-                observed_at=face.get("observed_at") or _utc_now(),
-                track_generation=(vision.correlation.entities.get(int(face.get("oid", -1))).track_generation
-                                  if vision.correlation.entities.get(int(face.get("oid", -1))) else 1),
+                observed_at=observed_at,
+                track_generation=track_generation,
+            )
+            evidence_decision = (
+                "confirmed" if gate_eligible else
+                "spoof_or_uncertain" if str(correlation_gate.get("liveness_state") or "").upper() != "REAL"
+                else "unresolved"
             )
             evidence_id = db.record_recognition_evidence(
                 entity_id=entity_id,
                 presence_session_id=session_id,
-                track_id=face.get("oid"),
-                person_id=person_id,
-                candidate_name=name,
-                decision="confirmed",
+                track_id=track_id,
+                person_id=canonical_person_id,
+                candidate_name=name if canonical_person_id is not None else "UNKNOWN",
+                decision=evidence_decision,
                 similarity=face.get("current_observation_similarity", confidence),
                 quality_score=face.get("quality_score", 0.0),
                 quality_ok=face.get("quality_ok", False),
                 liveness_status=correlation_gate.get("liveness_state", "REAL"),
                 identity_state=correlation_gate.get("identity_state", "CONFIRMED"),
-                reason="center_attendance_challenge_passed",
+                reason=("center_attendance_challenge_passed" if gate_eligible
+                        else f"center_gate_rejected:{gate_reason}"),
                 source_frame_id=face.get("source_frame_id"),
-                observed_at=face.get("observed_at") or _utc_now(),
+                observed_at=observed_at,
             )
+            db.record_attendance_decision(
+                decision_key=gate_key,
+                decision="eligible" if gate_eligible else "rejected",
+                reason=gate_reason,
+                person_id=canonical_person_id,
+                entity_id=entity_id,
+                presence_session_id=session_id,
+                recognition_evidence_id=evidence_id,
+                identity_state=correlation_gate.get("identity_state"),
+                liveness_status=correlation_gate.get("liveness_state"),
+                quality_score=face.get("quality_score"),
+                recognition_confidence=face.get("current_observation_similarity", confidence),
+                source_frame_id=face.get("source_frame_id"),
+                observed_at=observed_at,
+                details={
+                    "method": "center_attendance",
+                    "challenge_phase": state.get("liveness_phase"),
+                    "track_generation": track_generation,
+                    "gate": correlation_gate,
+                },
+            )
+            state["last_gate_key"] = gate_key
+
+        if not gate_eligible:
+            state.update({
+                "phase": "VERIFYING",
+                "status": f"Verification paused: {gate_reason}.",
+            })
+            ui["message"] = state["status"]
+            return
+
+        # A policy rejection (for example a non-school day) is separate from
+        # the recognition gate. Preserve that outcome in the same audit trail.
         result = attendance.clock_in_verified(
             name, cam_id, cam_location, confidence=confidence,
             method="center_attendance", presence_session_id=session_id,
@@ -8181,6 +8373,23 @@ def main():
             attendance_eligible=True,
             quality_ok=bool(correlation_gate.get("quality_ok")))
         if "error" in result:
+            if entity_id:
+                db.record_attendance_decision(
+                    decision_key=f"{gate_key}:policy",
+                    decision="rejected",
+                    reason=f"attendance_policy:{result['error']}",
+                    person_id=person_id,
+                    entity_id=entity_id,
+                    presence_session_id=session_id,
+                    recognition_evidence_id=evidence_id,
+                    identity_state=correlation_gate.get("identity_state"),
+                    liveness_status=correlation_gate.get("liveness_state"),
+                    quality_score=face.get("quality_score"),
+                    recognition_confidence=face.get("current_observation_similarity", confidence),
+                    source_frame_id=face.get("source_frame_id"),
+                    observed_at=observed_at,
+                    details={"method": "center_attendance", "policy_result": result},
+                )
             state.update({"phase": "BLOCKED", "status": result["error"], "progress": 0.0})
             return
         state.update({

@@ -84,6 +84,103 @@ class CorrelationCore:
         distance, track_id = min(candidates)
         return track_id if distance <= 150.0 else None
 
+    def _correlate_security_events(
+        self,
+        security_events: Optional[Iterable[tuple]],
+        source_frame_id: Optional[int],
+        camera_id: str,
+        observed_at_monotonic: float,
+        observed_at_wallclock: Optional[str],
+    ) -> Dict[str, list]:
+        """Attach security observations to the current canonical entities.
+
+        Security rules may run after the identity reducer has established the
+        current entity state. This method deliberately does not advance the
+        frame reducer or create a second person observation; it only records
+        the already-correlated security decisions that are safe to persist.
+        """
+        correlated_event_tuples = []
+        correlated_event_records = []
+        for event in security_events or ():
+            if not event:
+                continue
+            event_type = str(event[0])
+            metadata = dict(event[4]) if len(event) > 4 and isinstance(event[4], dict) else {}
+            track_id = metadata.get("track_id")
+            try:
+                track_id = int(track_id) if track_id is not None else None
+            except (TypeError, ValueError):
+                track_id = None
+            entity = self.entities.get(track_id) if track_id is not None else None
+            if entity is not None:
+                entity.refresh(observed_at_monotonic)
+                identity = entity.identity
+                metadata.update({
+                    "entity_id": entity.entity_id,
+                    "track_generation": entity.track_generation,
+                    "lifecycle_state": entity.lifecycle_state.value,
+                    "identity_state": identity.state,
+                    "confirmed_name": identity.confirmed_name,
+                    "liveness_state": entity.liveness.state,
+                    "attendance_eligibility": entity.attendance_eligibility,
+                    "source_frame_id": source_frame_id,
+                })
+                zone_id = metadata.get("zone_id")
+                if zone_id:
+                    if event_type == "ZONE_EXIT":
+                        entity.current_zone = None
+                    else:
+                        entity.current_zone = str(zone_id)
+            target = str(event[1]) if len(event) > 1 else "SYSTEM"
+            # Never let a raw ID_* target become a named person unless the
+            # current entity is confirmed by the correlation reducer.
+            if entity is not None:
+                identity = entity.identity
+                if identity.state == "CONFIRMED" and identity.confirmed_name:
+                    if target.startswith("ID_") or target in {"PERSON", "UNKNOWN"}:
+                        target = identity.confirmed_name
+                elif target == "PERSON" or target.startswith("ID_") or target not in {"SYSTEM"}:
+                    target = "UNKNOWN"
+            confidence = float(event[2]) if len(event) > 2 else 0.0
+            details = event[3] if len(event) > 3 else ""
+            correlated_event_tuples.append((event_type, target, confidence, details, metadata))
+            correlated_event_records.append({
+                "event_type": event_type,
+                "target": target,
+                "confidence": confidence,
+                "details": details,
+                "metadata": metadata,
+            })
+            self._add(Observation(
+                ObservationType.SECURITY_SIGNAL,
+                camera_id=camera_id,
+                source_frame_id=source_frame_id,
+                observed_at_monotonic=observed_at_monotonic,
+                observed_at_wallclock=observed_at_wallclock or "",
+                producer="SecuritySignalEngine",
+                entity_track_id=track_id,
+                confidence=confidence,
+                confidence_type="security_signal_confidence",
+                value=event_type,
+                metadata={**metadata, "event_type": event_type, "details": details},
+            ))
+            if entity is not None and metadata.get("zone_id"):
+                self._add(Observation(
+                    ObservationType.ZONE_MEMBERSHIP,
+                    camera_id=camera_id,
+                    source_frame_id=source_frame_id,
+                    observed_at_monotonic=observed_at_monotonic,
+                    observed_at_wallclock=observed_at_wallclock or "",
+                    producer="SecuritySignalEngine",
+                    entity_track_id=track_id,
+                    value=None if event_type == "ZONE_EXIT" else metadata.get("zone_id"),
+                    metadata={"zone_name": metadata.get("zone_name"), "event_type": event_type},
+                ))
+        return {
+            "security_event_tuples": correlated_event_tuples,
+            "security_events": correlated_event_records,
+        }
+
     def update(
         self,
         tracked: Dict[int, Tuple[int, int]],
@@ -267,62 +364,8 @@ class CorrelationCore:
                 metadata={"category": detection.get("category"), "entity_association": "not_established"},
             ))
 
-        correlated_event_tuples = []
-        correlated_event_records = []
-        for event in security_events or ():
-            if not event:
-                continue
-            event_type = str(event[0])
-            metadata = dict(event[4]) if len(event) > 4 and isinstance(event[4], dict) else {}
-            track_id = metadata.get("track_id")
-            try:
-                track_id = int(track_id) if track_id is not None else None
-            except (TypeError, ValueError):
-                track_id = None
-            entity = self.entities.get(track_id) if track_id is not None else None
-            if entity is not None:
-                entity.refresh(now)
-                identity = entity.identity
-                metadata.update({
-                    "entity_id": entity.entity_id,
-                    "track_generation": entity.track_generation,
-                    "lifecycle_state": entity.lifecycle_state.value,
-                    "identity_state": identity.state,
-                    "confirmed_name": identity.confirmed_name,
-                    "liveness_state": entity.liveness.state,
-                    "attendance_eligibility": entity.attendance_eligibility,
-                })
-            target = str(event[1]) if len(event) > 1 else "SYSTEM"
-            if entity is not None and identity.confirmed_name and target.startswith("ID_"):
-                target = identity.confirmed_name
-            confidence = float(event[2]) if len(event) > 2 else 0.0
-            details = event[3] if len(event) > 3 else ""
-            correlated_event_tuples.append(
-                (event_type, target, confidence, details, metadata))
-            correlated_event_records.append({
-                "event_type": event_type,
-                "target": target,
-                "confidence": confidence,
-                "details": details,
-                "metadata": metadata,
-            })
-            self._add(Observation(
-                ObservationType.SECURITY_SIGNAL,
-                camera_id=camera_id,
-                source_frame_id=source_frame_id,
-                observed_at_monotonic=now,
-                observed_at_wallclock=observed_at_wallclock or "",
-                producer="SecuritySignalEngine",
-                entity_track_id=track_id,
-                confidence=float(event[2]) if len(event) > 2 else None,
-                confidence_type="security_signal_confidence",
-                value=event_type,
-                metadata={
-                    **metadata,
-                    "event_type": event_type,
-                    "details": details,
-                },
-            ))
+        correlated = self._correlate_security_events(
+            security_events, source_frame_id, camera_id, now, observed_at_wallclock)
 
         self.entities.history.prune(now)
         self.global_history.prune(now)
@@ -331,13 +374,35 @@ class CorrelationCore:
             "frame_id": source_frame_id,
             "camera_id": camera_id,
             "entities": self.entities.snapshot(now),
-            "security_events": correlated_event_records,
+            "security_events": correlated["security_events"],
             # The runtime bridge consumes these enriched tuples for event,
             # alert, and incident persistence. Raw model events remain useful
             # for diagnostics but are no longer the operational contract.
-            "security_event_tuples": correlated_event_tuples,
+            "security_event_tuples": correlated["security_event_tuples"],
             "stats": self.stats(),
         }
+
+    def correlate_security_events(
+        self,
+        security_events: Optional[Iterable[tuple]],
+        source_frame_id: Optional[int] = None,
+        camera_id: str = "cam_0",
+        observed_at_monotonic: Optional[float] = None,
+        observed_at_wallclock: Optional[str] = None,
+    ) -> Dict[str, list]:
+        """Correlate security output after identity state is canonical.
+
+        This second-stage hook exists to avoid a circular dependency: zone
+        policy needs canonical identity, while entity state also needs the
+        resulting security observation. It does not increment frame counts or
+        re-run recognition, so it is safe for the real-time path.
+        """
+        now = time.monotonic() if observed_at_monotonic is None else observed_at_monotonic
+        result = self._correlate_security_events(
+            security_events, source_frame_id, camera_id, now, observed_at_wallclock)
+        self.entities.history.prune(now)
+        self.global_history.prune(now)
+        return result
 
     def stats(self) -> Dict[str, object]:
         return {
@@ -366,24 +431,15 @@ class CorrelationCore:
         entity = self.entities.get(track_id)
         if entity is None:
             return {"eligible": False, "reason": "entity_not_active"}
-        entity.refresh()
+        gate = entity.attendance_gate()
         identity = entity.identity
-        reasons = []
-        if entity.lifecycle_state.value not in {"NEW", "ACTIVE"}:
-            reasons.append("entity_not_active")
-        if not entity.face_visible:
-            reasons.append("face_not_visible")
-        if not entity.quality_ok:
-            reasons.append("face_quality_rejected")
-        if identity.state != "CONFIRMED":
-            reasons.append(f"identity_{identity.state.lower()}")
-        if not entity.liveness.last_checked_monotonic or entity.liveness.state != "REAL":
-            reasons.append("liveness_not_real")
-        if not entity.attendance_eligibility:
+        reasons = [] if gate.get("eligible") else str(gate.get("reason", "rejected")).split(",")
+        if not entity.attendance_eligibility and "entity_attendance_not_eligible" not in reasons:
             reasons.append("entity_attendance_not_eligible")
         if not active_roster:
             reasons.append("person_not_active_in_roster")
-        if expected_name and identity.confirmed_name != expected_name:
+        if (expected_name and (not identity.confirmed_name or
+                               identity.confirmed_name.casefold() != str(expected_name).casefold())):
             reasons.append("identity_name_mismatch")
         return {
             "eligible": not reasons,
@@ -392,8 +448,17 @@ class CorrelationCore:
             "person_name": identity.confirmed_name,
             "identity_state": identity.state,
             "liveness_state": entity.liveness.state,
-            "quality_ok": entity.quality_ok,
+            "quality_ok": gate.get("quality_ok"),
             "attendance_eligibility": entity.attendance_eligibility,
+            "entity_gate": gate,
+            "confidence": identity.best_score,
+            "second_score": identity.second_score,
+            "margin": identity.margin,
+            "confirmation_hits": identity.confirmation_hits,
+            "contradiction_count": identity.contradiction_count,
+            "track_generation": entity.track_generation,
+            "source_frame_id": entity.last_source_frame_id,
+            "observed_at": entity.last_observed_wallclock,
         }
 
     def snapshot(self) -> Dict[str, object]:

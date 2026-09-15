@@ -150,6 +150,27 @@ def ensure_platform_schema() -> None:
                 created_at text not null default (datetime('now')),
                 foreign key(person_id) references people(id) on delete set null
             );
+            create table if not exists attendance_decisions (
+                id integer primary key autoincrement,
+                decision_key text not null unique,
+                person_id integer,
+                entity_id text,
+                presence_session_id integer,
+                recognition_evidence_id integer,
+                decision text not null,
+                reason text,
+                identity_state text,
+                liveness_status text,
+                quality_score real,
+                recognition_confidence real,
+                source_frame_id integer,
+                observed_at text not null,
+                details_json text,
+                created_at text not null default (datetime('now')),
+                foreign key(person_id) references people(id) on delete set null,
+                foreign key(presence_session_id) references presence_sessions(id) on delete set null,
+                foreign key(recognition_evidence_id) references recognition_evidence(id) on delete set null
+            );
             """
         )
         event_columns = {row[1] for row in con.execute("pragma table_info(events)").fetchall()}
@@ -354,6 +375,10 @@ def ensure_platform_schema() -> None:
             create index if not exists idx_presence_person on presence_sessions(person_id, last_seen_at);
             create index if not exists idx_evidence_entity on recognition_evidence(entity_id, observed_at);
             create index if not exists idx_evidence_person on recognition_evidence(person_id, observed_at);
+            create index if not exists idx_attendance_decisions_entity
+                on attendance_decisions(entity_id, observed_at);
+            create index if not exists idx_attendance_decisions_person
+                on attendance_decisions(person_id, observed_at);
             create index if not exists idx_absence_person_date on absence_records(person_id, absence_date);
             create index if not exists idx_absence_date on absence_records(absence_date, status);
             create index if not exists idx_incident_entity on incidents(entity_id, camera_id, location);

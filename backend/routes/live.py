@@ -26,7 +26,9 @@ def live_status(actor: str = Depends(require_operator)):
     state["summary"].update(attendance)
     state["summary"]["presentToday"] = attendance["present"]
     state["summary"]["openIncidents"] = sum(1 for incident in state["incidents"] if incident["status"] not in {"dismissed", "resolved"})
-    state["summary"]["securityObservations"] = event_summary()["total"]
+    event_totals = event_summary()
+    state["summary"]["securityObservations"] = event_totals["security_total"]
+    state["summary"]["allObservations"] = event_totals["total"]
     state["summary"]["securityEvents"] = state["summary"]["openIncidents"]
     state["operational"] = operational_summary()
     state["analytics"] = {

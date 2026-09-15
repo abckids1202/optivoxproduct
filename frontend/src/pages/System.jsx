@@ -1,10 +1,11 @@
 import { BellRing, Camera, Cpu, Database, Gauge, HardDrive, Radio } from "lucide-react";
 import { useEffect, useState } from "react";
 import StatCard from "../components/StatCard";
-import { fetchPerformanceReport, sendCommand } from "../services/api";
+import { fetchAttendanceDecisions, fetchPerformanceReport, sendCommand } from "../services/api";
 
 export default function System({ state, connection }) {
   const [performanceReport, setPerformanceReport] = useState(null);
+  const [attendanceDecisions, setAttendanceDecisions] = useState([]);
   const runtime = state.runtime || {};
   const capabilities = runtime.capabilities || {};
   const performance = state.performance || {};
@@ -17,7 +18,15 @@ export default function System({ state, connection }) {
   const operational = state.operational || {};
 
   useEffect(() => {
-    fetchPerformanceReport().then(setPerformanceReport).catch(() => setPerformanceReport(null));
+    Promise.all([fetchPerformanceReport(), fetchAttendanceDecisions()])
+      .then(([report, decisions]) => {
+        setPerformanceReport(report);
+        setAttendanceDecisions(decisions || []);
+      })
+      .catch(() => {
+        setPerformanceReport(null);
+        setAttendanceDecisions([]);
+      });
   }, [state.generatedAt]);
 
   function metric(value, suffix = "") {
@@ -78,6 +87,35 @@ export default function System({ state, connection }) {
       <section className="panel">
         <div className="section-heading">
           <div>
+            <p className="eyebrow">Attendance decision trail</p>
+            <h2>Why the gate accepted or rejected a face</h2>
+          </div>
+          <span className="status-badge tone-info">{attendanceDecisions.length} recent decisions</span>
+        </div>
+        {attendanceDecisions.length ? (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead><tr><th>Decision</th><th>Identity</th><th>Liveness</th><th>Quality</th><th>Confidence</th><th>Reason</th><th>Frame</th></tr></thead>
+              <tbody>{attendanceDecisions.map((decision) => (
+                <tr key={decision.id}>
+                  <td><span className={`status-badge ${decision.decision === "eligible" ? "tone-success" : "tone-warning"}`}>{decision.decision}</span></td>
+                  <td>{decision.identityState || "UNRESOLVED"}</td>
+                  <td>{decision.livenessStatus || "NOT_EVALUATED"}</td>
+                  <td>{decision.qualityScore == null ? "Not measured" : Math.round(Number(decision.qualityScore))}</td>
+                  <td>{decision.recognitionConfidence == null ? "Not measured" : Number(decision.recognitionConfidence).toFixed(3)}</td>
+                  <td>{decision.reason || "-"}</td>
+                  <td>{decision.sourceFrameId ?? "-"}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        ) : <p className="empty-copy">No automatic gate decisions have been recorded yet.</p>}
+        <p className="panel-note">A decision is evidence of the automatic gate, not itself an attendance record. Unknown, uncertain, and spoof-suspect decisions remain rejected.</p>
+      </section>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
             <p className="eyebrow">Correlation core</p>
             <h2>Operational state</h2>
           </div>
@@ -110,6 +148,7 @@ export default function System({ state, connection }) {
             ["Capture rate", metric(performance.capture_fps, " FPS")],
             ["Display rate", metric(performance.display_fps, " FPS")],
             ["Inference p95", metric(latency.inference_p95, " ms")],
+            ["Capture-to-display p95", metric(latency.end_to_end_p95, " ms")],
             ["Frame age at start", metric(latency.frame_age_start_avg, " ms avg")],
             ["Frame age at completion", metric(latency.frame_age_end_avg, " ms avg")],
             ["Frame age at display", metric(latency.display_frame_age_avg, " ms avg")],

@@ -133,6 +133,9 @@ def _normalize(row: dict[str, Any]) -> dict[str, Any]:
         "first_event_at": row["first_event_at"],
         "last_event_at": row["last_event_at"],
         "event_count": int(row.get("event_count") or 0),
+        "evidence_count": int(row.get("evidence_count") or 0),
+        "alert_count": int(row.get("alert_count") or 0),
+        "review_action_count": int(row.get("review_action_count") or 0),
         "resolution_note": row.get("resolution_note"),
         "updated_at": row.get("updated_at"),
         "entityId": row.get("entity_id"),
@@ -169,7 +172,10 @@ def list_incidents(limit: int = 100, status: str | None = None,
         _normalize(row)
         for row in fetch_all(
             f"""
-            select i.*, count(ie.event_id) as event_count
+            select i.*, count(ie.event_id) as event_count,
+                   (select count(*) from incident_evidence x where x.incident_id=i.id) as evidence_count,
+                   (select count(*) from incident_alerts x where x.incident_id=i.id) as alert_count,
+                   (select count(*) from incident_review_actions x where x.incident_id=i.id) as review_action_count
             from incidents i left join incident_events ie on ie.incident_id=i.id
             {where}
             group by i.id order by i.updated_at desc, i.id desc limit ?
@@ -183,7 +189,10 @@ def get_incident(incident_id: int) -> dict[str, Any]:
     sync_incidents()
     row = fetch_one(
         """
-        select i.*, count(ie.event_id) as event_count
+        select i.*, count(ie.event_id) as event_count,
+               (select count(*) from incident_evidence x where x.incident_id=i.id) as evidence_count,
+               (select count(*) from incident_alerts x where x.incident_id=i.id) as alert_count,
+               (select count(*) from incident_review_actions x where x.incident_id=i.id) as review_action_count
         from incidents i left join incident_events ie on ie.incident_id=i.id
         where i.id=? group by i.id
         """,

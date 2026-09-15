@@ -146,6 +146,12 @@ class PerformanceProfiler:
                     "display_frame_age_avg": round(sum(display_ages) / len(display_ages), 2)
                     if display_ages else None,
                     "display_frame_age_p95": round(_percentile(display_ages, 0.95), 2) if display_ages else None,
+                    # Display frame age is the measured capture-to-display
+                    # latency for the latest-frame pipeline.
+                    "end_to_end_avg": round(sum(display_ages) / len(display_ages), 2)
+                    if display_ages else None,
+                    "end_to_end_p95": round(_percentile(display_ages, 0.95), 2)
+                    if display_ages else None,
                     "latest_frame_age": round(float(latest_frame_age_ms), 2) if latest_frame_age_ms is not None else None,
                 },
                 "stages_ms": {

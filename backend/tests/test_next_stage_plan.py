@@ -123,6 +123,8 @@ def test_incident_evidence_and_alert_are_linked_to_source_event(platform_db, tmp
     assert detail["presenceSessionId"] == 8
     assert detail["evidence"][0]["status"] == "available"
     assert detail["alerts"][0]["status"] == "delivered"
+    assert detail["evidence_count"] == 1
+    assert detail["alert_count"] == 1
 
 
 def test_password_sessions_store_only_hashes(platform_db):

@@ -90,6 +90,8 @@ class EntityState:
     created_monotonic: float
     first_seen_monotonic: float
     last_seen_monotonic: float
+    last_source_frame_id: Optional[int] = None
+    last_observed_wallclock: Optional[str] = None
     track_generation: int = 1
     lifecycle_state: EntityLifecycle = EntityLifecycle.NEW
     bbox: Optional[Tuple[float, float, float, float]] = None
@@ -147,6 +149,10 @@ class EntityState:
     def attach(self, observation: Observation) -> None:
         self.recent_observation_count += 1
         self.last_seen_monotonic = max(self.last_seen_monotonic, observation.observed_at_monotonic)
+        if observation.source_frame_id is not None:
+            self.last_source_frame_id = observation.source_frame_id
+        if observation.observed_at_wallclock:
+            self.last_observed_wallclock = observation.observed_at_wallclock
         if observation.observation_type == ObservationType.FACE_DETECTED:
             self.face_visible = True
             self.last_face_observation_monotonic = observation.observed_at_monotonic
@@ -296,6 +302,30 @@ class EntityState:
             and self.liveness.state == "REAL"
         )
 
+    def attendance_gate(self, now: Optional[float] = None) -> Dict[str, object]:
+        """Explain the local, non-roster portion of attendance eligibility."""
+        current = time.monotonic() if now is None else now
+        self.refresh(current)
+        reasons: List[str] = []
+        if self.lifecycle_state not in {EntityLifecycle.NEW, EntityLifecycle.ACTIVE}:
+            reasons.append("entity_not_active")
+        if not self.face_visible:
+            reasons.append("face_not_visible")
+        if not self.quality_ok or self.last_quality_observation_monotonic is None or current - self.last_quality_observation_monotonic > self.quality_valid_after_sec:
+            reasons.append("face_quality_rejected")
+        if self.identity.state != IdentityDecisionState.CONFIRMED.value:
+            reasons.append(f"identity_{self.identity.state.lower()}")
+        if self.liveness.state != "REAL" or self.liveness.last_checked_monotonic is None or current - self.liveness.last_checked_monotonic > self.liveness_valid_after_sec:
+            reasons.append("liveness_not_real")
+        return {
+            "eligible": not reasons,
+            "reason": "eligible" if not reasons else ",".join(reasons),
+            "identity_state": self.identity.state,
+            "liveness_state": self.liveness.state,
+            "quality_ok": self.quality_ok,
+            "entity_state": self.lifecycle_state.value,
+        }
+
     def summary(self, now: Optional[float] = None) -> Dict[str, object]:
         current = time.monotonic() if now is None else now
         return {
@@ -307,6 +337,8 @@ class EntityState:
             "lifecycle_state": self.lifecycle_state.value,
             "first_seen_monotonic": self.first_seen_monotonic,
             "last_seen_monotonic": self.last_seen_monotonic,
+            "last_source_frame_id": self.last_source_frame_id,
+            "last_observed_wallclock": self.last_observed_wallclock,
             "age_since_last_seen_ms": round(max(0.0, current - self.last_seen_monotonic) * 1000.0, 2),
             "bbox": self.bbox,
             "velocity": self.motion.velocity,
@@ -337,6 +369,7 @@ class EntityState:
             "current_zone": self.current_zone,
             "security_signals": list(self.security_signals),
             "attendance_eligibility": self.attendance_eligibility,
+            "attendance_decision": self.attendance_gate(current),
             "recent_observation_count": self.recent_observation_count,
         }
 
@@ -434,6 +467,8 @@ class EntityStateStore:
             elif entity.missing_updates >= self.occluded_after_updates:
                 entity.lifecycle_state = EntityLifecycle.OCCLUDED
             else:
+                # Preserve the short-gap lifecycle label for compatibility;
+                # both STALE and OCCLUDED are ineligible for attendance.
                 entity.lifecycle_state = EntityLifecycle.STALE
         if len(self.entities) > self.max_entities:
             removable = sorted(

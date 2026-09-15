@@ -81,6 +81,23 @@ def test_event_review_and_incident_grouping(platform_db):
     assert incidents[0]["event_count"] == 2
 
 
+def test_security_analytics_excludes_attendance_observations(platform_db):
+    database.execute(
+        "insert into events (event_type, severity, details_json, timestamp) values (?, ?, ?, datetime('now'))",
+        ["ATTENDANCE_CLOCKIN", 0, '{"message":"arrival"}'],
+    )
+    database.execute(
+        "insert into events (event_type, severity, details_json, timestamp) values (?, ?, ?, datetime('now'))",
+        ["ZONE_INTRUSION", 2, '{"message":"restricted entry"}'],
+    )
+
+    from backend.services.analytics_service import security
+
+    result = security(days=1)
+    assert result["securityObservationTotal"] == 1
+    assert result["securityCategories"] == [{"name": "ZONE_INTRUSION", "value": 1}]
+
+
 def test_command_idempotency(platform_db, tmp_path, monkeypatch):
     commands_path = tmp_path / "commands.json"
     results_path = tmp_path / "results.json"
