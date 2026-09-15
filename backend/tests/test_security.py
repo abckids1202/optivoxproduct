@@ -27,3 +27,13 @@ def test_sensitive_read_routes_require_configured_key(monkeypatch):
     client = TestClient(app)
     response = client.get("/api/people")
     assert response.status_code == 401
+
+
+def test_login_attempts_are_rate_limited(monkeypatch):
+    from backend import security
+
+    security._login_history.clear()
+    client = TestClient(app)
+    responses = [client.post("/api/auth/login", json={"username": "missing", "password": "bad-password"}) for _ in range(11)]
+    assert responses[-1].status_code == 429
+    security._login_history.clear()

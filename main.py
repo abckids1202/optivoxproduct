@@ -116,6 +116,22 @@ except ImportError:
 # Section 2: Configuration
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _env_int_list(name, default):
+    values = []
+    for item in os.environ.get(name, "").split(","):
+        try:
+            number = int(item.strip())
+        except (TypeError, ValueError):
+            continue
+        if 0 <= number <= 6:
+            values.append(number)
+    return values or list(default)
+
+
+def _env_string_list(name):
+    return [item.strip() for item in os.environ.get(name, "").split(",") if item.strip()]
+
 CONFIG: Dict[str, Any] = {
     #Paths
     "BASE_DIR": _BASE_DIR,
@@ -419,6 +435,8 @@ CONFIG: Dict[str, Any] = {
         "AUTO_CLOCKOUT_TIMEOUT_MIN": 15,
         "AUTO_CLOCKOUT_ON_SHUTDOWN": True,
         "PRESENCE_SESSION_CLOSE_AFTER_SEC": 5.0,
+        "SCHOOL_DAYS": _env_int_list("OPTIVOX_SCHOOL_DAYS", [0, 1, 2, 3, 4]),
+        "HOLIDAYS": _env_string_list("OPTIVOX_SCHOOL_HOLIDAYS"),
         "RECOGNITION_EVIDENCE_MIN_INTERVAL_SEC": 0.75,
         "WORK_START_HOUR": 9,
         "LATE_GRACE_MIN": 15,
@@ -529,6 +547,26 @@ def _utc_now() -> str:
 
 def _today_iso() -> str:
     return _local_datetime().date().isoformat()
+
+
+def _is_school_day(local_now=None) -> bool:
+    """Return whether automatic attendance is allowed on this local date."""
+    local_now = local_now or _local_datetime()
+    attendance_cfg = CONFIG.get("ATTENDANCE", {})
+    raw_days = attendance_cfg.get("SCHOOL_DAYS", range(5))
+    school_days = set()
+    for day in raw_days:
+        try:
+            day = int(day)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= day <= 6:
+            school_days.add(day)
+    holidays = {
+        str(day).strip() for day in attendance_cfg.get("HOLIDAYS", [])
+        if str(day).strip()
+    }
+    return local_now.weekday() in school_days and local_now.date().isoformat() not in holidays
 
 
 def _parse_timestamp(value: str) -> dt_datetime:
@@ -1456,6 +1494,12 @@ class EventDatabase:
         if existing and existing["clock_in"]:
             return {"already_clocked_in": True, "clock_in": existing["clock_in"]}
         now_local = _local_datetime()
+        if str(decision_source or "").lower().startswith("automatic") and not _is_school_day(now_local):
+            return {
+                "not_school_day": True,
+                "date": today,
+                "reason": "Automatic attendance is disabled for this school day.",
+            }
         schedule = self._schedule_for_person(person_id, now_local)
         if schedule:
             scheduled = schedule["scheduled"]
@@ -5306,6 +5350,7 @@ class AttendanceManager:
         if today != self._date:
             try:
                 self.db.close_open_attendance_before(today)
+                self.db.close_open_presence_sessions("day_rollover")
             except Exception as exc:
                 print(f"[ATTENDANCE] Rollover reconciliation failed: {exc}")
             self._today_clocked_in.clear()
@@ -5326,6 +5371,8 @@ class AttendanceManager:
                 or not attendance_eligible or not quality_ok):
             return
         self._maybe_rollover()
+        if not _is_school_day(_local_datetime()):
+            return
         now = time.time()
         pid = self.db.get_active_person_id(person_name)
         if pid is None:
@@ -5349,7 +5396,8 @@ class AttendanceManager:
                 identity_state="CONFIRMED",
                 liveness_status=liveness_status or "REAL",
                 decision_source="automatic_correlated")
-            self._today_clocked_in.add(person_name)
+            if "clocked_in_at" in result or result.get("already_clocked_in"):
+                self._today_clocked_in.add(person_name)
             if "clocked_in_at" in result:
                 late = result.get("late_minutes", 0)
                 if self._announce:
@@ -5382,7 +5430,8 @@ class AttendanceManager:
                 identity_state="CONFIRMED",
                 liveness_status=liveness_status or "REAL",
                 decision_source="automatic")
-            self._today_clocked_in.add(person_name)
+            if "clocked_in_at" in result or result.get("already_clocked_in"):
+                self._today_clocked_in.add(person_name)
             if "clocked_in_at" in result:
                 late = result.get("late_minutes", 0)
                 msg = f"Welcome {person_name}."
@@ -5411,6 +5460,8 @@ class AttendanceManager:
                 or not attendance_eligible or not quality_ok):
             return {"error": "Identity, quality, and liveness verification did not pass"}
         self._maybe_rollover()
+        if not _is_school_day(_local_datetime()):
+            return {"error": "Automatic attendance is disabled for this school day."}
         pid = self.db.get_active_person_id(person_name)
         if pid is None:
             return {"error": f"No database person found for {person_name}"}
@@ -5422,7 +5473,8 @@ class AttendanceManager:
             identity_state="CONFIRMED",
             liveness_status=liveness_status,
             decision_source=method)
-        self._today_clocked_in.add(person_name)
+        if "clocked_in_at" in result or result.get("already_clocked_in"):
+            self._today_clocked_in.add(person_name)
         self._recognitions[person_name].clear()
         if "clocked_in_at" in result:
             late = result.get("late_minutes", 0)

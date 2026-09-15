@@ -4,6 +4,14 @@ export const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
 const USE_DEMO_DATA = import.meta.env.VITE_USE_DEMO_DATA === "true";
 const API_KEY = import.meta.env.VITE_OPTIVOX_API_KEY || "";
 
+export class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 function sessionToken() {
   return window.localStorage.getItem("optivox_access_token") || "";
 }
@@ -13,7 +21,7 @@ export const FRAME_URL = `${API_BASE}/api/live/frame`;
 async function getJson(path) {
   const response = await fetch(`${API_BASE}${path}`, { headers: requestHeaders() });
   if (!response.ok) {
-    throw new Error(await errorMessage(response));
+    throw new ApiError(await errorMessage(response), response.status);
   }
   return response.json();
 }
@@ -39,9 +47,38 @@ export async function fetchDashboardState() {
   try {
     const state = await getJson("/api/live/status");
     return { ...state, dataMode: "live" };
-  } catch {
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      return { ...getEmptyState(), dataMode: "auth_required", authRequired: true };
+    }
     const empty = getEmptyState();
     return { ...empty, dataMode: "backend_offline" };
+  }
+}
+
+export async function login(username, password) {
+  const response = await fetch(`${API_BASE}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
+  const data = await response.json();
+  window.localStorage.setItem("optivox_access_token", data.access_token);
+  return data;
+}
+
+export async function logout() {
+  const token = sessionToken();
+  try {
+    if (token) {
+      await fetch(`${API_BASE}/api/auth/logout`, {
+        method: "POST",
+        headers: requestHeaders(),
+      });
+    }
+  } finally {
+    window.localStorage.removeItem("optivox_access_token");
   }
 }
 
@@ -177,6 +214,24 @@ export async function correctAttendance(personId, payload) {
     body: JSON.stringify(payload),
   });
   if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+export async function clockInPerson(personId) {
+  const response = await fetch(`${API_BASE}/api/attendance/${personId}/clock-in`, {
+    method: "POST",
+    headers: requestHeaders(),
+  });
+  if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
+  return response.json();
+}
+
+export async function clockOutPerson(personId) {
+  const response = await fetch(`${API_BASE}/api/attendance/${personId}/clock-out`, {
+    method: "POST",
+    headers: requestHeaders(),
+  });
+  if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
   return response.json();
 }
 

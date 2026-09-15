@@ -24,6 +24,25 @@ FRONTEND_ORIGINS = [
 ]
 COMMAND_PIN = os.getenv("OPTIVOX_COMMAND_PIN", "")
 
+
+def _int_list(value: str, default: list[int]) -> list[int]:
+    parsed = []
+    for item in str(value or "").split(","):
+        try:
+            number = int(item.strip())
+        except (TypeError, ValueError):
+            continue
+        if 0 <= number <= 6:
+            parsed.append(number)
+    return parsed or list(default)
+
+
+SCHOOL_DAYS = _int_list(os.getenv("OPTIVOX_SCHOOL_DAYS", "0,1,2,3,4"), [0, 1, 2, 3, 4])
+SCHOOL_HOLIDAYS = [
+    item.strip() for item in os.getenv("OPTIVOX_SCHOOL_HOLIDAYS", "").split(",")
+    if item.strip()
+]
+
 RUNTIME_DIR.mkdir(exist_ok=True)
 
 

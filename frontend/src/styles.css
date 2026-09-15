@@ -922,12 +922,24 @@ td span {
 .profile-subjects em { display: inline-block; margin: 0; color: #91a3b8; font-size: 10px; }
 
 .chart-note, .panel-note { color: #91a3b8; font-size: 12px; margin: 7px 0 0; }
+.analytics-table-panel { min-width: 0; }
+.compact-table-wrap { max-height: 280px; overflow: auto; }
+.compact-table-wrap table { min-width: 0; }
+.compact-table-wrap th, .compact-table-wrap td { padding: 10px 12px; }
+.policy-strip { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 12px 14px; border: 1px solid rgba(96, 165, 250, 0.24); border-radius: 6px; background: rgba(96, 165, 250, 0.06); color: #c8d5e6; font-size: 12px; }
+.policy-strip strong { color: #60a5fa; }
+.policy-strip span:last-child { color: #91a3b8; }
 .calendar-controls { display: inline-flex; align-items: center; gap: 8px; }
 .calendar-controls strong { display: inline-flex; align-items: center; gap: 7px; min-width: 150px; justify-content: center; }
 .view-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
 .view-tabs button.selected { background: rgba(45, 212, 191, 0.14); border-color: rgba(45, 212, 191, 0.45); color: #ccfbf1; }
 .attendance-summary-strip { display: flex; flex-wrap: wrap; gap: 24px; padding: 12px 0; color: #91a3b8; }
 .attendance-summary-strip strong { color: #e7edf6; font-size: 18px; margin-right: 5px; }
+.attendance-operator-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; }
+.attendance-operator-controls label { display: grid; gap: 6px; min-width: min(100%, 310px); }
+.attendance-operator-controls label span { color: #91a3b8; font-size: 11px; }
+.attendance-operator-controls select { min-height: 38px; padding: 0 10px; border: 1px solid rgba(145, 163, 184, 0.2); border-radius: 6px; background: #0b1422; color: #e7edf6; }
+.operator-message { align-self: center; color: #99f6e4; font-size: 12px; }
 .matrix-wrap { overflow: auto; max-height: 520px; border: 1px solid rgba(145, 163, 184, 0.14); border-radius: 8px; }
 .attendance-matrix { min-width: 760px; }
 .attendance-matrix th, .attendance-matrix td { padding: 10px 8px; text-align: center; min-width: 34px; }
@@ -988,6 +1000,145 @@ td span {
 
 .boot-screen span {
   color: #91a3b8;
+}
+
+.auth-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at 50% 20%, rgba(45, 212, 191, 0.12), transparent 34%),
+    #0b1220;
+}
+
+.auth-panel {
+  width: min(100%, 440px);
+  padding: 30px;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.94);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 34px;
+}
+
+.auth-brand > span {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: #061019;
+  background: #2dd4bf;
+}
+
+.auth-brand strong,
+.auth-brand small {
+  display: block;
+}
+
+.auth-brand small,
+.auth-copy,
+.auth-note {
+  color: #91a3b8;
+}
+
+.auth-brand small {
+  margin-top: 3px;
+  font-size: 12px;
+}
+
+.auth-panel h1 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.auth-copy {
+  margin: 9px 0 24px;
+  line-height: 1.55;
+}
+
+.auth-form {
+  display: grid;
+  gap: 14px;
+}
+
+.auth-form label {
+  display: grid;
+  gap: 7px;
+}
+
+.auth-form label > span {
+  color: #c8d3df;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.auth-form input {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 11px;
+  border: 1px solid rgba(145, 163, 184, 0.24);
+  border-radius: 6px;
+  outline: 0;
+  background: #0b1422;
+  color: #e7edf6;
+}
+
+.auth-form input:focus {
+  border-color: rgba(45, 212, 191, 0.72);
+}
+
+.password-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 11px;
+  border: 1px solid rgba(145, 163, 184, 0.24);
+  border-radius: 6px;
+  background: #0b1422;
+  color: #91a3b8;
+}
+
+.password-field input {
+  border: 0;
+  padding-left: 0;
+  background: transparent;
+}
+
+.auth-form button {
+  min-height: 42px;
+  margin-top: 4px;
+  border-color: #2dd4bf;
+  background: #2dd4bf;
+  color: #061019;
+  font-weight: 900;
+}
+
+.auth-form button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.auth-error {
+  margin: 0;
+  padding: 10px 11px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.1);
+  color: #fecaca;
+  font-size: 12px;
+}
+
+.auth-note {
+  margin: 22px 0 0;
+  font-size: 11px;
 }
 
 .spin {

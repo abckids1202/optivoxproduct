@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
 from pydantic import BaseModel, Field
 
-from ..security import require_operator
+from ..security import enforce_login_rate_limit, require_operator
 from ..services import auth_service
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
@@ -15,7 +15,8 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/login")
-def login(payload: LoginRequest):
+def login(request: Request, payload: LoginRequest):
+    enforce_login_rate_limit(request)
     return auth_service.login(payload.username, payload.password)
 
 
@@ -29,4 +30,3 @@ def logout(authorization: str | None = Header(default=None), actor: str = Depend
     token = authorization[7:].strip() if authorization and authorization.lower().startswith("bearer ") else None
     auth_service.logout(token)
     return {"status": "logged_out", "actor": actor}
-

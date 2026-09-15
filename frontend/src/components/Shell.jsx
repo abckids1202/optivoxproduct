@@ -4,6 +4,7 @@ import {
   Camera,
   ClipboardCheck,
   Database,
+  LogOut,
   Radio,
   ShieldAlert,
   Users,
@@ -20,7 +21,7 @@ const navItems = [
   { id: "system", label: "System", icon: Database },
 ];
 
-export default function Shell({ activePage, onNavigate, connection, state, children }) {
+export default function Shell({ activePage, onNavigate, connection, state, onLogout, children }) {
   const engine = state?.engine;
 
   return (
@@ -73,6 +74,7 @@ export default function Shell({ activePage, onNavigate, connection, state, child
             <StatusBadge value={engine?.mode || "Local AI Processing"} tone="info" />
             <StatusBadge value={connectionLabel(connection)} tone={connection === "live" ? "success" : connection === "demo" ? "info" : "warning"} />
             <span className="clock">{state?.localTime || "--:--:--"}</span>
+            {onLogout && <button className="icon-button" type="button" onClick={onLogout} aria-label="Sign out" title="Sign out"><LogOut size={17} /></button>}
           </div>
         </header>
 
@@ -94,6 +96,7 @@ function connectionLabel(connection) {
     demo: "DEMO MODE",
     backend_offline: "BACKEND OFFLINE",
     engine_offline: "ENGINE OFFLINE",
+    auth_required: "SIGN-IN REQUIRED",
     connecting: "CONNECTING",
   }[connection] || "CONNECTING";
 }
@@ -103,6 +106,7 @@ function offlineMessage(connection) {
     demo: "Demo mode is explicitly enabled. The interface is showing exhibition sample data.",
     backend_offline: "The FastAPI backend is unavailable. No fake detections are being shown in live mode.",
     engine_offline: "The backend is online, but the vision engine is not publishing a fresh heartbeat.",
+    auth_required: "Sign in with an authorized Optivox account to access operational data.",
     connecting: "Connecting to the local OptiVox backend.",
   }[connection] || "Live data is temporarily unavailable.";
 }

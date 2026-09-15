@@ -29,6 +29,11 @@ export default function Analytics({ state }) {
   const lateRate = present + late ? Math.round((late / (present + late)) * 100) : 0;
   const absenceTotal = (data.absenceSplit || []).reduce((sum, item) => sum + Number(item.value || 0), 0);
   const openIncidents = data.incidentTotals?.open || state.summary?.openIncidents || 0;
+  const classCoverage = data.classCoverage || [];
+  const severityRows = (data.bySeverity || []).map((item) => ({
+    label: severityLabel(item.severity),
+    count: Number(item.count || 0),
+  }));
   return (
     <div className="page-stack">
       <div className="stats-grid four">
@@ -96,6 +101,16 @@ export default function Analytics({ state }) {
         <ResponsiveContainer width="100%" height={260}><PieChart><Pie data={data.absenceSplit || []} dataKey="value" nameKey="name" outerRadius={94}>{(data.absenceSplit || []).map((entry, index) => <Cell key={entry.name} fill={colors[index % colors.length]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer>
       </ChartPanel>
 
+      <section className="panel analytics-table-panel">
+        <div className="section-heading"><div><p className="eyebrow">Roster comparison</p><h2>Class attendance coverage</h2><p className="chart-note">People with an attendance record in the selected 30-day window.</p></div></div>
+        <div className="table-wrap compact-table-wrap"><table><thead><tr><th>Class</th><th>Present</th><th>Roster</th><th>Coverage</th></tr></thead><tbody>{classCoverage.map((row) => <tr key={row.name}><td><strong>{row.name}</strong></td><td>{row.present}</td><td>{row.roster}</td><td>{row.roster ? `${Math.round((row.present / row.roster) * 100)}%` : "0%"}</td></tr>)}</tbody></table>{!classCoverage.length && <p className="empty-copy table-empty">No class metadata is available yet.</p>}</div>
+      </section>
+
+      <section className="panel analytics-table-panel">
+        <div className="section-heading"><div><p className="eyebrow">Security workload</p><h2>Severity mix</h2><p className="chart-note">Stored security observations by severity; this is not a count of unique incidents.</p></div></div>
+        <div className="table-wrap compact-table-wrap"><table><thead><tr><th>Severity</th><th>Observations</th><th>Share</th></tr></thead><tbody>{severityRows.map((row) => <tr key={row.label}><td><span className={`table-status ${row.label.toLowerCase()}`}>{row.label}</span></td><td>{row.count}</td><td>{data.totalEvents ? `${Math.round((row.count / data.totalEvents) * 100)}%` : "0%"}</td></tr>)}</tbody></table>{!severityRows.length && <p className="empty-copy table-empty">No security severity data is available yet.</p>}</div>
+      </section>
+
       <section className="panel analytics-summary">
         <p className="eyebrow">What this proves</p>
         <h2>Demo readiness</h2>
@@ -111,6 +126,14 @@ export default function Analytics({ state }) {
     </div>
     </div>
   );
+}
+
+function severityLabel(value) {
+  const numeric = Number(value);
+  if (numeric >= 3) return "Critical";
+  if (numeric === 2) return "Warning";
+  if (numeric === 1) return "Attention";
+  return "Normal";
 }
 
 function ChartPanel({ title, note, children }) {

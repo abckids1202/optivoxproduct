@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { fetchDashboardState } from "../services/api";
 
-export function useLiveData() {
+export function useLiveData(reloadKey = 0) {
   const [state, setState] = useState(null);
   const [connection, setConnection] = useState("connecting");
+  const [authRequired, setAuthRequired] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -14,7 +15,9 @@ export function useLiveData() {
         const data = await fetchDashboardState();
         if (!active) return;
         setState(data);
-        if (data?.dataMode === "demo") setConnection("demo");
+        setAuthRequired(Boolean(data?.authRequired));
+        if (data?.dataMode === "auth_required") setConnection("auth_required");
+        else if (data?.dataMode === "demo") setConnection("demo");
         else if (data?.dataMode === "backend_offline") setConnection("backend_offline");
         else if (data?.engine?.status === "Offline") setConnection("engine_offline");
         else setConnection("live");
@@ -30,7 +33,7 @@ export function useLiveData() {
       active = false;
       window.clearInterval(intervalId);
     };
-  }, []);
+  }, [reloadKey]);
 
-  return { state, connection };
+  return { state, connection, authRequired };
 }

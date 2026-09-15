@@ -13,8 +13,10 @@ from .services.auth_service import resolve_session
 
 _RATE_LIMIT = 120
 _RATE_WINDOW_SECONDS = 60
+_LOGIN_RATE_LIMIT = 10
 _rate_lock = threading.Lock()
 _rate_history: dict[str, deque[float]] = defaultdict(deque)
+_login_history: dict[str, deque[float]] = defaultdict(deque)
 
 
 def _configured_keys() -> tuple[str | None, str | None]:
@@ -61,6 +63,23 @@ def _guard(request: Request, x_optivox_key: str | None, authorization: str | Non
     if not _is_loopback(request):
         raise HTTPException(status_code=503, detail={"code": "API_KEY_NOT_CONFIGURED", "message": "Configure OPTIVOX_API_KEY before exposing the backend beyond localhost."})
     return "local-operator"
+
+
+def enforce_login_rate_limit(request: Request) -> None:
+    """Limit password attempts independently from normal operator traffic."""
+    client = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    with _rate_lock:
+        history = _login_history[client]
+        while history and now - history[0] > _RATE_WINDOW_SECONDS:
+            history.popleft()
+        if len(history) >= _LOGIN_RATE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "LOGIN_RATE_LIMITED", "message": "Too many sign-in attempts. Try again shortly."},
+                headers={"Retry-After": "60"},
+            )
+        history.append(now)
 
 
 def require_operator(

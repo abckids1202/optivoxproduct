@@ -1,4 +1,5 @@
 import { Loader2 } from "lucide-react";
+import Login from "./components/Login";
 import Shell from "./components/Shell";
 import { useLiveData } from "./hooks/useLiveData";
 import Analytics from "./pages/Analytics";
@@ -7,11 +8,17 @@ import Overview from "./pages/Overview";
 import People from "./pages/People";
 import Security from "./pages/Security";
 import System from "./pages/System";
+import { logout } from "./services/api";
 import { useState } from "react";
 
 export default function App() {
   const [activePage, setActivePage] = useState("overview");
-  const { state, connection } = useLiveData();
+  const [authVersion, setAuthVersion] = useState(0);
+  const { state, connection, authRequired } = useLiveData(authVersion);
+
+  if (authRequired) {
+    return <Login onAuthenticated={() => setAuthVersion((value) => value + 1)} />;
+  }
 
   if (!state) {
     return (
@@ -29,6 +36,10 @@ export default function App() {
       onNavigate={setActivePage}
       connection={connection}
       state={state}
+      onLogout={async () => {
+        await logout();
+        setAuthVersion((value) => value + 1);
+      }}
     >
       {activePage === "overview" && <Overview state={state} connection={connection} onNavigate={setActivePage} />}
       {activePage === "attendance" && <Attendance state={state} />}

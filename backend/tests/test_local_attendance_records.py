@@ -6,7 +6,7 @@ from types import SimpleNamespace
 _test_config_dir = Path(__file__).resolve().parents[1] / ".pytest-temp" / "ultralytics"
 _test_config_dir.mkdir(parents=True, exist_ok=True)
 os.environ["YOLO_CONFIG_DIR"] = str(_test_config_dir)
-from main import EventDatabase, FAISSIndexer, VisionSystem, _utc_datetime
+from main import AttendanceManager, CONFIG, EventDatabase, FAISSIndexer, VisionSystem, _utc_datetime
 
 
 def _database(tmp_path):
@@ -78,6 +78,40 @@ def test_automatic_clockout_uses_last_valid_presence(tmp_path):
         assert row["clock_out"] == old_seen
         assert row["clock_out_source"] == "automatic_timeout"
         assert row["last_seen_at"] == old_seen
+    finally:
+        database.conn.close()
+
+
+def test_automatic_attendance_skips_configured_non_school_day(tmp_path, monkeypatch):
+    database = _database(tmp_path)
+    try:
+        person_id = database.upsert_person("Weekend Student")
+        monkeypatch.setitem(CONFIG["ATTENDANCE"], "SCHOOL_DAYS", [6])
+        attendance = AttendanceManager(database, CONFIG)
+        attendance.handle_recognition(
+            "Weekend Student", confidence=0.95, identity_state="CONFIRMED",
+            liveness_status="REAL", attendance_eligible=True, quality_ok=True,
+            presence_session_id="cam_0:entity:1",
+        )
+        assert database._fetchone(
+            "select id from attendance where person_id=? and date=?",
+            (person_id, database._fetchone("select date(?) as date", (_utc_datetime(),))["date"]),
+        ) is None
+    finally:
+        database.conn.close()
+
+
+def test_rollover_closes_presence_sessions_with_explicit_reason(tmp_path):
+    database = _database(tmp_path)
+    try:
+        database.upsert_presence_session("cam_0:entity:rollover", track_id=4)
+        assert database.close_open_presence_sessions("day_rollover") == 1
+        row = database._fetchone(
+            "select status, closed_reason from presence_sessions where entity_id=?",
+            ("cam_0:entity:rollover",),
+        )
+        assert row["status"] == "closed"
+        assert row["closed_reason"] == "day_rollover"
     finally:
         database.conn.close()
 

@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from ..database import fetch_all
-from ..config import local_today
+from ..config import SCHOOL_DAYS, SCHOOL_HOLIDAYS, local_today
 from ..database import execute
 
 
@@ -44,7 +44,7 @@ def overview(year: int | None = None, month: int | None = None) -> dict[str, Any
     ]
     day = start
     while day <= cutoff:
-        if day.weekday() < 5:
+        if day.weekday() in SCHOOL_DAYS and day.isoformat() not in SCHOOL_HOLIDAYS:
             for person in people:
                 if (person["id"], day.isoformat()) not in recorded_keys and (person["id"], day.isoformat()) not in stored_keys:
                     absences.append({"person_id": person["id"], "name": person["name"], "date": day.isoformat(), "status": "Inferred absence", "absence_type": "inferred", "official": False, "source": "system"})
@@ -56,6 +56,11 @@ def overview(year: int | None = None, month: int | None = None) -> dict[str, Any
         "subjects": sorted(subjects),
         "profiles": profiles,
         "absence_records": absences,
+        "school_policy": {
+            "school_days": list(SCHOOL_DAYS),
+            "holidays": list(SCHOOL_HOLIDAYS),
+            "absence_is_inferred_until_confirmed": True,
+        },
         "absence_note": "Absence is inferred from a missing attendance record. Confirm policy before treating it as an official absence.",
     }
 

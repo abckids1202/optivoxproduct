@@ -99,3 +99,10 @@ configured. Before exposing the backend beyond the local machine, set
 `OPTIVOX_API_KEY` and, for roster administration or attendance corrections,
 `OPTIVOX_ADMIN_KEY`. Put the matching `VITE_OPTIVOX_API_KEY` in the frontend
 build environment. Never commit real values.
+
+Automatic attendance follows the configured school calendar. By default,
+Monday through Friday are school days. Override this for a pilot site with
+`OPTIVOX_SCHOOL_DAYS=0,1,2,3,4` (Monday is `0`, Sunday is `6`) and optionally provide a
+comma-separated holiday list with `OPTIVOX_SCHOOL_HOLIDAYS=2026-10-01,2026-12-25`.
+Non-school days skip automatic attendance and are not treated as inferred
+absence days by the academic overview.
