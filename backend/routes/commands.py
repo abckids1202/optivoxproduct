@@ -27,7 +27,7 @@ def command(req: CommandRequest, request: Request,
 
 
 @router.get("/commands/{command_id}")
-def status(command_id: str):
+def status(command_id: str, actor: str = Depends(require_operator)):
     return svc.command_status(command_id)
 
 
@@ -72,5 +72,5 @@ def delete_person(person_name: str, confirm: bool = False, actor: str = Depends(
 
 
 @router.get("/enrollment/status")
-def enrollment_status():
+def enrollment_status(actor: str = Depends(require_operator)):
     return svc.enrollment_status()

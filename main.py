@@ -5110,8 +5110,11 @@ class VisionSystem:
                         "wallclock": self._last_pose_observation_wallclock,
                     },
                 },
-                security_events=security_events,
+                # Correlate every operational signal, including danger,
+                # behavior, and zone events, before persistence or alerts.
+                security_events=events,
             )
+            events = correlation_state.get("security_event_tuples") or events
         self._last_correlation_state = correlation_state
         entity_by_track = {
             int(entity["track_id"]): entity

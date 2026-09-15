@@ -188,3 +188,60 @@ def test_cached_module_provenance_is_not_rewritten_as_current_frame():
     assert identity is not None
     assert identity.source_frame_id == 95
     assert identity.age_ms(now) == pytest.approx(400.0, abs=0.01)
+
+
+def test_security_events_are_enriched_from_correlated_entity_state():
+    core = CorrelationCore(max_entities=4, identity_confirmation_observations=1)
+    state = core.update(
+        tracked={1: (20, 20)},
+        source_frame_id=21,
+        faces_info=[{
+            "oid": 1,
+            "bbox": (0, 0, 40, 40),
+            "name": "Ada",
+            "identity_state": "CONFIRMED",
+            "quality_ok": True,
+            "quality_score": 90,
+            "liveness_status": "REAL",
+        }],
+        security_events=[(
+            "ZONE_INTRUSION", "ID_1", 0.95, "Restricted zone entry",
+            {"track_id": 1, "zone_id": "lab"},
+        )],
+    )
+
+    event = state["security_events"][0]
+    assert event["target"] == "Ada"
+    assert event["metadata"]["entity_id"].startswith("cam_0:entity:")
+    assert event["metadata"]["identity_state"] == "CONFIRMED"
+    assert event["metadata"]["liveness_state"] == "REAL"
+    assert state["security_event_tuples"][0][4]["track_generation"] == 1
+
+
+def test_attendance_decision_rejects_stale_liveness():
+    core = CorrelationCore(
+        max_entities=2,
+        identity_confirmation_observations=1,
+        liveness_valid_after_sec=0.5,
+    )
+    now = time.monotonic()
+    face = {
+        "oid": 1,
+        "bbox": (0, 0, 40, 40),
+        "name": "Ada",
+        "identity_state": "CONFIRMED",
+        "quality_ok": True,
+        "quality_score": 90,
+        "liveness_status": "REAL",
+    }
+    core.update(tracked={1: (20, 20)}, faces_info=[face], observed_at_monotonic=now)
+    assert core.attendance_decision(1)["eligible"] is True
+
+    core.update(
+        tracked={1: (20, 20)},
+        faces_info=[{**face, "liveness_status": "NOT_EVALUATED"}],
+        observed_at_monotonic=now + 1.0,
+    )
+    decision = core.attendance_decision(1)
+    assert decision["eligible"] is False
+    assert "entity_attendance_not_eligible" in decision["reason"]

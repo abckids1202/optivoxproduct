@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
 from ..services import runtime_service
 from ..services.analytics_service import attendance as attendance_analytics, security as security_analytics
@@ -10,12 +10,13 @@ from ..services.event_service import event_summary, list_events
 from ..services.incident_service import list_incidents
 from ..services.operational_service import summary as operational_summary
 from ..services.people_service import list_people
+from ..security import require_operator, require_websocket_operator
 
 router = APIRouter(tags=["live"])
 
 
 @router.get("/api/live/status")
-def live_status():
+def live_status(actor: str = Depends(require_operator)):
     state = runtime_service.live_state()
     state["people"] = list_people()
     state["attendance"] = today_attendance()
@@ -36,22 +37,23 @@ def live_status():
 
 
 @router.get("/api/live/detections")
-def live_detections():
+def live_detections(actor: str = Depends(require_operator)):
     return runtime_service.live_detections()
 
 
 @router.get("/api/live/frame")
-def live_frame():
+def live_frame(actor: str = Depends(require_operator)):
     return runtime_service.frame_response()
 
 
 @router.get("/api/live/events")
-def live_events():
+def live_events(actor: str = Depends(require_operator)):
     return list_events(limit=20)
 
 
 @router.websocket("/ws/live")
 async def live_ws(websocket: WebSocket):
+    require_websocket_operator(websocket)
     await websocket.accept()
     last_payload = ""
     try:

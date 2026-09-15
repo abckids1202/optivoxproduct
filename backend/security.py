@@ -6,7 +6,7 @@ import threading
 import time
 from collections import defaultdict, deque
 
-from fastapi import Header, HTTPException, Request
+from fastapi import Header, HTTPException, Request, WebSocket, WebSocketException, status
 
 from .services.auth_service import resolve_session
 
@@ -77,3 +77,23 @@ def require_admin(
     authorization: str | None = Header(default=None),
 ) -> str:
     return _guard(request, x_optivox_key, authorization, admin=True)
+
+
+def require_websocket_operator(websocket: WebSocket) -> str:
+    """Protect the live stream before accepting a websocket connection."""
+    operator_key, admin_key = _configured_keys()
+    supplied = _supplied_key(
+        websocket.headers.get("x-optivox-key"),
+        websocket.headers.get("authorization"),
+    )
+    session = resolve_session(supplied)
+    if session:
+        return str(session.get("username") or "session-user")
+    expected = operator_key or admin_key
+    if expected and (not supplied or not hmac.compare_digest(supplied, expected)):
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+    if not expected:
+        host = websocket.client.host if websocket.client else ""
+        if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+    return "api-key-operator" if expected else "local-operator"

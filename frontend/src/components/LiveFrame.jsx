@@ -1,8 +1,46 @@
 import { Camera, Maximize2 } from "lucide-react";
-import { FRAME_URL } from "../services/api";
+import { useEffect, useState } from "react";
+import { FRAME_URL, requestHeaders } from "../services/api";
 
 export default function LiveFrame({ engine, connection }) {
   const showImage = connection === "live" && engine?.frameAvailable;
+  const [frameUrl, setFrameUrl] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    let objectUrl = "";
+    let timer;
+
+    if (!showImage) {
+      setFrameUrl("");
+      return () => {};
+    }
+
+    const loadFrame = async () => {
+      try {
+        const response = await fetch(`${FRAME_URL}?t=${Date.now()}`, { headers: requestHeaders() });
+        if (!response.ok) throw new Error("Frame unavailable");
+        const blob = await response.blob();
+        if (!active) return;
+        const nextObjectUrl = URL.createObjectURL(blob);
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        objectUrl = nextObjectUrl;
+        setFrameUrl(nextObjectUrl);
+      } catch {
+        if (active) setFrameUrl("");
+      } finally {
+        if (active) timer = window.setTimeout(loadFrame, 500);
+      }
+    };
+
+    loadFrame();
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [showImage]);
+
   return (
     <section className="panel live-frame-panel">
       <div className="section-heading">
@@ -16,8 +54,8 @@ export default function LiveFrame({ engine, connection }) {
       </div>
 
       <div className="live-frame">
-        {showImage ? (
-          <img className="frame-image" src={`${FRAME_URL}?t=${Date.now()}`} alt="Latest annotated Optivox frame" />
+        {showImage && frameUrl ? (
+          <img className="frame-image" src={frameUrl} alt="Latest annotated Optivox frame" />
         ) : (
           <>
             <div className="frame-grid" />

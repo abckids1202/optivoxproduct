@@ -22,14 +22,15 @@ class AssignmentRequest(BaseModel):
 def incidents(limit: int = 100, status: str | None = None,
               category: str | None = None, zone_id: str | None = None,
               camera_id: str | None = None, severity: int | None = None,
-              assignee: str | None = None):
+              assignee: str | None = None,
+              actor: str = Depends(require_operator)):
     return svc.list_incidents(
         limit=limit, status=status, category=category, zone_id=zone_id,
         camera_id=camera_id, severity=severity, assignee=assignee)
 
 
 @router.get("/{incident_id}")
-def incident(incident_id: int):
+def incident(incident_id: int, actor: str = Depends(require_operator)):
     return svc.get_incident(incident_id)
 
 

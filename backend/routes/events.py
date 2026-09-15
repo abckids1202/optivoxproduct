@@ -15,22 +15,22 @@ class ReviewRequest(BaseModel):
 
 
 @router.get("")
-def events(limit: int = 100, offset: int = 0, event_type: str | None = None, severity: str | None = None):
+def events(limit: int = 100, offset: int = 0, event_type: str | None = None, severity: str | None = None, actor: str = Depends(require_operator)):
     return svc.list_events(limit=limit, offset=offset, event_type=event_type, severity=severity)
 
 
 @router.get("/summary")
-def summary():
+def summary(actor: str = Depends(require_operator)):
     return svc.event_summary()
 
 
 @router.get("/{event_id}")
-def event(event_id: int):
+def event(event_id: int, actor: str = Depends(require_operator)):
     return svc.get_event(event_id)
 
 
 @router.get("/{event_id}/snapshot")
-def snapshot(event_id: int):
+def snapshot(event_id: int, actor: str = Depends(require_operator)):
     return svc.snapshot_response(event_id)
 
 

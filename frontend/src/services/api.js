@@ -18,7 +18,7 @@ async function getJson(path) {
   return response.json();
 }
 
-function requestHeaders(extra = {}) {
+export function requestHeaders(extra = {}) {
   const token = sessionToken();
   return { ...(API_KEY ? { "X-Optivox-Key": API_KEY } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extra };
 }

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from ..services import people_service as svc
-from ..security import require_admin
+from ..security import require_admin, require_operator
 
 router = APIRouter(prefix="/api/people", tags=["people"])
 
@@ -19,12 +19,12 @@ class PersonUpdateRequest(BaseModel):
 
 
 @router.get("")
-def people():
+def people(actor: str = Depends(require_operator)):
     return svc.list_people()
 
 
 @router.get("/{person_id}")
-def person(person_id: int):
+def person(person_id: int, actor: str = Depends(require_operator)):
     return svc.get_person(person_id)
 
 

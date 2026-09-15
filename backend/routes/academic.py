@@ -4,13 +4,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..services import academic_service as svc
-from ..security import require_admin
+from ..security import require_admin, require_operator
 
 router = APIRouter(prefix="/api/academic", tags=["academic"])
 
 
 @router.get("/overview")
-def overview(year: int | None = None, month: int | None = None):
+def overview(year: int | None = None, month: int | None = None, actor: str = Depends(require_operator)):
     return svc.overview(year=year, month=month)
 
 
@@ -24,7 +24,7 @@ class ScheduleRequest(BaseModel):
 
 
 @router.get("/schedules")
-def schedules(active_only: bool = False):
+def schedules(active_only: bool = False, actor: str = Depends(require_operator)):
     return svc.list_schedules(active_only=active_only)
 
 

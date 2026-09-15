@@ -20,3 +20,10 @@ def test_configured_key_allows_operator_command(monkeypatch):
     )
     assert response.status_code == 200
     assert response.json()["type"] == "save_snapshot"
+
+
+def test_sensitive_read_routes_require_configured_key(monkeypatch):
+    monkeypatch.setenv("OPTIVOX_API_KEY", "test-secret")
+    client = TestClient(app)
+    response = client.get("/api/people")
+    assert response.status_code == 401

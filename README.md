@@ -75,6 +75,27 @@ The frontend only uses sample data when `VITE_USE_DEMO_DATA=true`. In normal liv
 
 Close the frontend tab, stop the backend terminal, then quit the engine with `q` so it can save its shutdown report.
 
+## Benchmark
+
+With the engine running, collect a non-invasive ten-minute runtime report:
+
+```bat
+python benchmark_runtime.py --seconds 600 --publish-runtime-summary
+```
+
+The observer writes a timestamped JSON report under `reports/` and, with
+`--publish-runtime-summary`, updates `runtime/performance_summary.json` for
+the dashboard performance endpoint. It samples
+capture, inference, display, frame age, latency, CPU, queue, cache, and
+recognition counters without opening the camera a second time or writing to
+the operational database. GPU and VRAM remain `NOT_MEASURED` unless a
+hardware-specific collector is configured.
+
 ## API protection
 
-Local loopback access works without a key for the exhibition. Before exposing the backend beyond the local machine, set `OPTIVOX_API_KEY` and, for roster administration or attendance corrections, `OPTIVOX_ADMIN_KEY`. Put the matching `VITE_OPTIVOX_API_KEY` in the frontend build environment. Never commit real values.
+Local loopback access works without a key for the exhibition. Sensitive data
+and live-stream routes require operator authentication when keys are
+configured. Before exposing the backend beyond the local machine, set
+`OPTIVOX_API_KEY` and, for roster administration or attendance corrections,
+`OPTIVOX_ADMIN_KEY`. Put the matching `VITE_OPTIVOX_API_KEY` in the frontend
+build environment. Never commit real values.

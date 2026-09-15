@@ -10,32 +10,32 @@ router = APIRouter(prefix="/api/system", tags=["system"])
 
 
 @router.get("/status")
-def status():
+def status(actor: str = Depends(require_operator)):
     return svc.system_status()
 
 
 @router.get("/models")
-def models():
+def models(actor: str = Depends(require_operator)):
     return svc.models_status()
 
 
 @router.get("/database")
-def database():
+def database(actor: str = Depends(require_operator)):
     return svc.database_status()
 
 
 @router.get("/storage")
-def storage():
+def storage(actor: str = Depends(require_operator)):
     return svc.storage_status()
 
 
 @router.get("/alerts")
-def alerts():
+def alerts(actor: str = Depends(require_operator)):
     return svc.alerts_status()
 
 
 @router.get("/performance")
-def performance():
+def performance(actor: str = Depends(require_operator)):
     return svc.performance_report()
 
 

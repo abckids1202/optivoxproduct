@@ -25,37 +25,37 @@ class AbsenceRequest(BaseModel):
 
 
 @router.get("/today")
-def today():
+def today(actor: str = Depends(require_operator)):
     return svc.today_attendance()
 
 
 @router.get("")
-def list_attendance(limit: int = 200, offset: int = 0, person_id: int | None = None):
+def list_attendance(limit: int = 200, offset: int = 0, person_id: int | None = None, actor: str = Depends(require_operator)):
     return svc.list_attendance(limit=limit, offset=offset, person_id=person_id)
 
 
 @router.get("/summary")
-def summary():
+def summary(actor: str = Depends(require_operator)):
     return svc.attendance_summary()
 
 
 @router.get("/calendar")
-def calendar(year: int | None = None, month: int | None = None):
+def calendar(year: int | None = None, month: int | None = None, actor: str = Depends(require_operator)):
     return svc.attendance_calendar(year=year, month=month)
 
 
 @router.get("/person/{person_id}")
-def person(person_id: int):
+def person(person_id: int, actor: str = Depends(require_operator)):
     return svc.person_attendance(person_id)
 
 
 @router.get("/absences")
-def absences(person_id: int | None = None, start: str | None = None, end: str | None = None):
+def absences(person_id: int | None = None, start: str | None = None, end: str | None = None, actor: str = Depends(require_operator)):
     return svc.list_absences(person_id=person_id, start=start, end=end)
 
 
 @router.get("/export")
-def export():
+def export(actor: str = Depends(require_operator)):
     return svc.export_csv()
 
 

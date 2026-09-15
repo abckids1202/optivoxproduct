@@ -267,6 +267,8 @@ class CorrelationCore:
                 metadata={"category": detection.get("category"), "entity_association": "not_established"},
             ))
 
+        correlated_event_tuples = []
+        correlated_event_records = []
         for event in security_events or ():
             if not event:
                 continue
@@ -277,6 +279,33 @@ class CorrelationCore:
                 track_id = int(track_id) if track_id is not None else None
             except (TypeError, ValueError):
                 track_id = None
+            entity = self.entities.get(track_id) if track_id is not None else None
+            if entity is not None:
+                entity.refresh(now)
+                identity = entity.identity
+                metadata.update({
+                    "entity_id": entity.entity_id,
+                    "track_generation": entity.track_generation,
+                    "lifecycle_state": entity.lifecycle_state.value,
+                    "identity_state": identity.state,
+                    "confirmed_name": identity.confirmed_name,
+                    "liveness_state": entity.liveness.state,
+                    "attendance_eligibility": entity.attendance_eligibility,
+                })
+            target = str(event[1]) if len(event) > 1 else "SYSTEM"
+            if entity is not None and identity.confirmed_name and target.startswith("ID_"):
+                target = identity.confirmed_name
+            confidence = float(event[2]) if len(event) > 2 else 0.0
+            details = event[3] if len(event) > 3 else ""
+            correlated_event_tuples.append(
+                (event_type, target, confidence, details, metadata))
+            correlated_event_records.append({
+                "event_type": event_type,
+                "target": target,
+                "confidence": confidence,
+                "details": details,
+                "metadata": metadata,
+            })
             self._add(Observation(
                 ObservationType.SECURITY_SIGNAL,
                 camera_id=camera_id,
@@ -291,7 +320,7 @@ class CorrelationCore:
                 metadata={
                     **metadata,
                     "event_type": event_type,
-                    "details": event[3] if len(event) > 3 else "",
+                    "details": details,
                 },
             ))
 
@@ -302,16 +331,11 @@ class CorrelationCore:
             "frame_id": source_frame_id,
             "camera_id": camera_id,
             "entities": self.entities.snapshot(now),
-            "security_events": [
-                {
-                    "event_type": str(event[0]),
-                    "target": str(event[1]) if len(event) > 1 else "SYSTEM",
-                    "confidence": float(event[2]) if len(event) > 2 else 0.0,
-                    "details": event[3] if len(event) > 3 else "",
-                    "metadata": dict(event[4]) if len(event) > 4 and isinstance(event[4], dict) else {},
-                }
-                for event in (security_events or ())
-            ],
+            "security_events": correlated_event_records,
+            # The runtime bridge consumes these enriched tuples for event,
+            # alert, and incident persistence. Raw model events remain useful
+            # for diagnostics but are no longer the operational contract.
+            "security_event_tuples": correlated_event_tuples,
             "stats": self.stats(),
         }
 
@@ -355,6 +379,8 @@ class CorrelationCore:
             reasons.append(f"identity_{identity.state.lower()}")
         if not entity.liveness.last_checked_monotonic or entity.liveness.state != "REAL":
             reasons.append("liveness_not_real")
+        if not entity.attendance_eligibility:
+            reasons.append("entity_attendance_not_eligible")
         if not active_roster:
             reasons.append("person_not_active_in_roster")
         if expected_name and identity.confirmed_name != expected_name:
@@ -367,6 +393,7 @@ class CorrelationCore:
             "identity_state": identity.state,
             "liveness_state": entity.liveness.state,
             "quality_ok": entity.quality_ok,
+            "attendance_eligibility": entity.attendance_eligibility,
         }
 
     def snapshot(self) -> Dict[str, object]:
