@@ -4,13 +4,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..services import academic_service as svc
-from ..security import require_admin, require_operator
+from ..security import require_permission
 
 router = APIRouter(prefix="/api/academic", tags=["academic"])
 
 
 @router.get("/overview")
-def overview(year: int | None = None, month: int | None = None, actor: str = Depends(require_operator)):
+def overview(year: int | None = None, month: int | None = None, actor: str = Depends(require_permission("attendance.view"))):
     return svc.overview(year=year, month=month)
 
 
@@ -24,12 +24,12 @@ class ScheduleRequest(BaseModel):
 
 
 @router.get("/schedules")
-def schedules(active_only: bool = False, actor: str = Depends(require_operator)):
+def schedules(active_only: bool = False, actor: str = Depends(require_permission("attendance.view"))):
     return svc.list_schedules(active_only=active_only)
 
 
 @router.post("/schedules")
-def add_schedule(payload: ScheduleRequest, actor: str = Depends(require_admin)):
+def add_schedule(payload: ScheduleRequest, actor: str = Depends(require_permission("attendance.manage"))):
     try:
         return svc.create_schedule(**payload.dict())
     except ValueError as exc:
@@ -37,7 +37,7 @@ def add_schedule(payload: ScheduleRequest, actor: str = Depends(require_admin)):
 
 
 @router.delete("/schedules/{schedule_id}")
-def deactivate_schedule(schedule_id: int, actor: str = Depends(require_admin)):
+def deactivate_schedule(schedule_id: int, actor: str = Depends(require_permission("attendance.manage"))):
     try:
         return svc.deactivate_schedule(schedule_id)
     except ValueError as exc:

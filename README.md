@@ -17,6 +17,10 @@ OptiVox uses one local computer-vision engine, `main.py`, plus a FastAPI backend
 
 ## Startup
 
+The root `main.py` plus the root `backend/` and `frontend/` directories are
+the canonical application. The `optivox-web/` tree is retained legacy and
+marketing material; it is not part of the current startup path.
+
 Run separately:
 
 ```bat
@@ -30,6 +34,31 @@ Or run all three:
 ```bat
 start_all.bat
 ```
+
+These batch files are development/exhibition launchers. They bind the backend
+to loopback and enable Uvicorn reload. For pilot or production operation, run
+the services under a process supervisor with an explicit `OPTIVOX_RUNTIME_MODE`
+of `pilot` or `production`, authentication configured, and TLS supplied by a
+trusted reverse proxy. Do not use `--reload` for production.
+
+## Runtime security modes
+
+`OPTIVOX_RUNTIME_MODE` must be one of `development`, `exhibition`, `pilot`,
+or `production`. Development and exhibition allow the existing loopback
+convenience path. Pilot and production do not trust loopback implicitly and
+require an API key or configured durable user; production also requires an
+administrator authentication method and rejects demo mode.
+
+Validate the current repository’s tracked files for common credential patterns
+with:
+
+```bat
+python security_scan.py
+```
+
+The scanner reports only file names, line numbers, and rule names. It does not
+print matched secret values. It is a local guardrail and does not replace a
+hosted secret-scanning service.
 
 ## Runtime Bridge
 
@@ -96,9 +125,9 @@ hardware-specific collector is configured.
 Local loopback access works without a key for the exhibition. Sensitive data
 and live-stream routes require operator authentication when keys are
 configured. Before exposing the backend beyond the local machine, set
-`OPTIVOX_API_KEY` and, for roster administration or attendance corrections,
-`OPTIVOX_ADMIN_KEY`. Put the matching `VITE_OPTIVOX_API_KEY` in the frontend
-build environment. Never commit real values.
+`OPTIVOX_API_KEY` and, for CLI/edge administration, `OPTIVOX_ADMIN_KEY`.
+Browser access uses the authenticated session cookies; do not put an API key
+in the Vite build environment. Never commit real values.
 
 Automatic attendance follows the configured school calendar. By default,
 Monday through Friday are school days. Override this for a pilot site with

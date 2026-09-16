@@ -335,6 +335,10 @@ def ensure_platform_schema() -> None:
                 password_hash text not null,
                 role text not null default 'operator',
                 active integer not null default 1,
+                failed_login_count integer not null default 0,
+                locked_until text,
+                last_login_at text,
+                last_login_ip text,
                 created_at text not null default (datetime('now')),
                 updated_at text not null default (datetime('now'))
             );
@@ -343,6 +347,10 @@ def ensure_platform_schema() -> None:
                 token_hash text primary key,
                 user_id integer not null,
                 expires_at text not null,
+                csrf_token_hash text,
+                rotated_from text,
+                client_ip text,
+                user_agent text,
                 created_at text not null default (datetime('now')),
                 last_seen_at text not null default (datetime('now')),
                 foreign key (user_id) references platform_users(id) on delete cascade
@@ -388,4 +396,22 @@ def ensure_platform_schema() -> None:
             create index if not exists idx_session_expiry on platform_sessions(expires_at);
             """
         )
+        user_columns = {row["name"] for row in con.execute("pragma table_info(platform_users)").fetchall()}
+        for name, definition in (
+            ("failed_login_count", "integer not null default 0"),
+            ("locked_until", "text"),
+            ("last_login_at", "text"),
+            ("last_login_ip", "text"),
+        ):
+            if name not in user_columns:
+                con.execute(f"alter table platform_users add column {name} {definition}")
+        session_columns = {row["name"] for row in con.execute("pragma table_info(platform_sessions)").fetchall()}
+        for name, definition in (
+            ("csrf_token_hash", "text"),
+            ("rotated_from", "text"),
+            ("client_ip", "text"),
+            ("user_agent", "text"),
+        ):
+            if name not in session_columns:
+                con.execute(f"alter table platform_sessions add column {name} {definition}")
         con.commit()

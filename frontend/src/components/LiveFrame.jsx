@@ -18,7 +18,7 @@ export default function LiveFrame({ engine, connection }) {
 
     const loadFrame = async () => {
       try {
-        const response = await fetch(`${FRAME_URL}?t=${Date.now()}`, { headers: requestHeaders() });
+        const response = await fetch(`${FRAME_URL}?t=${Date.now()}`, { headers: requestHeaders(), credentials: "include" });
         if (!response.ok) throw new Error("Frame unavailable");
         const blob = await response.blob();
         if (!active) return;

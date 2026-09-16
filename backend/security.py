@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 
 from fastapi import Header, HTTPException, Request, WebSocket, WebSocketException, status
 
+from .config import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME, configured_auth_methods, frontend_origin_allowed, loopback_bypass_allowed
 from .services.auth_service import resolve_session
 
 
@@ -17,6 +18,20 @@ _LOGIN_RATE_LIMIT = 10
 _rate_lock = threading.Lock()
 _rate_history: dict[str, deque[float]] = defaultdict(deque)
 _login_history: dict[str, deque[float]] = defaultdict(deque)
+
+ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
+    "viewer": frozenset({"live.view", "attendance.view", "people.view", "security.view", "analytics.view", "system.view", "operations.view"}),
+    "operator": frozenset({
+        "live.view", "attendance.view", "attendance.manual", "people.view", "security.view",
+        "evidence.view", "analytics.view", "system.view", "operations.view", "commands.execute",
+    }),
+    "security-reviewer": frozenset({"live.view", "security.view", "security.review", "evidence.view", "operations.view", "system.view"}),
+    "attendance-admin": frozenset({"live.view", "attendance.view", "attendance.manual", "attendance.manage", "attendance.export", "people.view", "analytics.view", "operations.view", "system.view", "commands.execute"}),
+    "biometric-admin": frozenset({"live.view", "people.view", "biometric.enroll", "biometric.manage", "biometric.merge", "biometric.delete", "operations.view", "system.view", "commands.execute"}),
+    "system-admin": frozenset({"*"}),
+    # Existing local/API deployments may still contain this legacy role.
+    "admin": frozenset({"*"}),
+}
 
 
 def _configured_keys() -> tuple[str | None, str | None]:
@@ -31,12 +46,43 @@ def _supplied_key(x_optivox_key: str | None, authorization: str | None) -> str |
     return None
 
 
+def _supplied_credential(request: Request, x_optivox_key: str | None, authorization: str | None) -> tuple[str | None, bool]:
+    header_credential = _supplied_key(x_optivox_key, authorization)
+    if header_credential:
+        return header_credential, False
+    cookie_credential = request.cookies.get(SESSION_COOKIE_NAME)
+    return (cookie_credential, True) if cookie_credential else (None, False)
+
+
+def has_permission(role: str | None, permission: str) -> bool:
+    normalized = str(role or "").strip().casefold()
+    if normalized.startswith("local-"):
+        return True
+    permissions = ROLE_PERMISSIONS.get(normalized, frozenset())
+    return "*" in permissions or permission in permissions
+
+
+def _require_permission(role: str, permission: str | None) -> None:
+    if permission and not has_permission(role, permission):
+        raise HTTPException(status_code=403, detail={"code": "PERMISSION_REQUIRED", "message": f"Permission required: {permission}."})
+
+
+def _validate_csrf(request: Request, cookie_auth: bool) -> None:
+    if not cookie_auth or request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return
+    cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
+    supplied_token = request.headers.get("X-CSRF-Token")
+    if not cookie_token or not supplied_token or not hmac.compare_digest(cookie_token, supplied_token):
+        raise HTTPException(status_code=403, detail={"code": "CSRF_TOKEN_REQUIRED", "message": "A valid CSRF token is required for this session action."})
+
+
 def _is_loopback(request: Request) -> bool:
     host = request.client.host if request.client else ""
     return host in {"127.0.0.1", "::1", "localhost", "testclient"}
 
 
-def _guard(request: Request, x_optivox_key: str | None, authorization: str | None, admin: bool = False) -> str:
+def _guard(request: Request, x_optivox_key: str | None, authorization: str | None,
+           admin: bool = False, required_permission: str | None = None) -> str:
     client = request.client.host if request.client else "unknown"
     now = time.monotonic()
     with _rate_lock:
@@ -47,22 +93,29 @@ def _guard(request: Request, x_optivox_key: str | None, authorization: str | Non
             raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "message": "Too many operator requests. Try again shortly."}, headers={"Retry-After": "60"})
         history.append(now)
     operator_key, admin_key = _configured_keys()
-    supplied = _supplied_key(x_optivox_key, authorization)
+    supplied, cookie_auth = _supplied_credential(request, x_optivox_key, authorization)
     session = resolve_session(supplied)
     if session:
-        if admin and session.get("role") != "admin":
-            raise HTTPException(status_code=403, detail={"code": "ADMIN_REQUIRED", "message": "This operation requires an administrator role."})
+        _validate_csrf(request, cookie_auth)
+        _require_permission(str(session.get("role") or ""), required_permission or ("system.admin" if admin else None))
         return str(session.get("username") or "session-user")
-    expected = admin_key if admin and admin_key else (operator_key or admin_key)
+    # An operator key must never grant administrator access just because a
+    # separate administrator key was omitted. Durable admin users remain a
+    # supported alternative through the session branch above.
+    expected = admin_key if admin else (operator_key or admin_key)
     if expected:
         if not supplied or not hmac.compare_digest(supplied, expected):
             raise HTTPException(status_code=401, detail={"code": "INVALID_API_KEY", "message": "A valid OptiVox API key is required."})
-        if admin and admin_key and not hmac.compare_digest(supplied, admin_key):
-            raise HTTPException(status_code=403, detail={"code": "ADMIN_REQUIRED", "message": "This operation requires an administrator key."})
-        return "api-key-admin" if admin else "api-key-operator"
-    if not _is_loopback(request):
-        raise HTTPException(status_code=503, detail={"code": "API_KEY_NOT_CONFIGURED", "message": "Configure OPTIVOX_API_KEY before exposing the backend beyond localhost."})
-    return "local-operator"
+        role = "system-admin" if admin or (admin_key and hmac.compare_digest(supplied, admin_key)) else "operator"
+        _require_permission(role, required_permission or ("system.admin" if admin else None))
+        return "api-key-admin" if role == "system-admin" else "api-key-operator"
+    if loopback_bypass_allowed() and _is_loopback(request):
+        _validate_csrf(request, False)
+        _require_permission("local-admin" if admin else "local-operator", required_permission or ("system.admin" if admin else None))
+        return "local-admin" if admin else "local-operator"
+    if not any(configured_auth_methods().values()):
+        raise HTTPException(status_code=503, detail={"code": "AUTH_NOT_CONFIGURED", "message": "Configure an API key or durable user before using pilot or production mode."})
+    raise HTTPException(status_code=401, detail={"code": "AUTHENTICATION_REQUIRED", "message": "A valid authenticated session is required."})
 
 
 def enforce_login_rate_limit(request: Request) -> None:
@@ -95,23 +148,45 @@ def require_admin(
     x_optivox_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ) -> str:
-    return _guard(request, x_optivox_key, authorization, admin=True)
+    return _guard(request, x_optivox_key, authorization, admin=True, required_permission="system.admin")
+
+
+def require_permission(permission: str):
+    """Create a FastAPI dependency enforcing one named permission."""
+    def dependency(
+        request: Request,
+        x_optivox_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> str:
+        return _guard(request, x_optivox_key, authorization, required_permission=permission)
+    dependency.__name__ = f"require_{permission.replace('.', '_')}"
+    return dependency
 
 
 def require_websocket_operator(websocket: WebSocket) -> str:
     """Protect the live stream before accepting a websocket connection."""
+    # HTTP CORS does not protect WebSocket upgrades. Validate the browser
+    # origin separately while allowing origin-less trusted native clients.
+    if not frontend_origin_allowed(websocket.headers.get("origin")):
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
     operator_key, admin_key = _configured_keys()
     supplied = _supplied_key(
         websocket.headers.get("x-optivox-key"),
         websocket.headers.get("authorization"),
     )
+    if not supplied:
+        supplied = websocket.cookies.get("optivox_session")
     session = resolve_session(supplied)
     if session:
+        if not has_permission(str(session.get("role") or ""), "live.view"):
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
         return str(session.get("username") or "session-user")
     expected = operator_key or admin_key
     if expected and (not supplied or not hmac.compare_digest(supplied, expected)):
         raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
     if not expected:
+        if not loopback_bypass_allowed():
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
         host = websocket.client.host if websocket.client else ""
         if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)

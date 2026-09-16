@@ -2,7 +2,6 @@ import { getDemoState } from "./mockData";
 
 export const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
 const USE_DEMO_DATA = import.meta.env.VITE_USE_DEMO_DATA === "true";
-const API_KEY = import.meta.env.VITE_OPTIVOX_API_KEY || "";
 
 export class ApiError extends Error {
   constructor(message, status) {
@@ -12,14 +11,14 @@ export class ApiError extends Error {
   }
 }
 
-function sessionToken() {
-  return window.localStorage.getItem("optivox_access_token") || "";
+function csrfToken() {
+  return document.cookie.split(";").map((item) => item.trim()).find((item) => item.startsWith("optivox_csrf="))?.slice("optivox_csrf=".length) || "";
 }
 
 export const FRAME_URL = `${API_BASE}/api/live/frame`;
 
 async function getJson(path) {
-  const response = await fetch(`${API_BASE}${path}`, { headers: requestHeaders() });
+  const response = await fetch(`${API_BASE}${path}`, { headers: requestHeaders(), credentials: "include" });
   if (!response.ok) {
     throw new ApiError(await errorMessage(response), response.status);
   }
@@ -27,8 +26,8 @@ async function getJson(path) {
 }
 
 export function requestHeaders(extra = {}) {
-  const token = sessionToken();
-  return { ...(API_KEY ? { "X-Optivox-Key": API_KEY } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extra };
+  const csrf = csrfToken();
+  return { ...(csrf ? { "X-CSRF-Token": csrf } : {}), ...extra };
 }
 
 async function errorMessage(response) {
@@ -60,25 +59,22 @@ export async function login(username, password) {
   const response = await fetch(`${API_BASE}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify({ username, password }),
   });
   if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
-  const data = await response.json();
-  window.localStorage.setItem("optivox_access_token", data.access_token);
-  return data;
+  return response.json();
 }
 
 export async function logout() {
-  const token = sessionToken();
   try {
-    if (token) {
-      await fetch(`${API_BASE}/api/auth/logout`, {
-        method: "POST",
-        headers: requestHeaders(),
-      });
-    }
+    await fetch(`${API_BASE}/api/auth/logout`, {
+      method: "POST",
+      headers: requestHeaders(),
+      credentials: "include",
+    });
   } finally {
-    window.localStorage.removeItem("optivox_access_token");
+    // Session cookies are cleared by the backend response.
   }
 }
 
@@ -87,6 +83,7 @@ export async function sendCommand(command, payload = {}) {
     return await fetch(`${API_BASE}/api/commands`, {
       method: "POST",
       headers: requestHeaders({ "Content-Type": "application/json", "Idempotency-Key": `web-${command}-${Date.now()}` }),
+      credentials: "include",
       body: JSON.stringify({ command, payload }),
     }).then(async (response) => {
       if (!response.ok) throw new Error(await errorMessage(response));
@@ -112,6 +109,7 @@ export async function updatePerson(personId, payload) {
   const response = await fetch(`${API_BASE}/api/people/${personId}`, {
     method: "PATCH",
     headers: requestHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
     body: JSON.stringify(payload),
   });
   if (!response.ok) throw new Error(await errorMessage(response));
@@ -171,6 +169,7 @@ export async function reviewEvent(eventId, action, note = "") {
   const response = await fetch(`${API_BASE}/api/events/${eventId}/review`, {
     method: "POST",
     headers: requestHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
     body: JSON.stringify({ action, note }),
   });
   if (!response.ok) throw new Error(await errorMessage(response));
@@ -181,6 +180,7 @@ export async function reviewIncident(incidentId, action, note = "") {
   const response = await fetch(`${API_BASE}/api/incidents/${incidentId}/review`, {
     method: "POST",
     headers: requestHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
     body: JSON.stringify({ action, note }),
   });
   if (!response.ok) throw new Error(await errorMessage(response));
@@ -196,6 +196,7 @@ export async function assignIncident(incidentId, assignee) {
   const response = await fetch(`${API_BASE}/api/incidents/${incidentId}/assign`, {
     method: "POST",
     headers: requestHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
     body: JSON.stringify({ assignee }),
   });
   if (!response.ok) throw new Error(await errorMessage(response));
@@ -206,6 +207,7 @@ export async function recordAbsence(personId, payload) {
   const response = await fetch(`${API_BASE}/api/attendance/${personId}/absence`, {
     method: "POST",
     headers: requestHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
     body: JSON.stringify(payload),
   });
   if (!response.ok) throw new Error(await errorMessage(response));
@@ -216,6 +218,7 @@ export async function correctAttendance(personId, payload) {
   const response = await fetch(`${API_BASE}/api/attendance/${personId}/correct`, {
     method: "POST",
     headers: requestHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
     body: JSON.stringify(payload),
   });
   if (!response.ok) throw new Error(await errorMessage(response));
@@ -226,6 +229,7 @@ export async function clockInPerson(personId) {
   const response = await fetch(`${API_BASE}/api/attendance/${personId}/clock-in`, {
     method: "POST",
     headers: requestHeaders(),
+    credentials: "include",
   });
   if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
   return response.json();
@@ -235,6 +239,7 @@ export async function clockOutPerson(personId) {
   const response = await fetch(`${API_BASE}/api/attendance/${personId}/clock-out`, {
     method: "POST",
     headers: requestHeaders(),
+    credentials: "include",
   });
   if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
   return response.json();

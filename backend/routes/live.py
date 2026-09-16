@@ -10,13 +10,13 @@ from ..services.event_service import event_summary, list_events
 from ..services.incident_service import list_incidents
 from ..services.operational_service import summary as operational_summary
 from ..services.people_service import list_people
-from ..security import require_operator, require_websocket_operator
+from ..security import require_permission, require_websocket_operator
 
 router = APIRouter(tags=["live"])
 
 
 @router.get("/api/live/status")
-def live_status(actor: str = Depends(require_operator)):
+def live_status(actor: str = Depends(require_permission("live.view"))):
     state = runtime_service.live_state()
     state["people"] = list_people()
     state["attendance"] = today_attendance()
@@ -39,17 +39,17 @@ def live_status(actor: str = Depends(require_operator)):
 
 
 @router.get("/api/live/detections")
-def live_detections(actor: str = Depends(require_operator)):
+def live_detections(actor: str = Depends(require_permission("live.view"))):
     return runtime_service.live_detections()
 
 
 @router.get("/api/live/frame")
-def live_frame(actor: str = Depends(require_operator)):
+def live_frame(actor: str = Depends(require_permission("live.view"))):
     return runtime_service.frame_response()
 
 
 @router.get("/api/live/events")
-def live_events(actor: str = Depends(require_operator)):
+def live_events(actor: str = Depends(require_permission("security.view"))):
     return list_events(limit=20)
 
 

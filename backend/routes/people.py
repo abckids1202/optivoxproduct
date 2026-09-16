@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from ..services import people_service as svc
-from ..security import require_admin, require_operator
+from ..security import require_permission
 
 router = APIRouter(prefix="/api/people", tags=["people"])
 
@@ -19,25 +19,25 @@ class PersonUpdateRequest(BaseModel):
 
 
 @router.get("")
-def people(actor: str = Depends(require_operator)):
+def people(actor: str = Depends(require_permission("people.view"))):
     return svc.list_people()
 
 
 @router.get("/{person_id}")
-def person(person_id: int, actor: str = Depends(require_operator)):
+def person(person_id: int, actor: str = Depends(require_permission("people.view"))):
     return svc.get_person(person_id)
 
 
 @router.patch("/{person_id}")
-def update(person_id: int, payload: PersonUpdateRequest, actor: str = Depends(require_admin)):
+def update(person_id: int, payload: PersonUpdateRequest, actor: str = Depends(require_permission("people.manage"))):
     return svc.update_person(person_id, payload.dict(exclude_none=True), actor_id=actor)
 
 
 @router.post("/{person_id}/disable")
-def disable(person_id: int, actor: str = Depends(require_admin)):
+def disable(person_id: int, actor: str = Depends(require_permission("biometric.manage"))):
     return svc.set_enabled(person_id, False, actor_id=actor)
 
 
 @router.post("/{person_id}/enable")
-def enable(person_id: int, actor: str = Depends(require_admin)):
+def enable(person_id: int, actor: str = Depends(require_permission("biometric.manage"))):
     return svc.set_enabled(person_id, True, actor_id=actor)

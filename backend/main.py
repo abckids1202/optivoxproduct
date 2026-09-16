@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import FRONTEND_ORIGINS
+from .config import FRONTEND_ORIGINS, RUNTIME_MODE, validate_runtime_configuration
 from .platform_schema import ensure_platform_schema
 from .routes import academic, analytics, attendance, auth, commands, events, health, incidents, live, operations, people, system
 from .services.auth_service import bootstrap_configured_users
@@ -14,11 +14,16 @@ from .services.auth_service import bootstrap_configured_users
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("optivox.backend")
 
+# Validate before the import-time schema compatibility check can touch the
+# operational database. Lifespan repeats this check for supervised startups.
+validate_runtime_configuration()
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    validate_runtime_configuration()
     ensure_platform_schema()
     bootstrap_configured_users()
-    logger.info("OptiVox backend started")
+    logger.info("OptiVox backend started in %s mode", RUNTIME_MODE)
     yield
     logger.info("OptiVox backend stopped")
 
@@ -39,8 +44,21 @@ app.add_middleware(
     allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type", "X-Optivox-Key", "X-CSRF-Token", "Idempotency-Key"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=()")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    if RUNTIME_MODE == "production":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 for router in [
     health.router,

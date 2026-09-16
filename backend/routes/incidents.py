@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from ..security import require_operator
+from ..security import require_permission
 from ..services import incident_service as svc
 
 router = APIRouter(prefix="/api/incidents", tags=["incidents"])
@@ -23,22 +23,22 @@ def incidents(limit: int = 100, status: str | None = None,
               category: str | None = None, zone_id: str | None = None,
               camera_id: str | None = None, severity: int | None = None,
               assignee: str | None = None,
-              actor: str = Depends(require_operator)):
+              actor: str = Depends(require_permission("security.view"))):
     return svc.list_incidents(
         limit=limit, status=status, category=category, zone_id=zone_id,
         camera_id=camera_id, severity=severity, assignee=assignee)
 
 
 @router.get("/{incident_id}")
-def incident(incident_id: int, actor: str = Depends(require_operator)):
+def incident(incident_id: int, actor: str = Depends(require_permission("security.view"))):
     return svc.get_incident(incident_id)
 
 
 @router.post("/{incident_id}/review")
-def review(incident_id: int, payload: ReviewRequest, actor: str = Depends(require_operator)):
+def review(incident_id: int, payload: ReviewRequest, actor: str = Depends(require_permission("security.review"))):
     return svc.review_incident(incident_id, payload.action, payload.note, actor_id=actor)
 
 
 @router.post("/{incident_id}/assign")
-def assign(incident_id: int, payload: AssignmentRequest, actor: str = Depends(require_operator)):
+def assign(incident_id: int, payload: AssignmentRequest, actor: str = Depends(require_permission("security.review"))):
     return svc.assign_incident(incident_id, payload.assignee, actor_id=actor)

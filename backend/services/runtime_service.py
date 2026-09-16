@@ -123,6 +123,7 @@ def live_state() -> dict[str, Any]:
 def performance_report() -> dict[str, Any]:
     """Return measured values when a fresh benchmark exists, otherwise explicit unknowns."""
     report = read_json(PERFORMANCE_SUMMARY_PATH, {}) or {}
+    latency = report.get("latency_ms", {}) if isinstance(report.get("latency_ms", {}), dict) else {}
     required = {
         "capture_fps": None,
         "inference_fps": None,
@@ -140,7 +141,6 @@ def performance_report() -> dict[str, Any]:
         "identity_confirmation_ms": None,
         "frames_replaced": None,
     }
-    latency = report.get("latency_ms", {}) if isinstance(report.get("latency_ms", {}), dict) else {}
     vision = report.get("vision", {}) if isinstance(report.get("vision", {}), dict) else {}
     models = vision.get("models", {}) if isinstance(vision.get("models", {}), dict) else {}
     resources = report.get("resource", {}) if isinstance(report.get("resource", {}), dict) else {}

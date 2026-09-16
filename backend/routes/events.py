@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from ..services import event_service as svc
-from ..security import require_operator
+from ..security import require_permission
 
 router = APIRouter(prefix="/api/events", tags=["events"])
 
@@ -15,25 +15,25 @@ class ReviewRequest(BaseModel):
 
 
 @router.get("")
-def events(limit: int = 100, offset: int = 0, event_type: str | None = None, severity: str | None = None, actor: str = Depends(require_operator)):
+def events(limit: int = 100, offset: int = 0, event_type: str | None = None, severity: str | None = None, actor: str = Depends(require_permission("security.view"))):
     return svc.list_events(limit=limit, offset=offset, event_type=event_type, severity=severity)
 
 
 @router.get("/summary")
-def summary(actor: str = Depends(require_operator)):
+def summary(actor: str = Depends(require_permission("security.view"))):
     return svc.event_summary()
 
 
 @router.get("/{event_id}")
-def event(event_id: int, actor: str = Depends(require_operator)):
+def event(event_id: int, actor: str = Depends(require_permission("security.view"))):
     return svc.get_event(event_id)
 
 
 @router.get("/{event_id}/snapshot")
-def snapshot(event_id: int, actor: str = Depends(require_operator)):
+def snapshot(event_id: int, actor: str = Depends(require_permission("evidence.view"))):
     return svc.snapshot_response(event_id)
 
 
 @router.post("/{event_id}/review")
-def review(event_id: int, payload: ReviewRequest, actor: str = Depends(require_operator)):
+def review(event_id: int, payload: ReviewRequest, actor: str = Depends(require_permission("security.review"))):
     return svc.review_event(event_id, payload.action, payload.note, actor_id=actor)

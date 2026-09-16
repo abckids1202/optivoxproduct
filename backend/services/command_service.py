@@ -35,6 +35,22 @@ ADMIN_COMMANDS = {
     "delete_person",
 }
 
+COMMAND_PERMISSIONS = {
+    "save_snapshot": "live.view",
+    "manual_clock_in": "attendance.manual",
+    "manual_clock_out": "attendance.manual",
+    "start_enrollment": "biometric.enroll",
+    "register_visible_unknown": "biometric.enroll",
+    "cancel_enrollment": "biometric.enroll",
+    "confirm_enrollment": "biometric.enroll",
+    "retrain_person": "biometric.manage",
+    "disable_person": "biometric.manage",
+    "merge_people": "biometric.merge",
+    "delete_person": "biometric.delete",
+    "test_alert": "system.manage",
+    "reset_demo_data": "system.manage",
+}
+
 _COMMAND_LOCK = threading.Lock()
 
 

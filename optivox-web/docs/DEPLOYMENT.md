@@ -63,8 +63,8 @@ OPTIVOX_CAMERA=0                 # webcam index, or rtsp://user:pass@cam-ip:554/
 OPTIVOX_DB=../security.db        # path to the SQLite file your core writes to
 OPTIVOX_ENABLE_BRIDGE=1
 OPTIVOX_SYNTHETIC=1        # set 0 in prod to fail loudly if camera/module missing
-OPENAI_API_KEY=sk-...            # optional; only for the AI assistant
-OPTIVOX_SECRET_KEY=change-me-long-random
+OPENAI_API_KEY=<set-outside-source>       # optional; only for the AI assistant
+OPTIVOX_SECRET_KEY=<long-random-value>    # legacy deployment placeholder
 ```
 
 Health check should now report `"mode":"live"`. If it still says `synthetic`,
