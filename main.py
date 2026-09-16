@@ -7773,6 +7773,17 @@ class CameraCaptureWorker(threading.Thread):
         except Exception as exc:
             self.last_error = str(exc)
             self._record_health(False, False, None)
+            if self.runtime_dir:
+                try:
+                    append_runtime_health_event(self.runtime_dir, {
+                        "type": "RUNTIME_CRASH",
+                        "component": "camera_capture_worker",
+                        "error": str(exc)[:500],
+                        "camera_id": self.camera_id,
+                        "process": process_identity(),
+                    })
+                except Exception:
+                    pass
             print(f"[CAPTURE] Worker stopped: {exc}")
         finally:
             try:
@@ -9020,6 +9031,15 @@ def main():
     except Exception as e:
         print(f"[FATAL] Unhandled error: {e}")
         traceback.print_exc()
+        try:
+            append_runtime_health_event(_runtime_dir(), {
+                "type": "RUNTIME_CRASH",
+                "component": "main",
+                "error": str(e)[:500],
+                "process": process_identity(),
+            })
+        except Exception:
+            pass
     finally:
         print("[INFO] Shutting down...")
         try:
