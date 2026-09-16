@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from ..config import APP_VERSION, DATABASE_PATH, RUNTIME_DIR, TIMEZONE
 from ..database import get_connection
-from ..services.runtime_service import heartbeat_state
+from ..services.runtime_service import health_events, heartbeat_state
 
 router = APIRouter(prefix="/api", tags=["health"])
 
@@ -29,5 +29,5 @@ def health():
         "runtime": "available" if RUNTIME_DIR.exists() else "missing",
         "version": APP_VERSION,
         "timestamp": datetime.now(TIMEZONE).isoformat(timespec="seconds"),
+        "health_events": health_events(10),
     }
-

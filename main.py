@@ -34,6 +34,20 @@ from core.entities import normalize_identity_state
 from core.face_augmentation import generate_variants
 from core.security import SecuritySignalEngine
 from core.liveness import LivenessChallenge
+from biometric_storage import BiometricStorageError, load_face_database, save_face_database
+from deployment_security import (
+    CameraHealthMonitor,
+    DeploymentSecurityError,
+    append_runtime_health_event,
+    is_strict_mode,
+    process_identity,
+    validate_alert_config,
+    validate_camera_source,
+    validate_edge_configuration,
+    validate_webhook_url,
+    verify_face_model_cache,
+    watchdog_status,
+)
 
 #Optional try and error
 try:
@@ -140,6 +154,8 @@ CONFIG: Dict[str, Any] = {
     "SNAPSHOT_DIR": os.path.join(_BASE_DIR, "snapshots"),
     "EXPORT_DIR": os.path.join(_BASE_DIR, "exports"),
     "MODEL_PATH": "yolov8n.pt",         
+    "MODEL_MANIFEST_PATH": os.environ.get(
+        "OPTIVOX_MODEL_MANIFEST", os.path.join(_BASE_DIR, "models", "model_checksums.json")),
     "ALERT_CONFIG_FILE": os.path.join(_BASE_DIR, "alert_config.json"),
     "KNOWN_FACES_DIR": os.path.join(_BASE_DIR, "known_faces"),
 
@@ -1846,26 +1862,56 @@ class AlertManager:
             except Exception as e:
                 print(f"[ALERT] failed to load {self.config_path}: {e}")
 
+        # Environment values are the preferred secret source. Merge only the
+        # operational destination fields before validation so overrides cannot
+        # bypass the outbound-network policy.
+        email_config = dict(self.config.get("email", {}) or {})
+        for env_name, config_name in (
+            ("OPTIVOX_SMTP_SERVER", "smtp_server"),
+            ("OPTIVOX_SMTP_USER", "smtp_user"),
+            ("OPTIVOX_SMTP_PASS", "smtp_pass"),
+            ("OPTIVOX_SMTP_FROM", "from"),
+            ("OPTIVOX_SMTP_TO", "to"),
+        ):
+            if os.environ.get(env_name):
+                email_config[config_name] = os.environ[env_name]
+        if email_config:
+            self.config["email"] = email_config
+        webhook_config = dict(self.config.get("webhook", {}) or {})
+        if os.environ.get("OPTIVOX_WEBHOOK_URL"):
+            webhook_config["url"] = os.environ["OPTIVOX_WEBHOOK_URL"]
+            webhook_config["enabled"] = True
+        if webhook_config:
+            self.config["webhook"] = webhook_config
+
+        alert_issues = validate_alert_config(
+            self.config, os.environ.get("OPTIVOX_RUNTIME_MODE", "development"))
+        if alert_issues:
+            message = "Alert configuration rejected: " + "; ".join(alert_issues)
+            if is_strict_mode(os.environ.get("OPTIVOX_RUNTIME_MODE", "development")):
+                raise DeploymentSecurityError(message)
+            print(f"[ALERT] {message}. Unsafe channels disabled.")
+
         self.enabled = self.config.get("enabled", True)
 
         email = self.config.get("email", {})
         self.email_enabled = email.get("enabled", False)
-        self.smtp_server   = email.get("smtp_server", "smtp.gmail.com")
+        self.smtp_server   = os.environ.get("OPTIVOX_SMTP_SERVER", email.get("smtp_server", "smtp.gmail.com"))
         self.smtp_port     = email.get("smtp_port", 587)
-        self.smtp_user     = email.get("smtp_user", "")
-        self.smtp_pass     = email.get("smtp_pass", "")
-        self.email_from    = email.get("from", self.smtp_user)
-        self.email_to      = email.get("to", [])
+        self.smtp_user     = os.environ.get("OPTIVOX_SMTP_USER", email.get("smtp_user", ""))
+        self.smtp_pass     = os.environ.get("OPTIVOX_SMTP_PASS", email.get("smtp_pass", ""))
+        self.email_from    = os.environ.get("OPTIVOX_SMTP_FROM", email.get("from", self.smtp_user))
+        self.email_to      = os.environ.get("OPTIVOX_SMTP_TO", "") or email.get("to", [])
         if isinstance(self.email_to, str): self.email_to = [self.email_to]
 
         tg = self.config.get("telegram", {})
         self.telegram_enabled = tg.get("enabled", False) and REQUESTS_AVAILABLE
-        self.tg_bot_token = tg.get("bot_token", "")
-        self.tg_chat_id   = tg.get("chat_id", "")
+        self.tg_bot_token = os.environ.get("OPTIVOX_TELEGRAM_BOT_TOKEN", tg.get("bot_token", ""))
+        self.tg_chat_id   = os.environ.get("OPTIVOX_TELEGRAM_CHAT_ID", tg.get("chat_id", ""))
 
         wh = self.config.get("webhook", {})
-        self.webhook_enabled = wh.get("enabled", False) and REQUESTS_AVAILABLE
-        self.webhook_url = wh.get("url", "")
+        self.webhook_enabled = wh.get("enabled", False) and REQUESTS_AVAILABLE and not alert_issues
+        self.webhook_url = os.environ.get("OPTIVOX_WEBHOOK_URL", wh.get("url", ""))
         self.discord_enabled = False
         self.sms_enabled = False
 
@@ -1952,11 +1998,15 @@ class AlertManager:
                 with open(snapshot_path, "rb") as f:
                     r = requests.post(url, data={"chat_id": self.tg_chat_id,
                                                  "caption": text[:1024]},
-                                      files={"photo": f}, timeout=15)
+                                      files={"photo": f}, timeout=(3, 15),
+                                      allow_redirects=False,
+                                      headers={"User-Agent": "OptiVox-Edge-Alert/1"})
             else:
                 url = f"https://api.telegram.org/bot{self.tg_bot_token}/sendMessage"
                 r = requests.post(url, data={"chat_id": self.tg_chat_id,
-                                             "text": text[:4000]}, timeout=15)
+                                             "text": text[:4000]}, timeout=(3, 15),
+                                  allow_redirects=False,
+                                  headers={"User-Agent": "OptiVox-Edge-Alert/1"})
             if r.status_code == 200: return True, "ok"
             return False, f"http {r.status_code}: {r.text[:200]}"
         except Exception as e:
@@ -1965,7 +2015,15 @@ class AlertManager:
     def _send_webhook(self, payload: dict) -> Tuple[bool, str]:
         if not self.webhook_enabled: return False, "disabled"
         try:
-            r = requests.post(self.webhook_url, json=payload, timeout=10)
+            validate_webhook_url(
+                self.webhook_url,
+                os.environ.get("OPTIVOX_RUNTIME_MODE", "development"),
+                os.environ.get("OPTIVOX_ALLOWED_WEBHOOK_HOSTS", "").split(","),
+            )
+            r = requests.post(
+                self.webhook_url, json=payload, timeout=(3, 10), allow_redirects=False,
+                headers={"User-Agent": "OptiVox-Edge-Alert/1"},
+            )
             return (r.status_code in (200, 201, 204)), f"http {r.status_code}"
         except Exception as e:
             return False, str(e)
@@ -2391,7 +2449,10 @@ class CentroidTracker:
 class FaceAnalyzer:
     def __init__(self, cfg=None):
         cfg = cfg or CONFIG
-        self.app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+        face_root = os.path.expanduser(os.environ.get("OPTIVOX_INSIGHTFACE_ROOT", "~/.insightface"))
+        if is_strict_mode(os.environ.get("OPTIVOX_RUNTIME_MODE", "development")):
+            verify_face_model_cache(required=True)
+        self.app = FaceAnalysis(name="buffalo_l", root=face_root, providers=["CPUExecutionProvider"])
         self.app.prepare(ctx_id=-1, det_size=(640, 640))
         self.enable_age_gender = bool(cfg.get("ENABLE_AGE_GENDER_INFERENCE", False))
 
@@ -2630,8 +2691,13 @@ class ObjectDetector:
         if not YOLO_AVAILABLE: return
         try:
             mp_ = self.cfg["MODEL_PATH"]
+            if not os.path.isabs(mp_):
+                mp_ = os.path.join(_BASE_DIR, mp_)
             if not os.path.exists(mp_):
-                print(f"[INFO] YOLO model {mp_} not present, will auto-download.")
+                if is_strict_mode(os.environ.get("OPTIVOX_RUNTIME_MODE", "development")):
+                    print(f"[ERROR] Model {mp_} is missing; production never downloads models silently.")
+                    return
+                print(f"[INFO] YOLO model {mp_} not present; local mode may download it.")
             self.model = YOLO(mp_)
             self.names = self.model.names if hasattr(self.model, "names") else {}
             print(f"[INFO] YOLO loaded: {mp_} ({len(self.names)} classes)")
@@ -3768,22 +3834,21 @@ class VisionSystem:
 
     def _load_face_db(self):
         path = self.cfg["FACE_DB_FILE"]
-        if not os.path.exists(path): return
         try:
-            with open(path, "rb") as f: self.face_db = pickle.load(f)
+            self.face_db = load_face_database(path)
             print(f"[INFO] Face DB loaded: {len(self.face_db)} person(s)")
             self._rebuild_index()
-        except Exception as e:
-            print(f"[WARN] Face DB load failed: {e}")
+        except BiometricStorageError as e:
+            # Fail closed for recognition instead of executing an untrusted
+            # object stream or continuing with partially decoded embeddings.
+            print(f"[SECURITY] Face DB rejected: {e}")
             self.face_db = {}
 
     def save_face_db(self):
         path = self.cfg["FACE_DB_FILE"]
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
-            with open(path, "wb") as f: pickle.dump(self.face_db, f)
-            return True
-        except Exception as e:
+            return save_face_database(path, self.face_db)
+        except (OSError, BiometricStorageError) as e:
             print(f"[WARN] Face DB save failed: {e}")
             return False
 
@@ -6273,6 +6338,12 @@ def _select_primary_camera(cfg: dict):
 
 
 def _open_capture(source):
+    validated = validate_camera_source(
+        source, _BASE_DIR, os.environ.get("OPTIVOX_RUNTIME_MODE", "development"))
+    if validated.get("kind") == "file":
+        source = validated["value"]
+    elif validated.get("kind") == "index":
+        source = validated["value"]
     cap = cv2.VideoCapture(source)
     if not cap.isOpened() and isinstance(source, int):
         alt = 1 if source == 0 else 0
@@ -6760,6 +6831,7 @@ def _publish_runtime_capabilities(runtime_dir: str, started_at: str, vision=None
         "runtime_id": RUNTIME_ID,
         "runtime_version": RUNTIME_VERSION,
         "pid": os.getpid(),
+        "process": process_identity(),
         "started_at": started_at,
         "generated_at": _runtime_now(),
         "capabilities": _runtime_capabilities(vision),
@@ -6783,6 +6855,8 @@ def _publish_runtime_heartbeat(
         "runtime_id": RUNTIME_ID,
         "runtime_version": RUNTIME_VERSION,
         "pid": os.getpid(),
+        "process": process_identity(),
+        "watchdog": watchdog_status(os.getpid()),
         "started_at": started_at,
         "timestamp": timestamp,
         "last_heartbeat": timestamp,
@@ -7639,21 +7713,49 @@ def _process_runtime_side_effects(
 
 
 class CameraCaptureWorker(threading.Thread):
-    def __init__(self, capture, frame_buffer, profiler, stop_event, target_size=(1280, 720)):
+    def __init__(self, capture, frame_buffer, profiler, stop_event,
+                 target_size=(1280, 720), runtime_dir=None, camera_id="cam_0"):
         super().__init__(name="optivox-camera", daemon=True)
         self.capture = capture
         self.frame_buffer = frame_buffer
         self.profiler = profiler
         self.stop_event = stop_event
         self.target_size = target_size
+        self.runtime_dir = runtime_dir
+        self.camera_id = str(camera_id)
+        self.health_monitor = CameraHealthMonitor(
+            freeze_after_sec=float(os.environ.get("OPTIVOX_CAMERA_FREEZE_SECONDS", "5")),
+            event_cooldown_sec=10.0,
+        )
+        self.health = self.health_monitor.observe(False, False, now=time.monotonic())
         self.last_error = None
         self.frames_read = 0
+
+    def health_status(self):
+        return dict(self.health)
+
+    def _record_health(self, capture_open, read_ok, frame):
+        self.health = self.health_monitor.observe(capture_open, read_ok, frame)
+        event = self.health.get("event")
+        if event:
+            event = {**event, "camera_id": self.camera_id, "process": process_identity()}
+            print(f"[CAMERA] {event['state']}: camera health transition")
+            if self.runtime_dir:
+                try:
+                    append_runtime_health_event(self.runtime_dir, event)
+                except Exception as exc:
+                    print(f"[CAMERA] health event write failed: {exc}")
 
     def run(self):
         try:
             while not self.stop_event.is_set():
+                try:
+                    capture_open = bool(self.capture.isOpened())
+                except Exception:
+                    capture_open = False
                 ret, frame = self.capture.read()
                 captured_at = time.time()
+                self._record_health(capture_open, ret, frame)
                 if not ret or frame is None:
                     self.last_error = "Camera read failed."
                     time.sleep(0.05)
@@ -7670,6 +7772,7 @@ class CameraCaptureWorker(threading.Thread):
                 self.last_error = None
         except Exception as exc:
             self.last_error = str(exc)
+            self._record_health(False, False, None)
             print(f"[CAPTURE] Worker stopped: {exc}")
         finally:
             try:
@@ -7924,10 +8027,13 @@ class RuntimeWorker(threading.Thread):
             worker_error = self.inference_worker.last_error or self.operations.last_error
             if self.capture_worker.last_error:
                 worker_error = self.capture_worker.last_error
+            camera_health = self.capture_worker.health_status()
             try:
                 if now - self._last_state >= 1.0:
                     _publish_runtime_heartbeat(
-                        self.runtime_dir, "online", "connected", fps,
+                        self.runtime_dir,
+                        "online" if camera_health.get("state") == "HEALTHY" else "degraded",
+                        str(camera_health.get("state", "UNKNOWN")).lower(), fps,
                         self.started_at, worker_error, performance=performance,
                         frame_id=result.get("frame_id") if result else None,
                         frame_age_ms=result.get("frame_age_ms") if result else latest_age,
@@ -7968,6 +8074,24 @@ def main():
     runtime_dir = _runtime_dir()
     started_at_epoch = time.time()
     started_at = _runtime_now()
+    runtime_mode = os.environ.get("OPTIVOX_RUNTIME_MODE", "development").strip().lower()
+    edge_validation = validate_edge_configuration(
+        CONFIG, _BASE_DIR, runtime_mode, manifest_path=CONFIG["MODEL_MANIFEST_PATH"])
+    if edge_validation.get("issues"):
+        print("[CONFIG] " + "; ".join(edge_validation["issues"]))
+        if is_strict_mode(runtime_mode):
+            _publish_runtime_heartbeat(
+                runtime_dir, "offline", "configuration_error", 0.0,
+                started_at, "Unsafe edge configuration.")
+            try:
+                append_runtime_health_event(runtime_dir, {
+                    "type": "CONFIGURATION_REJECTED",
+                    "issues": edge_validation["issues"],
+                    "process": process_identity(),
+                })
+            except Exception:
+                pass
+            return
     _publish_runtime_capabilities(runtime_dir, started_at)
     _publish_runtime_heartbeat(
         runtime_dir,
@@ -8520,7 +8644,7 @@ def main():
         target_size=(
             CONFIG.get("CAPTURE_WIDTH", 1280),
             CONFIG.get("CAPTURE_HEIGHT", 720),
-        ))
+        ), runtime_dir=runtime_dir, camera_id=cam_id)
     operations = OperationalWorker(
         db, attendance, alert_mgr, snapshot_dir, cam_id, cam_location,
         attendance_lock, lambda: bool(ui["center_attendance"].get("enabled")),

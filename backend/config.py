@@ -13,6 +13,7 @@ RUNTIME_DIR = (PROJECT_ROOT / os.getenv("OPTIVOX_RUNTIME_DIR", "runtime")).resol
 SNAPSHOTS_DIR = (PROJECT_ROOT / "snapshots").resolve()
 REPORTS_DIR = (PROJECT_ROOT / "reports").resolve()
 EXPORTS_DIR = (PROJECT_ROOT / "exports").resolve()
+BACKUPS_DIR = (PROJECT_ROOT / os.getenv("OPTIVOX_BACKUP_DIR", "backups")).resolve()
 MODELS_DIR = (PROJECT_ROOT / "models").resolve()
 FRONTEND_DIR = (PROJECT_ROOT / "frontend").resolve()
 TIMEZONE_NAME = os.getenv("OPTIVOX_TIMEZONE", "Asia/Jakarta")
@@ -30,6 +31,16 @@ COOKIE_SAMESITE = "strict"
 _configured_frontend_origin = os.getenv("OPTIVOX_FRONTEND_ORIGIN", "").strip()
 FRONTEND_ORIGINS = ([_configured_frontend_origin] if _configured_frontend_origin else ["http://127.0.0.1:5173", "http://localhost:5173"])
 COMMAND_PIN = os.getenv("OPTIVOX_COMMAND_PIN", "")
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+EVIDENCE_RETENTION_DAYS = _positive_int_env("OPTIVOX_EVIDENCE_RETENTION_DAYS", 30)
 
 
 def frontend_origin_allowed(origin: str | None) -> bool:
@@ -76,6 +87,8 @@ def configuration_issues() -> list[str]:
         issues.append("production mode requires an administrator API key or administrator user.")
     if RUNTIME_MODE in {"pilot", "production"} and DEMO_MODE:
         issues.append("demo mode must be disabled in pilot and production modes.")
+    if RUNTIME_MODE in {"pilot", "production"} and not os.getenv("OPTIVOX_BIOMETRIC_KEY", "").strip():
+        issues.append("pilot and production modes require OPTIVOX_BIOMETRIC_KEY for encrypted local embeddings.")
 
     for origin in FRONTEND_ORIGINS:
         parsed = urlparse(origin)
@@ -146,3 +159,4 @@ COMMAND_RESULTS_PATH = runtime_path("command_results.json")
 ENROLLMENT_STATUS_PATH = runtime_path("enrollment_status.json")
 CAPABILITY_PATH = runtime_path("capability.json")
 PERFORMANCE_SUMMARY_PATH = runtime_path("performance_summary.json")
+HEALTH_EVENTS_PATH = runtime_path("health_events.jsonl")

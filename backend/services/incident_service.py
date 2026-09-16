@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import hashlib
 import json
-from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
 
+from ..config import PROJECT_ROOT, SNAPSHOTS_DIR
 from ..database import get_connection, fetch_all, fetch_one, execute
 from .audit_service import record_action
 from .event_service import event_category, normalize_event, severity_label
+from .storage_service import StorageSecurityError, safe_storage_path, sha256_file, verify_checksum
 
 
 def _severity(value: Any) -> int:
@@ -26,7 +26,7 @@ def sync_incidents() -> None:
             """
             select id, event_type, severity, timestamp, details_json,
                    entity_id, presence_session_id, camera_id, location,
-                   snapshot_path, source_frame_id
+                   snapshot_path, evidence_checksum, source_frame_id
             from events
             where coalesce(severity, 0) >= 1
                or upper(event_type) like '%SPOOF%'
@@ -82,18 +82,33 @@ def sync_incidents() -> None:
                 incident_id = cur.lastrowid
             con.execute("insert or ignore into incident_events (incident_id, event_id) values (?, ?)", [incident_id, event_id])
             if row["snapshot_path"]:
-                evidence_path = Path(str(row["snapshot_path"]))
+                raw_path = str(row["snapshot_path"])
                 checksum = None
+                status = "missing"
                 try:
-                    checksum = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
-                except OSError:
-                    pass
+                    # Runtime snapshots normally live under SNAPSHOTS_DIR. A
+                    # project-local absolute path remains ingestible for old
+                    # deployments and tests, but serving is still restricted
+                    # to SNAPSHOTS_DIR by event_service.snapshot_response.
+                    evidence_path = safe_storage_path(
+                        raw_path,
+                        roots=(SNAPSHOTS_DIR, PROJECT_ROOT),
+                        base=SNAPSHOTS_DIR,
+                    )
+                    if evidence_path.is_file():
+                        checksum = row["evidence_checksum"] or sha256_file(evidence_path)
+                        status = "available" if not row["evidence_checksum"] or verify_checksum(evidence_path, row["evidence_checksum"]) else "tampered"
+                    else:
+                        status = "missing"
+                except StorageSecurityError:
+                    evidence_path = None
+                    status = "invalid_path"
                 con.execute(
                     """insert or ignore into incident_evidence
                        (incident_id, event_id, path, evidence_type, source_frame_id, captured_at, checksum, status)
                        values (?, ?, ?, 'snapshot', ?, ?, ?, ?)""",
-                    [incident_id, event_id, str(evidence_path), row["source_frame_id"],
-                     row["timestamp"], checksum, "available" if evidence_path.exists() else "missing"],
+                    [incident_id, event_id, raw_path if evidence_path is None else str(evidence_path), row["source_frame_id"],
+                     row["timestamp"], checksum, status],
                 )
             # Alert delivery is recorded separately from the incident decision.
             # Match the runtime's alert log to the source observation by type and

@@ -9,7 +9,8 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
 
-from ..config import CAPABILITY_PATH, DEVICE_ID, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, PERFORMANCE_SUMMARY_PATH, TIMEZONE
+from deployment_security import watchdog_status
+from ..config import CAPABILITY_PATH, DEVICE_ID, HEALTH_EVENTS_PATH, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, PERFORMANCE_SUMMARY_PATH, TIMEZONE
 
 
 def now_iso() -> str:
@@ -23,6 +24,17 @@ def read_json(path: Path, default: Any = None) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return default
+
+
+def health_events(limit: int = 20) -> list[dict[str, Any]]:
+    """Read bounded edge health transitions without treating them as incidents."""
+    if not HEALTH_EVENTS_PATH.exists():
+        return []
+    try:
+        lines = HEALTH_EVENTS_PATH.read_text(encoding="utf-8").splitlines()[-max(1, int(limit)):]
+        return [json.loads(line) for line in lines if line.strip()]
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
 
 
 def heartbeat_state() -> dict[str, Any]:
@@ -43,7 +55,12 @@ def heartbeat_state() -> dict[str, Any]:
         status = "delayed"
     else:
         status = "offline"
-    return {"status": status, "age_seconds": age, "heartbeat": hb}
+    process = hb.get("process") or {}
+    pid = process.get("pid") or hb.get("pid")
+    watchdog = watchdog_status(int(pid)) if str(pid or "").isdigit() else {"pid_alive": None}
+    if status == "online" and watchdog.get("pid_alive") is False:
+        status = "offline"
+    return {"status": status, "age_seconds": age, "heartbeat": hb, "watchdog": watchdog}
 
 
 def capability_state() -> dict[str, Any]:
@@ -117,6 +134,7 @@ def live_state() -> dict[str, Any]:
         "visiblePeople": normalize_people(presence),
         "objects": normalize_objects(objects),
         "events": state.get("recent_events", []),
+        "healthEvents": health_events(),
     }
 
 

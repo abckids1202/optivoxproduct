@@ -1,22 +1,22 @@
+# Reviewed compatible edge baseline; install in a clean environment and run
+# pip check before promotion. Do not install arbitrary new versions.
 torch==2.2.2
 torchvision==0.17.2
 tensorflow==2.20.0
-
 opencv-python==4.10.0.84
 facenet-pytorch==2.6.0
-
 sentence-transformers==5.1.2
-
 numpy==1.26.4
 pandas==2.3.0
 scikit-learn==1.6.1
-
 fastapi==0.115.6
-uvicorn[standard]==0.32.1
+uvicorn==0.32.1
+pydantic==2.10.4
+pytest==8.3.4
+httpx==0.28.1
 cryptography==45.0.7
 python-multipart==0.0.19
 jinja2==3.1.6
-
 python-dotenv==1.0.1
 insightface==0.7.3
 onnxruntime==1.19.2

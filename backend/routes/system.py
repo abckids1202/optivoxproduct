@@ -4,6 +4,10 @@ from fastapi import APIRouter, Depends
 
 from ..services import command_service
 from ..services import system_service as svc
+from ..services.audit_service import integrity_report
+from ..services.audit_service import record_action
+from ..services.storage_service import backup_database, purge_expired_evidence
+from ..config import EVIDENCE_RETENTION_DAYS
 from ..security import require_permission
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -37,6 +41,25 @@ def alerts(actor: str = Depends(require_permission("system.view"))):
 @router.get("/performance")
 def performance(actor: str = Depends(require_permission("system.view"))):
     return svc.performance_report()
+
+
+@router.get("/audit-integrity")
+def audit_integrity(actor: str = Depends(require_permission("system.view"))):
+    return integrity_report()
+
+
+@router.post("/backup")
+def backup(actor: str = Depends(require_permission("system.manage"))):
+    result = backup_database()
+    record_action("storage.backup", "database", None, {"sha256": result["sha256"]}, actor_type="operator", actor_id=actor)
+    return {"ok": True, "filename": result["path"].split("\\")[-1], "sha256": result["sha256"]}
+
+
+@router.post("/purge-evidence")
+def purge_evidence(actor: str = Depends(require_permission("system.manage"))):
+    deleted = purge_expired_evidence(EVIDENCE_RETENTION_DAYS)
+    record_action("evidence.retention_purge", "evidence", None, {"deleted": deleted, "retention_days": EVIDENCE_RETENTION_DAYS}, actor_type="operator", actor_id=actor)
+    return {"ok": True, "deleted": deleted, "retention_days": EVIDENCE_RETENTION_DAYS}
 
 
 @router.post("/test-alert", dependencies=[Depends(require_permission("system.manage"))])

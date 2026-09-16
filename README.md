@@ -60,6 +60,50 @@ The scanner reports only file names, line numbers, and rule names. It does not
 print matched secret values. It is a local guardrail and does not replace a
 hosted secret-scanning service.
 
+Run the offline supply-chain checks and generate the two review artifacts with:
+
+```bat
+python supply_chain_scan.py
+python generate_sbom.py
+python generate_model_manifest.py
+```
+
+`requirements.txt` and `requirements.lock.txt` pin the reviewed edge baseline
+(`torch 2.2.x`/`torchvision 0.17.x` with NumPy 1.26 for the face pipeline),
+while `backend/requirements.txt` and
+`frontend/package-lock.json` are the reviewed dependency inputs. The model
+manifest is generated locally because model weights are intentionally ignored
+from Git. Before pilot or production startup, place trusted model files on the
+edge device, generate the manifest, and review its hashes. Pilot/production
+refuse to start when a configured model is missing, unlisted, or modified;
+they never allow Ultralytics to download a replacement silently. This is an
+integrity check, not proof that a model is safe, so obtain weights from a
+trusted source and record their provenance separately.
+
+InsightFace keeps its `buffalo_l` cache under `~/.insightface` by default. In
+strict modes that cache must also contain a local checksum manifest. Generate
+it after verifying the trusted files with:
+
+```bat
+python generate_model_manifest.py --root "%USERPROFILE%\.insightface\models\buffalo_l" --output model_checksums.json
+```
+
+Set `OPTIVOX_INSIGHTFACE_ROOT` if the cache is stored elsewhere. A missing or
+unverified face-model cache fails strict startup before `FaceAnalysis` can
+invoke its model-availability download path.
+
+Outbound webhooks are HTTPS-only in strict modes and must use the explicit
+`OPTIVOX_ALLOWED_WEBHOOK_HOSTS` allowlist. Local HTTP webhooks are supported
+only for development/exhibition. Camera sources may be a non-negative local
+camera index, a project-contained local video file, or an RTSP/RTSPS URL;
+arbitrary URL schemes and path traversal are rejected. Runtime camera health
+transitions are appended to `runtime/health_events.jsonl` and shown by the
+health API. Run the edge process with a dedicated OS account that can read
+models and camera devices, write only its runtime/data directories, and has no
+interactive administrator rights. Keep the database, embeddings, alert
+credentials, manifests, and backups outside source control and back them up
+with restricted filesystem permissions.
+
 ## Runtime Bridge
 
 The engine publishes:
@@ -128,6 +172,26 @@ configured. Before exposing the backend beyond the local machine, set
 `OPTIVOX_API_KEY` and, for CLI/edge administration, `OPTIVOX_ADMIN_KEY`.
 Browser access uses the authenticated session cookies; do not put an API key
 in the Vite build environment. Never commit real values.
+
+## Biometric and evidence storage
+
+Face embeddings are written to a versioned `face_db.secure.json` envelope
+instead of the legacy executable-object pickle. The envelope is checksum
+verified, written atomically, and uses AES-GCM when `OPTIVOX_BIOMETRIC_KEY` is
+set. The key is mandatory in pilot and production modes, but development and
+exhibition can use checksum-only compatibility storage. Generate and store
+the key outside the repository; losing it makes an encrypted face database unreadable. A legacy `face_db.pkl` is accepted only
+through a restricted one-time migration and is removed after the secure file
+is written. Raw embeddings are not returned by normal People API responses.
+
+Evidence is restricted to the local snapshots directory, checksummed when
+events are recorded, and rejected if a checksum changes. Database backups are
+created only through the protected System backup action and include a checksum
+manifest. Evidence cleanup uses `OPTIVOX_EVIDENCE_RETENTION_DAYS` and should
+be scheduled by the site operator after confirming the retention policy.
+Audit records in both SQLite adapters use a chained SHA-256 hash. The System
+page exposes the current chain-integrity result; a failure means the audit
+history requires investigation before it is trusted.
 
 Automatic attendance follows the configured school calendar. By default,
 Monday through Friday are school days. Override this for a pilot site with

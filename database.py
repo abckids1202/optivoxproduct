@@ -2,8 +2,11 @@ import sqlite3
 import json
 import os
 import threading
+import hashlib
 from datetime import datetime, timedelta
 import numpy as np
+from biometric_storage import decode_embedding_blob, encode_embedding_blob
+from schema_migrations import append_audit_record, ensure_schema_migrations, verify_audit_chain
 
 
 def _utc_now() -> str:
@@ -68,12 +71,15 @@ class EventDatabase:
                     action          TEXT    NOT NULL,
                     target          TEXT,
                     details_json    TEXT,
-                    timestamp       TEXT    NOT NULL
+                    timestamp       TEXT    NOT NULL,
+                    prev_hash       TEXT,
+                    record_hash     TEXT
                 )
             """)
 
             cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(timestamp)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)")
+            ensure_schema_migrations(self.conn)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS people (
@@ -94,6 +100,7 @@ class EventDatabase:
                     confidence    REAL,
                     details_json  TEXT,
                     snapshot_path TEXT,
+                    evidence_checksum TEXT,
                     camera_id     TEXT    DEFAULT 'cam_0',
                     location      TEXT,
                     severity      INTEGER DEFAULT 0,
@@ -186,6 +193,8 @@ class EventDatabase:
             
             if "severity" not in event_cols:
                 cur.execute("ALTER TABLE events ADD COLUMN severity INTEGER DEFAULT 0")
+            if "evidence_checksum" not in event_cols:
+                cur.execute("ALTER TABLE events ADD COLUMN evidence_checksum TEXT")
 
             # Check 'people' table columns
             cur.execute("PRAGMA table_info(people)")
@@ -210,7 +219,7 @@ class EventDatabase:
 
     def enroll_person(self, name: str, embedding: np.ndarray,
                       thumbnail_path: str = None) -> int:
-        emb_blob = np.asarray(embedding, dtype=np.float32).tobytes()
+        emb_blob = encode_embedding_blob(embedding)
         now = _utc_now()
 
         with self.lock:
@@ -239,17 +248,20 @@ class EventDatabase:
         faces = {}
         rows = self._fetchall("SELECT name, face_embedding FROM people")
         for row in rows:
-            faces[row["name"]] = np.frombuffer(
-                row["face_embedding"], dtype=np.float32
-            ).copy()
+            faces[row["name"]] = decode_embedding_blob(row["face_embedding"])
         return faces
 
     def log_audit(self, action: str, target: str = None, details: dict = None):
         with self.lock:
-            self.conn.execute(
-                "INSERT INTO audit_log (action, target, details_json, timestamp) "
-                "VALUES (?, ?, ?, ?)",
-                (action, target, json.dumps(details or {}), _utc_now())
+            append_audit_record(
+                self.conn,
+                "audit_log",
+                {
+                    "action": action,
+                    "target": target,
+                    "details_json": json.dumps(details or {}, sort_keys=True, default=str),
+                    "timestamp": _utc_now(),
+                },
             )
             self.conn.commit()
 
@@ -262,6 +274,10 @@ class EventDatabase:
         return self._fetchall(
             "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?", (limit,)
         )
+
+    def audit_integrity(self) -> dict:
+        with self.lock:
+            return verify_audit_chain(self.conn, "audit_log")
 
     def get_person_id(self, name: str):
         row = self._fetchone("SELECT id FROM people WHERE name = ?", (name,))
@@ -284,15 +300,26 @@ class EventDatabase:
         else:
             details_json = json.dumps({})
 
+        evidence_checksum = None
+        if snapshot_path:
+            try:
+                digest = hashlib.sha256()
+                with open(snapshot_path, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                evidence_checksum = digest.hexdigest()
+            except OSError:
+                pass
+
         with self.lock:
             self.conn.execute("""
                 INSERT INTO events (
                     person_id, event_type, confidence, details_json,
-                    snapshot_path, camera_id, location, severity, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    snapshot_path, evidence_checksum, camera_id, location, severity, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 person_id, event_type, confidence, details_json,
-                snapshot_path, camera_id, location, severity, _utc_now(),
+                snapshot_path, evidence_checksum, camera_id, location, severity, _utc_now(),
             ))
             self._update_daily_stats(event_type)
             self._update_hourly_stats(event_type)

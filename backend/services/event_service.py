@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
@@ -11,6 +10,7 @@ from ..config import SNAPSHOTS_DIR
 from ..database import fetch_all, fetch_one
 from ..database import execute
 from .audit_service import record_action
+from .storage_service import StorageSecurityError, safe_storage_path, verify_checksum
 
 
 def severity_label(value: Any) -> str:
@@ -159,18 +159,31 @@ def review_event(event_id: int, action: str, note: str | None = None, actor_id: 
 
 
 def snapshot_response(event_id: int) -> FileResponse:
-    row = fetch_one("select snapshot_path from events where id=?", [event_id])
+    row = fetch_one("select snapshot_path, evidence_checksum from events where id=?", [event_id])
     if not row:
         raise HTTPException(status_code=404, detail={"code": "EVENT_NOT_FOUND", "message": "Event was not found."})
     raw = row.get("snapshot_path")
     if not raw:
         raise HTTPException(status_code=404, detail={"code": "SNAPSHOT_NOT_FOUND", "message": "This event has no snapshot."})
-    path = Path(raw)
-    if not path.is_absolute():
-        path = SNAPSHOTS_DIR / path
-    path = path.resolve()
-    if SNAPSHOTS_DIR not in path.parents and path.parent != SNAPSHOTS_DIR:
+    try:
+        path = safe_storage_path(raw, base=SNAPSHOTS_DIR)
+    except StorageSecurityError:
         raise HTTPException(status_code=400, detail={"code": "INVALID_SNAPSHOT_PATH", "message": "Snapshot path is outside the allowed directory."})
-    if not path.exists():
+    if not path.is_file():
         raise HTTPException(status_code=404, detail={"code": "SNAPSHOT_NOT_FOUND", "message": "Snapshot file is missing."})
+    expected = row.get("evidence_checksum")
+    if not expected:
+        linked = fetch_one(
+            "select checksum from incident_evidence where event_id=? and evidence_type='snapshot' order by id desc limit 1",
+            [event_id],
+        )
+        expected = linked.get("checksum") if linked else None
+    record_action("evidence.access", "event", event_id, {"result": "requested"}, actor_type="system")
+    if expected and not verify_checksum(path, expected):
+        execute(
+            "update incident_evidence set status='tampered' where event_id=? and evidence_type='snapshot'",
+            [event_id],
+        )
+        record_action("evidence.integrity_failure", "event", event_id, {"result": "checksum_mismatch"}, actor_type="system")
+        raise HTTPException(status_code=409, detail={"code": "EVIDENCE_CHECKSUM_MISMATCH", "message": "Evidence integrity validation failed."})
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})

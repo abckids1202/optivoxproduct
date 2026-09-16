@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .database import get_connection
+from schema_migrations import ensure_schema_migrations
 
 
 def ensure_platform_schema() -> None:
@@ -31,6 +32,7 @@ def ensure_platform_schema() -> None:
                 confidence real,
                 details_json text,
                 snapshot_path text,
+                evidence_checksum text,
                 camera_id text default 'cam_0',
                 location text,
                 severity integer default 0,
@@ -252,7 +254,9 @@ def ensure_platform_schema() -> None:
                 actor_type text not null default 'system',
                 actor_id text,
                 details_json text,
-                created_at text not null default (datetime('now'))
+                created_at text not null default (datetime('now')),
+                prev_hash text,
+                record_hash text
             );
             create index if not exists idx_platform_audit_time
                 on platform_audit_log(created_at);
@@ -414,4 +418,8 @@ def ensure_platform_schema() -> None:
         ):
             if name not in session_columns:
                 con.execute(f"alter table platform_sessions add column {name} {definition}")
+        event_columns = {row["name"] for row in con.execute("pragma table_info(events)").fetchall()}
+        if "evidence_checksum" not in event_columns:
+            con.execute("alter table events add column evidence_checksum text")
+        ensure_schema_migrations(con)
         con.commit()
