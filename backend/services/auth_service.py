@@ -90,7 +90,14 @@ def login(username: str, password: str, client_ip: str | None = None, user_agent
             if locked_until.tzinfo is None:
                 locked_until = locked_until.replace(tzinfo=timezone.utc)
             if locked_until > now:
-                record_action("auth.login.locked", "user", row.get("id"), {"username": username}, actor_type="system", actor_id=username)
+                record_action("auth.login.locked", "user", row.get("id"), {"username": username, "client_ip": (client_ip or "")[:128], "user_agent": (user_agent or "")[:300]}, actor_type="system", actor_id=username)
+                from .cybersecurity_service import record_cyber_event
+                record_cyber_event(
+                    "FAILED_LOGIN_BURST", source="authentication", actor_id=username,
+                    actor_type="system", ip_address=client_ip, user_agent=user_agent,
+                    details={"username": username, "reason": "account_lockout"},
+                    dedupe_key=f"failed-login-lockout:{username}:{client_ip or 'unknown'}:{now.strftime('%Y%m%d%H%M')}",
+                )
                 raise HTTPException(status_code=429, detail={"code": "ACCOUNT_TEMPORARILY_LOCKED", "message": "Account temporarily locked. Try again later."})
         except ValueError:
             pass
@@ -105,7 +112,18 @@ def login(username: str, password: str, client_ip: str | None = None, user_agent
                 "update platform_users set failed_login_count=?, locked_until=?, updated_at=? where id=?",
                 [failed, locked_until, now.isoformat(), row["id"]],
             )
-        record_action("auth.login.failure", "user", row.get("id") if row else None, {"username": username}, actor_type="system", actor_id=username)
+        record_action("auth.login.failure", "user", row.get("id") if row else None, {"username": username, "client_ip": (client_ip or "")[:128], "user_agent": (user_agent or "")[:300]}, actor_type="system", actor_id=username)
+        recent_failures = fetch_one(
+            "select count(*) as count from platform_audit_log where action='auth.login.failure' and created_at >= datetime('now', '-5 minutes')",
+        )
+        if int((recent_failures or {}).get("count") or 0) >= 5 or (row and failed >= _LOCKOUT_THRESHOLD):
+            from .cybersecurity_service import record_cyber_event
+            record_cyber_event(
+                "FAILED_LOGIN_BURST", source="authentication", actor_id=username,
+                actor_type="system", ip_address=client_ip, user_agent=user_agent,
+                details={"username": username, "failure_count": int((recent_failures or {}).get("count") or 0)},
+                dedupe_key=f"failed-login-burst:{client_ip or 'unknown'}:{now.strftime('%Y%m%d%H%M')}",
+            )
         raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "Username or password is incorrect."})
 
     # Re-authentication rotates the session family by revoking prior tokens.
@@ -121,7 +139,7 @@ def login(username: str, password: str, client_ip: str | None = None, user_agent
         "update platform_users set failed_login_count=0, locked_until=null, last_login_at=?, last_login_ip=?, updated_at=? where id=?",
         [now.isoformat(), (client_ip or "")[:128], now.isoformat(), row["id"]],
     )
-    record_action("auth.login.success", "user", row["id"], {"username": row["username"]}, actor_type="user", actor_id=row["username"])
+    record_action("auth.login.success", "user", row["id"], {"username": row["username"], "client_ip": (client_ip or "")[:128], "user_agent": (user_agent or "")[:300]}, actor_type="user", actor_id=row["username"])
     return {
         "access_token": token,
         "csrf_token": csrf_token,
@@ -146,6 +164,22 @@ def resolve_session(token: str | None) -> dict[str, Any] | None:
         return None
     execute("update platform_sessions set last_seen_at=? where token_hash=?", [_now().isoformat(), row["token_hash"]])
     return {"id": row["user_id"], "username": row["username"], "role": row["role"]}
+
+
+def session_status(token: str | None) -> str:
+    """Return a non-secret reason for a failed session lookup."""
+    if not token:
+        return "missing"
+    row = fetch_one("select expires_at from platform_sessions where token_hash=?", [_token_hash(token)])
+    if not row:
+        return "invalid_or_revoked"
+    try:
+        expires = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return "expired" if expires <= _now() else "inactive"
+    except (TypeError, ValueError):
+        return "invalid_or_revoked"
 
 
 def logout(token: str | None) -> None:

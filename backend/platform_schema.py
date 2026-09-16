@@ -400,6 +400,91 @@ def ensure_platform_schema() -> None:
             create index if not exists idx_session_expiry on platform_sessions(expires_at);
             """
         )
+        # Application-security telemetry is intentionally separate from the
+        # physical-vision incident tables above. Cyber events describe attacks
+        # or failures of the application, edge device, or its trust boundary.
+        con.executescript(
+            """
+            create table if not exists cybersecurity_events (
+                id integer primary key autoincrement,
+                correlation_id text not null unique,
+                dedupe_key text unique,
+                event_type text not null,
+                category text not null,
+                severity integer not null default 1,
+                source text not null,
+                actor_id text,
+                actor_type text,
+                device_id text,
+                ip_address text,
+                user_agent text,
+                occurred_at text not null,
+                details_json text,
+                evidence_ref text,
+                status text not null default 'open',
+                incident_id integer,
+                created_at text not null default (datetime('now')),
+                foreign key(incident_id) references cybersecurity_incidents(id) on delete set null
+            );
+            create table if not exists cybersecurity_incidents (
+                id integer primary key autoincrement,
+                correlation_key text not null unique,
+                category text not null,
+                severity integer not null default 1,
+                summary text not null,
+                source text not null,
+                actor_id text,
+                device_id text,
+                ip_address text,
+                user_agent text,
+                first_event_at text not null,
+                last_event_at text not null,
+                status text not null default 'open',
+                assigned_to text,
+                resolution_note text,
+                resolved_at text,
+                resolved_by text,
+                created_at text not null default (datetime('now')),
+                updated_at text not null default (datetime('now'))
+            );
+            create table if not exists cybersecurity_incident_events (
+                incident_id integer not null,
+                cyber_event_id integer not null unique,
+                created_at text not null default (datetime('now')),
+                primary key (incident_id, cyber_event_id),
+                foreign key(incident_id) references cybersecurity_incidents(id) on delete cascade,
+                foreign key(cyber_event_id) references cybersecurity_events(id) on delete cascade
+            );
+            create table if not exists cybersecurity_incident_alerts (
+                id integer primary key autoincrement,
+                incident_id integer not null,
+                channel text not null,
+                status text not null,
+                correlation_id text,
+                attempted_at text not null default (datetime('now')),
+                delivered_at text,
+                error text,
+                attempt_count integer not null default 1,
+                foreign key(incident_id) references cybersecurity_incidents(id) on delete cascade
+            );
+            create table if not exists cybersecurity_reviews (
+                id integer primary key autoincrement,
+                incident_id integer not null,
+                action text not null,
+                note text,
+                actor_id text,
+                created_at text not null default (datetime('now')),
+                foreign key(incident_id) references cybersecurity_incidents(id) on delete cascade
+            );
+            create index if not exists idx_cyber_events_time on cybersecurity_events(occurred_at);
+            create index if not exists idx_cyber_events_type on cybersecurity_events(event_type, occurred_at);
+            create index if not exists idx_cyber_events_incident on cybersecurity_events(incident_id);
+            create index if not exists idx_cyber_incidents_status on cybersecurity_incidents(status, updated_at);
+            create index if not exists idx_cyber_incidents_category on cybersecurity_incidents(category, last_event_at);
+            create index if not exists idx_cyber_alerts_status on cybersecurity_incident_alerts(status, attempted_at);
+            create index if not exists idx_cyber_reviews_incident on cybersecurity_reviews(incident_id, created_at);
+            """
+        )
         user_columns = {row["name"] for row in con.execute("pragma table_info(platform_users)").fetchall()}
         for name, definition in (
             ("failed_login_count", "integer not null default 0"),

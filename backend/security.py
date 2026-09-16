@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 from fastapi import Header, HTTPException, Request, WebSocket, WebSocketException, status
 
 from .config import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME, configured_auth_methods, frontend_origin_allowed, loopback_bypass_allowed
-from .services.auth_service import resolve_session
+from .services.auth_service import resolve_session, session_status
 
 
 _RATE_LIMIT = 120
@@ -67,6 +67,46 @@ def _require_permission(role: str, permission: str | None) -> None:
         raise HTTPException(status_code=403, detail={"code": "PERMISSION_REQUIRED", "message": f"Permission required: {permission}."})
 
 
+def _record_cyber_event(event_type: str, request: Request, *, actor_id: str | None = None,
+                        actor_type: str | None = None, details: dict | None = None,
+                        dedupe_key: str | None = None) -> None:
+    """Security telemetry must never make the protected request fail open/closed."""
+    try:
+        from .services.cybersecurity_service import record_cyber_event
+        record_cyber_event(
+            event_type,
+            source="authorization" if event_type != "EXPIRED_TOKEN" else "authentication",
+            actor_id=actor_id,
+            actor_type=actor_type or "system",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"method": request.method, "path": request.url.path, **(details or {})},
+            dedupe_key=dedupe_key,
+        )
+    except Exception:
+        # Observability must not become an authentication bypass or an outage.
+        return
+
+
+def _record_websocket_event(event_type: str, websocket: WebSocket, *, actor_id: str | None = None,
+                            actor_type: str | None = None, details: dict | None = None) -> None:
+    try:
+        from .services.cybersecurity_service import record_cyber_event
+        host = websocket.client.host if websocket.client else None
+        record_cyber_event(
+            event_type,
+            source="websocket",
+            actor_id=actor_id,
+            actor_type=actor_type or "system",
+            ip_address=host,
+            user_agent=websocket.headers.get("user-agent"),
+            details={"path": websocket.url.path, **(details or {})},
+            dedupe_key=f"websocket:{event_type}:{host or 'unknown'}:{websocket.url.path}:{int(time.time() // 60)}",
+        )
+    except Exception:
+        return
+
+
 def _validate_csrf(request: Request, cookie_auth: bool) -> None:
     if not cookie_auth or request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
         return
@@ -97,14 +137,32 @@ def _guard(request: Request, x_optivox_key: str | None, authorization: str | Non
     session = resolve_session(supplied)
     if session:
         _validate_csrf(request, cookie_auth)
-        _require_permission(str(session.get("role") or ""), required_permission or ("system.admin" if admin else None))
+        permission = required_permission or ("system.admin" if admin else None)
+        if permission and not has_permission(str(session.get("role") or ""), permission):
+            _record_cyber_event(
+                "UNAUTHORIZED_COMMAND" if request.url.path.rstrip("/") == "/api/commands" else "WRONG_ROLE_ACCESS",
+                request,
+                actor_id=str(session.get("id") or session.get("username") or "unknown"),
+                actor_type="user",
+                details={"username": session.get("username"), "role": session.get("role"), "required_permission": permission},
+                dedupe_key=f"wrong-role:{session.get('id')}:{request.url.path}:{permission}:{int(time.time() // 60)}",
+            )
+            _require_permission(str(session.get("role") or ""), permission)
         return str(session.get("username") or "session-user")
+    if supplied and session_status(supplied) == "expired":
+        _record_cyber_event(
+            "EXPIRED_TOKEN", request,
+            details={"credential_type": "session_cookie" if cookie_auth else "authorization_header"},
+            dedupe_key=f"expired-token:{request.client.host if request.client else 'unknown'}:{request.url.path}:{int(time.time() // 60)}",
+        )
     # An operator key must never grant administrator access just because a
     # separate administrator key was omitted. Durable admin users remain a
     # supported alternative through the session branch above.
     expected = admin_key if admin else (operator_key or admin_key)
     if expected:
         if not supplied or not hmac.compare_digest(supplied, expected):
+            if request.url.path.rstrip("/") == "/api/commands":
+                _record_cyber_event("UNAUTHORIZED_COMMAND", request, details={"credential_type": "api_key"})
             raise HTTPException(status_code=401, detail={"code": "INVALID_API_KEY", "message": "A valid OptiVox API key is required."})
         role = "system-admin" if admin or (admin_key and hmac.compare_digest(supplied, admin_key)) else "operator"
         _require_permission(role, required_permission or ("system.admin" if admin else None))
@@ -179,10 +237,18 @@ def require_websocket_operator(websocket: WebSocket) -> str:
     session = resolve_session(supplied)
     if session:
         if not has_permission(str(session.get("role") or ""), "live.view"):
+            _record_websocket_event(
+                "WRONG_ROLE_ACCESS", websocket,
+                actor_id=str(session.get("id") or session.get("username") or "unknown"),
+                actor_type="user", details={"username": session.get("username"), "role": session.get("role"), "required_permission": "live.view"},
+            )
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
         return str(session.get("username") or "session-user")
+    if supplied and session_status(supplied) == "expired":
+        _record_websocket_event("EXPIRED_TOKEN", websocket, details={"credential_type": "session_cookie"})
     expected = operator_key or admin_key
     if expected and (not supplied or not hmac.compare_digest(supplied, expected)):
+        _record_websocket_event("WRONG_ROLE_ACCESS", websocket, details={"credential_type": "api_key"})
         raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
     if not expected:
         if not loopback_bypass_allowed():

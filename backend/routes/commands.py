@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Header, Request
 from pydantic import BaseModel, Field
 
 from ..services import command_service as svc
+from ..services.cybersecurity_service import record_cyber_event
 from ..security import require_permission
 
 router = APIRouter(prefix="/api", tags=["commands"])
@@ -23,6 +24,21 @@ def command(req: CommandRequest, request: Request,
     permission = svc.COMMAND_PERMISSIONS.get(req.command)
     if permission:
         actor = require_permission(permission)(request, x_optivox_key, authorization)
+    event_type = None
+    if req.command in {"start_enrollment", "confirm_enrollment", "register_visible_unknown", "cancel_enrollment", "retrain_person", "disable_person", "merge_people", "delete_person"}:
+        event_type = "BIOMETRIC_CHANGE"
+    elif req.command == "reset_demo_data":
+        event_type = "CONFIGURATION_CHANGE"
+    if event_type:
+        record_cyber_event(
+            event_type,
+            source="command_api",
+            actor_id=actor,
+            actor_type="user" if not actor.startswith("api-key-") and not actor.startswith("local-") else "system",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"command": req.command, "payload_keys": sorted(req.payload.keys())},
+        )
     payload = {**req.payload, "actor_id": actor}
     return svc.create_command(req.command, payload, idempotency_key=idempotency_key)
 

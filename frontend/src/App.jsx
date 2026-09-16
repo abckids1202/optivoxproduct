@@ -7,6 +7,7 @@ import Attendance from "./pages/Attendance";
 import Overview from "./pages/Overview";
 import People from "./pages/People";
 import Security from "./pages/Security";
+import CyberSecurity from "./pages/CyberSecurity";
 import System from "./pages/System";
 import { logout } from "./services/api";
 import { useState } from "react";
@@ -44,6 +45,7 @@ export default function App() {
       {activePage === "overview" && <Overview state={state} connection={connection} onNavigate={setActivePage} />}
       {activePage === "attendance" && <Attendance state={state} />}
       {activePage === "security" && <Security state={state} />}
+      {activePage === "cybersecurity" && <CyberSecurity state={state} />}
       {activePage === "people" && <People state={state} />}
       {activePage === "analytics" && <Analytics state={state} />}
       {activePage === "system" && <System state={state} connection={connection} />}

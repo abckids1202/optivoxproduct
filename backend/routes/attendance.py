@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from ..services import attendance_service as svc
 from ..security import require_permission
+from ..services.cybersecurity_service import record_cyber_event
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"])
 
@@ -55,7 +56,16 @@ def absences(person_id: int | None = None, start: str | None = None, end: str | 
 
 
 @router.get("/export")
-def export(actor: str = Depends(require_permission("attendance.export"))):
+def export(request: Request, actor: str = Depends(require_permission("attendance.export"))):
+    record_cyber_event(
+        "BULK_EXPORT",
+        source="attendance_api",
+        actor_id=actor,
+        actor_type="user" if not actor.startswith("api-key-") and not actor.startswith("local-") else "system",
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        details={"resource": "attendance", "format": "csv", "limit": 1000},
+    )
     return svc.export_csv()
 
 

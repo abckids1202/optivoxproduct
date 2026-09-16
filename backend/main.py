@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import FRONTEND_ORIGINS, RUNTIME_MODE, validate_runtime_configuration
 from .platform_schema import ensure_platform_schema
-from .routes import academic, analytics, attendance, auth, commands, events, health, incidents, live, operations, people, system
+from .routes import academic, analytics, attendance, auth, commands, cybersecurity, events, health, incidents, live, operations, people, system
 from .services.auth_service import bootstrap_configured_users
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -73,5 +73,6 @@ for router in [
     commands.router,
     system.router,
     academic.router,
+    cybersecurity.router,
 ]:
     app.include_router(router)

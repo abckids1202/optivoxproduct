@@ -265,6 +265,72 @@ export async function fetchAnalytics() {
   return { ...attendance, ...security, ...objects };
 }
 
+export async function fetchCyberSummary() {
+  if (USE_DEMO_DATA) return { incidentTotal: 0, openIncidents: 0, eventTotal: 0, statusCounts: [], categories: [], eventTypes: [], physicalEventsSeparate: true };
+  return getJson("/api/cybersecurity/summary");
+}
+
+export async function fetchCyberIncidents(filters = {}) {
+  if (USE_DEMO_DATA) return [];
+  const params = new URLSearchParams();
+  if (filters.status && filters.status !== "all") params.set("status", filters.status);
+  if (filters.category && filters.category !== "all") params.set("category", filters.category);
+  if (filters.severity && filters.severity !== "all") params.set("severity", filters.severity);
+  params.set("limit", "100");
+  return getJson(`/api/cybersecurity/incidents?${params.toString()}`);
+}
+
+export async function fetchCyberIncident(incidentId) {
+  return getJson(`/api/cybersecurity/incidents/${incidentId}`);
+}
+
+export async function reviewCyberIncident(incidentId, action, note = "") {
+  const response = await fetch(`${API_BASE}/api/cybersecurity/incidents/${incidentId}/review`, {
+    method: "POST",
+    headers: requestHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
+    body: JSON.stringify({ action, note }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+export async function assignCyberIncident(incidentId, assignee) {
+  const response = await fetch(`${API_BASE}/api/cybersecurity/incidents/${incidentId}/assign`, {
+    method: "POST",
+    headers: requestHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
+    body: JSON.stringify({ assignee }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+export async function fetchCyberSessions() {
+  if (USE_DEMO_DATA) return [];
+  return getJson("/api/cybersecurity/sessions");
+}
+
+export async function fetchCyberAuthHistory() {
+  if (USE_DEMO_DATA) return [];
+  return getJson("/api/cybersecurity/auth-history?limit=100");
+}
+
+export async function fetchCyberAdminHistory() {
+  if (USE_DEMO_DATA) return [];
+  return getJson("/api/cybersecurity/admin-history?limit=100");
+}
+
+export async function fetchCyberIntegrityFailures() {
+  if (USE_DEMO_DATA) return [];
+  return getJson("/api/cybersecurity/integrity?limit=100");
+}
+
+export async function fetchCyberAlertFailures() {
+  if (USE_DEMO_DATA) return [];
+  return getJson("/api/cybersecurity/alert-failures?limit=100");
+}
+
 function getDemoCalendar(year, month) {
   const days = Array.from({ length: new Date(year, month, 0).getDate() }, (_, index) => `${year}-${String(month).padStart(2, "0")}-${String(index + 1).padStart(2, "0")}`);
   return { year, month, days, people: peopleForCalendar(days) };
