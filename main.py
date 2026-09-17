@@ -34,6 +34,7 @@ from core.entities import normalize_identity_state
 from core.face_augmentation import generate_variants
 from core.security import SecuritySignalEngine
 from core.liveness import LivenessChallenge
+from core.assistant_policy import assistant_tool_allowed
 from biometric_storage import BiometricStorageError, load_face_database, save_face_database
 from deployment_security import (
     CameraHealthMonitor,
@@ -3013,13 +3014,15 @@ class AntiSpoofDetector:
         self.depth = DepthEstimator(self._root_cfg)
         self._frames_seen = 0
         self._global_state = {"frames_seen": 0}
-        self._track_states: OrderedDict[int, dict] = OrderedDict()
+        self._track_states: OrderedDict[str, dict] = OrderedDict()
+        self._track_scopes: Dict[int, str] = {}
 
     def _state_for_track(self, track_id):
         if track_id is None or int(track_id) <= 0:
             return self._global_state, self.blink, self.pose, self.depth
         track_id = int(track_id)
-        state = self._track_states.get(track_id)
+        scope = self._track_scopes.get(track_id, f"track:{track_id}")
+        state = self._track_states.get(scope)
         if state is None:
             state = {
                 "frames_seen": 0,
@@ -3027,16 +3030,50 @@ class AntiSpoofDetector:
                 "pose": HeadPoseEstimator(self._root_cfg),
                 "depth": DepthEstimator(self._root_cfg),
             }
-            self._track_states[track_id] = state
-        self._track_states.move_to_end(track_id)
+            self._track_states[scope] = state
+        self._track_states.move_to_end(scope)
         while len(self._track_states) > 256:
             self._track_states.popitem(last=False)
         return state, state["blink"], state["pose"], state["depth"]
 
+    def bind_track_entity(self, track_id, entity_id, track_generation=1) -> None:
+        """Bind anti-spoof history to the correlation entity generation.
+
+        A tracker ID can be reused. When its correlated entity changes, the
+        old liveness history is discarded so a new person cannot inherit a
+        previous person's blink, pose, or depth evidence.
+        """
+        try:
+            track_id = int(track_id)
+        except (TypeError, ValueError):
+            return
+        if track_id <= 0 or not entity_id:
+            return
+        scope = f"{entity_id}:generation:{int(track_generation or 1)}"
+        previous = self._track_scopes.get(track_id)
+        if previous and previous != scope:
+            self._track_states.pop(previous, None)
+        elif previous is None:
+            # Preserve the first frame's warmup evidence when the entity is
+            # bound after correlation, while removing the temporary scope.
+            unbound = self._track_states.pop(f"track:{track_id}", None)
+            if unbound is not None:
+                self._track_states[scope] = unbound
+        self._track_scopes[track_id] = scope
+
+    def liveness_scope(self, track_id) -> Optional[str]:
+        try:
+            return self._track_scopes.get(int(track_id))
+        except (TypeError, ValueError):
+            return None
+
     def forget_track(self, track_id) -> None:
         """Drop liveness history when a tracker identity is closed or reused."""
         try:
-            self._track_states.pop(int(track_id), None)
+            track_id = int(track_id)
+            scope = self._track_scopes.pop(track_id, None)
+            self._track_states.pop(scope, None)
+            self._track_states.pop(f"track:{track_id}", None)
         except (TypeError, ValueError):
             return
 
@@ -3447,6 +3484,7 @@ class VisionSystem:
         self._last_object_observation_wallclock = None
         self._last_danger_detections = []
         self._recognition_cache: Dict[int, dict] = {}
+        self._track_generations_seen: Dict[int, int] = {}
         self._spoof_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=self.cfg["ANTI_SPOOFING"].get("SUSPECT_WINDOW_FRAMES", 8)))
         self._event_cooldown = EventCooldown()
         self._stranger_gallery: Dict[str, dict] = {}
@@ -5311,6 +5349,35 @@ class VisionSystem:
             for entity in correlation_state.get("entities", [])
             if entity.get("track_id") is not None
         }
+        for entity in correlation_state.get("entities", []):
+            # Move anti-spoof history onto the stable entity generation. A
+            # reused tracker ID therefore starts with clean liveness state.
+            try:
+                track_id = int(entity.get("track_id"))
+                generation = int(entity.get("track_generation", 1))
+            except (TypeError, ValueError):
+                track_id = None
+                generation = 1
+            previous_generation = (
+                self._track_generations_seen.get(track_id)
+                if track_id is not None else None
+            )
+            if (track_id is not None and previous_generation is not None
+                    and previous_generation != generation):
+                # The correlation layer detected a tracker reuse/switch. Do
+                # not let recognition, spoof, stranger, or timing history
+                # leak into the new entity generation.
+                self._recognition_cache.pop(track_id, None)
+                self._spoof_history.pop(track_id, None)
+                self._face_recog_history.pop(track_id, None)
+                self._identity_started_at.pop(track_id, None)
+                self._identity_timing.pop(track_id, None)
+                self._last_evidence_at.pop(track_id, None)
+            if track_id is not None:
+                self._track_generations_seen[track_id] = generation
+            self.anti_spoof.bind_track_entity(
+                entity.get("track_id"), entity.get("entity_id"),
+                entity.get("track_generation", 1))
 
         # The correlation reducer is the decision boundary. Model output can
         # still be shown for diagnostics, but downstream attendance must use
@@ -5821,6 +5888,9 @@ def _build_system_prompt() -> str:
         " - For security events, lead with severity.\n"
         " - If user asks about someone, fetch their events AND attendance.\n"
         " - Never invent data. If a tool returns nothing, say so.\n"
+        " - You are a read-only copilot. You may summarize evidence and suggest next steps, but you cannot confirm identity, create or alter official attendance, dismiss or resolve incidents, delete or merge biometric records, retrain identities, or change permissions.\n"
+        " - Never treat an AI suggestion as authorization. Sensitive actions require the authenticated operator workflow and an audit record.\n"
+        " - Unknown, unresolved, and spoof-suspect people are not dangerous merely because recognition failed.\n"
         f"Current UTC time: {_utc_datetime().strftime('%Y-%m-%d %H:%M')}\n"
     )
 
@@ -6183,6 +6253,12 @@ class AIAssistant:
         return "Demo mode (no OpenAI key). Try: status, enrolled, events, attendance."
 
     def _execute_tool(self, name: str, args: dict) -> str:
+        if not assistant_tool_allowed(name):
+            return json.dumps({
+                "error": "assistant_tool_not_allowed",
+                "reason": "read_only_assistant",
+                "message": "The assistant can only query information. Use an authenticated operator workflow for changes.",
+            })
         try:
             fn = {
                 "get_system_status":           self._tool_status,
@@ -6949,7 +7025,11 @@ def _publish_runtime_state(
     height, width = display.shape[:2] if display is not None else (None, None)
     security_level = (
         "critical" if any(e.get("severity") == "Critical" for e in active_events)
-        else ("attention" if unknown or active_events else "normal")
+        else ("attention" if active_events else "normal")
+    )
+    identity_message = (
+        "Identity unresolved; attendance blocked. Unknown is not danger."
+        if unknown else None
     )
     _atomic_json_write(os.path.join(runtime_dir, "live_state.json"), {
         "schema_version": 1,
@@ -6977,10 +7057,12 @@ def _publish_runtime_state(
         },
         "security": {
             "level": security_level,
-            "message": "Unknown person detected" if unknown else (
-                "Security event active" if active_events else "No active warning"
+            "message": "Security event active" if active_events else (
+                identity_message or "No active warning"
             ),
             "active_event_count": len(active_events),
+            "identity_unresolved_count": len(unknown),
+            "unknown_is_not_dangerous": True,
         },
         "presence": {"registered": registered, "unknown": unknown},
         "correlation": getattr(vision, "_last_correlation_state", {}),
@@ -6997,6 +7079,26 @@ def _publish_runtime_frame(runtime_dir: str, display, quality: int = 78):
     final = os.path.join(runtime_dir, "latest_frame.jpg")
     if cv2.imwrite(tmp, display, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]):
         os.replace(tmp, final)
+
+
+def _publish_liveness_metrics(runtime_dir: str, challenge, center_state=None):
+    """Persist labelled liveness telemetry without storing biometric data."""
+    state = center_state or {}
+    _atomic_json_write(os.path.join(runtime_dir, "liveness_metrics.json"), {
+        "schema_version": 1,
+        "generated_at": _runtime_now(),
+        "scope": "entity_scoped_center_attendance",
+        "status": state.get("liveness_status", "NOT_EVALUATED"),
+        "phase": state.get("liveness_phase", "CENTER"),
+        "attempts": state.get("liveness_attempts", 0),
+        "challenge": {
+            "enabled": bool(state.get("enabled", False)),
+            "candidate": state.get("candidate"),
+            "progress": state.get("progress", 0.0),
+        },
+        "metrics": challenge.metrics_snapshot(),
+        "limitation": "False accept/reject values require labelled replay or camera evaluation; unlabelled runtime frames are not counted as ground truth.",
+    })
 
 
 def _publish_performance_summary(runtime_dir, profiler, vision, started_at,
@@ -8233,6 +8335,10 @@ def main():
             "progress": 0.0,
             "completed_name": None,
             "liveness_phase": "CENTER",
+            "liveness_status": "NOT_EVALUATED",
+            "liveness_attempts": 0,
+            "liveness_timeout_count": 0,
+            "liveness_failure_count": 0,
             "liveness_started_at": None,
             "liveness_hold_started_at": None,
             "liveness_passed": False,
@@ -8290,6 +8396,10 @@ def main():
             "progress": 0.0,
             "completed_name": None,
             "liveness_phase": "CENTER",
+            "liveness_status": "NOT_EVALUATED",
+            "liveness_attempts": 0,
+            "liveness_timeout_count": 0,
+            "liveness_failure_count": 0,
             "liveness_started_at": None,
             "liveness_hold_started_at": None,
             "liveness_passed": False,
@@ -8339,6 +8449,10 @@ def main():
                 "started_at": None,
                 "progress": 0.0,
                 "liveness_phase": "CENTER",
+                "liveness_status": "NOT_EVALUATED",
+                "liveness_attempts": 0,
+                "liveness_timeout_count": 0,
+                "liveness_failure_count": 0,
                 "liveness_started_at": None,
                 "liveness_hold_started_at": None,
                 "liveness_passed": False,
@@ -8365,6 +8479,10 @@ def main():
                 "stable_frames": 1,
                 "started_at": now,
                 "liveness_phase": "CENTER",
+                "liveness_status": "NOT_EVALUATED",
+                "liveness_attempts": 0,
+                "liveness_timeout_count": 0,
+                "liveness_failure_count": 0,
                 "liveness_started_at": now,
                 "liveness_hold_started_at": None,
                 "liveness_passed": not cfg.get("CENTER_MODE_REQUIRE_LIVENESS", True),
@@ -8380,11 +8498,16 @@ def main():
             challenge_key, face.get("yaw"), now, enabled=require_liveness)
         state.update({
             "liveness_phase": challenge.get("phase", "CENTER"),
+            "liveness_status": challenge.get("status", "UNCERTAIN"),
+            "liveness_attempts": challenge.get("attempt_number", 0),
+            "liveness_timeout_count": challenge.get("timeout_count", 0),
+            "liveness_failure_count": challenge.get("failure_count", 0),
             "liveness_started_at": challenge.get("started_at"),
             "liveness_hold_started_at": challenge.get("hold_started_at"),
             "liveness_passed": bool(challenge.get("passed")),
             "liveness_first_turn": challenge.get("first_turn_sign"),
             "liveness_yaw": challenge.get("yaw"),
+            "liveness_metrics": liveness_challenge.metrics_snapshot(),
         })
         if require_liveness and not challenge.get("passed"):
             state["status"] = challenge.get("message", "Complete the liveness challenge.")
@@ -8691,6 +8814,7 @@ def main():
     last_raw_frame = None
     latest_result = None
     latest_result_id = 0
+    last_liveness_publish = 0.0
 
     try:
         while True:
@@ -8704,6 +8828,13 @@ def main():
                 latest_result_id = result.get("frame_id") or latest_result_id
                 with attendance_lock:
                     update_center_attendance(result.get("faces_info") or [])
+
+            if time.time() - last_liveness_publish >= 1.0:
+                with attendance_lock:
+                    _publish_liveness_metrics(
+                        runtime_dir, liveness_challenge,
+                        ui.get("center_attendance", {}))
+                last_liveness_publish = time.time()
 
             if latest_result:
                 display = latest_result["display"].copy()

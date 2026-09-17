@@ -56,8 +56,22 @@ _COMMAND_LOCK = threading.Lock()
 
 def atomic_write(path: Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        # Do not turn a full/unavailable disk into a misleading successful
+        # command submission, and do not leave a partial command artifact.
+        raise HTTPException(
+            status_code=507,
+            detail={"code": "COMMAND_STORAGE_UNAVAILABLE", "message": "The local command queue cannot be written."},
+        ) from exc
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def read_list(path: Path) -> list[dict[str, Any]]:

@@ -121,6 +121,7 @@ class CorrelationCore:
                     "lifecycle_state": entity.lifecycle_state.value,
                     "identity_state": identity.state,
                     "confirmed_name": identity.confirmed_name,
+                    "identity_evidence_fresh": identity.current_evidence_fresh,
                     "liveness_state": entity.liveness.state,
                     "attendance_eligibility": entity.attendance_eligibility,
                     "source_frame_id": source_frame_id,
@@ -136,7 +137,8 @@ class CorrelationCore:
             # current entity is confirmed by the correlation reducer.
             if entity is not None:
                 identity = entity.identity
-                if identity.state == "CONFIRMED" and identity.confirmed_name:
+                if (identity.state == "CONFIRMED" and identity.confirmed_name
+                        and identity.current_evidence_fresh):
                     if target.startswith("ID_") or target in {"PERSON", "UNKNOWN"}:
                         target = identity.confirmed_name
                 elif target == "PERSON" or target.startswith("ID_") or target not in {"SYSTEM"}:
@@ -310,8 +312,16 @@ class CorrelationCore:
                     "candidate_hits": face.get("candidate_hits"),
                     "stable_frames": face.get("stable_frames"),
                     "last_verified_at": face.get("last_verified_at"),
+                    # Cached names are diagnostic continuity only. The entity
+                    # reducer must not treat them as fresh biometric proof.
+                    "cached_only": str(face.get("reason") or "") in {
+                        "stable_track_cache", "cached_identity", "quality_hold",
+                        "WAITING_FOR_GOOD_FACE",
+                    },
+                    "recognition_reason": face.get("reason"),
                 },
             ))
+            liveness_details = face.get("liveness_details") or {}
             self._add(Observation(
                 ObservationType.LIVENESS_RESULT,
                 producer="AntiSpoofDetector",
@@ -323,7 +333,12 @@ class CorrelationCore:
                 bbox=bbox,
                 value=face.get("liveness_status", "NOT_EVALUATED"),
                 confidence_type="categorical_liveness_state",
-                metadata={"attendance_eligible": bool(face.get("attendance_eligible", False))},
+                metadata={
+                    "attendance_eligible": bool(face.get("attendance_eligible", False)),
+                    "challenge_phase": liveness_details.get("phase"),
+                    "failure_reason": liveness_details.get("reason"),
+                    "challenge_attempts": liveness_details.get("attempt_number"),
+                },
             ))
 
         pose = pose_result or {}
@@ -456,6 +471,7 @@ class CorrelationCore:
             "margin": identity.margin,
             "confirmation_hits": identity.confirmation_hits,
             "contradiction_count": identity.contradiction_count,
+            "identity_evidence_fresh": identity.current_evidence_fresh,
             "track_generation": entity.track_generation,
             "source_frame_id": entity.last_source_frame_id,
             "observed_at": entity.last_observed_wallclock,

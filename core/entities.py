@@ -72,6 +72,10 @@ class IdentityState:
     contradiction_count: int = 0
     occluded_since_monotonic: Optional[float] = None
     confirmation_hits: int = 0
+    # Cached display output is useful for continuity, but it is not fresh
+    # biometric evidence and must never authorize a new attendance decision.
+    current_evidence_fresh: bool = False
+    last_cached_observation_monotonic: Optional[float] = None
 
 
 @dataclass
@@ -79,6 +83,9 @@ class LivenessState:
     state: str = "NOT_EVALUATED"
     last_checked_monotonic: Optional[float] = None
     last_verified_monotonic: Optional[float] = None
+    challenge_phase: Optional[str] = None
+    failure_reason: Optional[str] = None
+    challenge_attempts: int = 0
 
 
 @dataclass
@@ -168,6 +175,19 @@ class EntityState:
             metadata = observation.metadata
             name = metadata.get("name") or observation.value
             candidate_name = str(name).strip() if name else None
+            if candidate_name and (
+                candidate_name.upper() in {"UNKNOWN", "SPOOF", "SPOOF_SUSPECT"}
+                or candidate_name.upper().startswith("STRANGER_")
+            ):
+                candidate_name = None
+            # A cache hit can be rendered as a name, but it is not new
+            # recognition evidence. Preserve the last safe state for display
+            # while making the current frame ineligible for attendance.
+            if bool(metadata.get("cached_only")):
+                self.identity.current_evidence_fresh = False
+                self.identity.last_cached_observation_monotonic = observation.observed_at_monotonic
+                return
+            self.identity.current_evidence_fresh = True
             incoming_state = normalize_identity_state(metadata.get("identity_state"))
             previous_state = self.identity.state
             previous_candidate = self.identity.candidate_name
@@ -244,12 +264,22 @@ class EntityState:
             self.security_signals = self.security_signals[-12:]
             self.last_security_observation_monotonic = observation.observed_at_monotonic
         elif observation.observation_type == ObservationType.LIVENESS_RESULT:
-            self.liveness.state = str(observation.value or "NOT_EVALUATED")
+            liveness_state = str(observation.value or "NOT_EVALUATED").upper()
+            self.liveness.state = (
+                IdentityDecisionState.SPOOF_SUSPECT.value
+                if liveness_state == "SUSPECT" else liveness_state
+            )
             self.liveness.last_checked_monotonic = observation.observed_at_monotonic
             if self.liveness.state == "REAL":
                 self.liveness.last_verified_monotonic = observation.observed_at_monotonic
             elif self.liveness.state in {"SUSPECT", "SPOOF_SUSPECT"}:
                 self.identity.state = IdentityDecisionState.SPOOF_SUSPECT.value
+                self.attendance_eligibility = False
+            self.liveness.challenge_phase = observation.metadata.get("challenge_phase")
+            self.liveness.failure_reason = observation.metadata.get("failure_reason")
+            self.liveness.challenge_attempts = int(
+                observation.metadata.get("challenge_attempts") or self.liveness.challenge_attempts or 0
+            )
         elif observation.observation_type == ObservationType.POSE_STATE:
             self.pose_state = str(observation.value) if observation.value is not None else None
             self.last_pose_observation_monotonic = observation.observed_at_monotonic
@@ -298,6 +328,7 @@ class EntityState:
             and quality_current
             and self.quality_ok
             and self.identity.state == IdentityDecisionState.CONFIRMED.value
+            and self.identity.current_evidence_fresh
             and liveness_current
             and self.liveness.state == "REAL"
         )
@@ -312,9 +343,11 @@ class EntityState:
         if not self.face_visible:
             reasons.append("face_not_visible")
         if not self.quality_ok or self.last_quality_observation_monotonic is None or current - self.last_quality_observation_monotonic > self.quality_valid_after_sec:
-            reasons.append("face_quality_rejected")
+            reasons.append("WAITING_FOR_GOOD_FACE")
         if self.identity.state != IdentityDecisionState.CONFIRMED.value:
             reasons.append(f"identity_{self.identity.state.lower()}")
+        if not self.identity.current_evidence_fresh:
+            reasons.append("identity_evidence_cached_or_missing")
         if self.liveness.state != "REAL" or self.liveness.last_checked_monotonic is None or current - self.liveness.last_checked_monotonic > self.liveness_valid_after_sec:
             reasons.append("liveness_not_real")
         return {
@@ -354,6 +387,8 @@ class EntityState:
                 "contradiction_count": self.identity.contradiction_count,
                 "occluded_since_monotonic": self.identity.occluded_since_monotonic,
                 "confirmation_hits": self.identity.confirmation_hits,
+                "current_evidence_fresh": self.identity.current_evidence_fresh,
+                "last_cached_observation_monotonic": self.identity.last_cached_observation_monotonic,
             },
             "face": {
                 "visible": self.face_visible,
@@ -364,6 +399,10 @@ class EntityState:
             "liveness": {
                 "state": self.liveness.state,
                 "last_checked_monotonic": self.liveness.last_checked_monotonic,
+                "last_verified_monotonic": self.liveness.last_verified_monotonic,
+                "challenge_phase": self.liveness.challenge_phase,
+                "failure_reason": self.liveness.failure_reason,
+                "challenge_attempts": self.liveness.challenge_attempts,
             },
             "pose_state": self.pose_state,
             "current_zone": self.current_zone,

@@ -41,6 +41,7 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 EVIDENCE_RETENTION_DAYS = _positive_int_env("OPTIVOX_EVIDENCE_RETENTION_DAYS", 30)
+MAX_REQUEST_BODY_BYTES = _positive_int_env("OPTIVOX_MAX_REQUEST_BODY_BYTES", 1_048_576)
 
 
 def frontend_origin_allowed(origin: str | None) -> bool:
@@ -159,4 +160,5 @@ COMMAND_RESULTS_PATH = runtime_path("command_results.json")
 ENROLLMENT_STATUS_PATH = runtime_path("enrollment_status.json")
 CAPABILITY_PATH = runtime_path("capability.json")
 PERFORMANCE_SUMMARY_PATH = runtime_path("performance_summary.json")
+LIVENESS_METRICS_PATH = runtime_path("liveness_metrics.json")
 HEALTH_EVENTS_PATH = runtime_path("health_events.jsonl")

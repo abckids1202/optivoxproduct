@@ -10,7 +10,7 @@ from fastapi import HTTPException
 from fastapi.responses import FileResponse
 
 from deployment_security import watchdog_status
-from ..config import CAPABILITY_PATH, DEVICE_ID, HEALTH_EVENTS_PATH, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, PERFORMANCE_SUMMARY_PATH, TIMEZONE
+from ..config import CAPABILITY_PATH, DEVICE_ID, HEALTH_EVENTS_PATH, HEARTBEAT_PATH, LATEST_FRAME_PATH, LIVE_STATE_PATH, LIVENESS_METRICS_PATH, PERFORMANCE_SUMMARY_PATH, TIMEZONE
 
 
 def now_iso() -> str:
@@ -89,6 +89,7 @@ def live_state() -> dict[str, Any]:
     security = state.get("security", {})
     performance = state.get("performance", {})
     performance_summary = read_json(PERFORMANCE_SUMMARY_PATH, {}) or {}
+    liveness = read_json(LIVENESS_METRICS_PATH, {}) or {}
     correlation = state.get("correlation", {})
     return {
         "generatedAt": now_iso(),
@@ -118,6 +119,7 @@ def live_state() -> dict[str, Any]:
         },
         "performance": performance,
         "performanceSummary": performance_summary,
+        "liveness": liveness,
         "correlation": correlation,
         "security": {
             "level": security.get("level", "normal"),

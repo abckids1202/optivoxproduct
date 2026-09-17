@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from .config import FRONTEND_ORIGINS, RUNTIME_MODE, validate_runtime_configuration
+from .config import FRONTEND_ORIGINS, MAX_REQUEST_BODY_BYTES, RUNTIME_MODE, validate_runtime_configuration
 from .platform_schema import ensure_platform_schema
 from .routes import academic, analytics, attendance, auth, commands, cybersecurity, events, health, incidents, live, operations, people, system
 from .services.auth_service import bootstrap_configured_users
@@ -56,9 +57,31 @@ async def security_headers(request, call_next):
     response.headers.setdefault("Referrer-Policy", "same-origin")
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=()")
     response.headers.setdefault("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
     if RUNTIME_MODE == "production":
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
+
+
+@app.middleware("http")
+async def request_size_limit(request: Request, call_next):
+    """Reject oversized API requests before parsing or persisting their body."""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": {"code": "INVALID_CONTENT_LENGTH", "message": "Content-Length must be a valid integer."}},
+            )
+        if declared < 0 or declared > MAX_REQUEST_BODY_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": {"code": "REQUEST_BODY_TOO_LARGE", "message": "Request body exceeds the configured limit."}},
+            )
+    return await call_next(request)
 
 for router in [
     health.router,
