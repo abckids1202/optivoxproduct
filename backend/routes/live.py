@@ -19,7 +19,7 @@ router = APIRouter(tags=["live"])
 def live_status(actor: str = Depends(require_permission("live.view"))):
     state = runtime_service.live_state()
     state["people"] = list_people()
-    state["attendance"] = today_attendance()
+    state["attendanceToday"] = today_attendance()
     state["events"] = list_events(limit=8)
     state["incidents"] = list_incidents(limit=8)
     attendance = attendance_summary()

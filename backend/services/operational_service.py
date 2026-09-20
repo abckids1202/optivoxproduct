@@ -5,6 +5,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from ..config import ORGANIZATION_ID, SITE_ID
 from ..database import fetch_all, fetch_one
 
 
@@ -88,19 +89,69 @@ def _normalize_decision(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _safe_liveness_metrics(value: Any) -> dict[str, Any] | None:
+    """Expose only bounded scalar challenge metrics, never biometric material."""
+    parsed = _details(value)
+    if not isinstance(parsed, dict):
+        return None
+    allowed = {
+        "forward_frames", "left_frames", "right_frames", "return_frames",
+        "yaw", "quality", "duration_ms", "retry_count",
+    }
+    result: dict[str, Any] = {}
+    for key in allowed:
+        item = parsed.get(key)
+        if isinstance(item, (str, int, float, bool)):
+            result[key] = item
+    return result or None
+
+
+def _normalize_liveness(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "entityId": row.get("entity_id"),
+        "presenceSessionId": row.get("presence_session_id"),
+        "trackId": row.get("track_id"),
+        "trackGeneration": row.get("track_generation") or 1,
+        "challengeState": row.get("challenge_state") or "IN_PROGRESS",
+        "phase": row.get("phase") or "CENTER",
+        "livenessStatus": row.get("liveness_status") or "NOT_EVALUATED",
+        "startedAt": row.get("started_at"),
+        "updatedAt": row.get("updated_at"),
+        "completedAt": row.get("completed_at"),
+        "attemptNumber": row.get("attempt_number") or 1,
+        "sourceFrameId": row.get("source_frame_id"),
+        "failureReason": row.get("failure_reason"),
+        "metrics": _safe_liveness_metrics(row.get("metrics_json")),
+    }
+
+
 def summary() -> dict[str, Any]:
     sessions = fetch_one(
         """select count(*) as total,
                   sum(case when status='active' then 1 else 0 end) as active,
                   sum(case when status='active' and identity_state='CONFIRMED' then 1 else 0 end) as confirmed,
                   sum(case when status='active' and (identity_state<>'CONFIRMED' or label='UNKNOWN') then 1 else 0 end) as unresolved
-           from presence_sessions"""
+           from presence_sessions
+           where organization_id=? and site_id=?""",
+        [ORGANIZATION_ID, SITE_ID],
     ) or {}
     evidence = fetch_one(
         """select count(*) as total,
                   sum(case when decision='confirmed' then 1 else 0 end) as confirmed,
                   sum(case when decision in ('spoof_or_uncertain','contradicted') then 1 else 0 end) as rejected
-           from recognition_evidence"""
+           from recognition_evidence
+           where organization_id=? and site_id=?""",
+        [ORGANIZATION_ID, SITE_ID],
+    ) or {}
+    challenges = fetch_one(
+        """select count(*) as total,
+                  sum(case when challenge_state='PASSED' then 1 else 0 end) as passed,
+                  sum(case when challenge_state in ('FAILED','TIMED_OUT') then 1 else 0 end) as failed,
+                  sum(case when challenge_state='IN_PROGRESS' then 1 else 0 end) as active
+           from liveness_challenges
+           where organization_id=? and site_id=?""",
+        [ORGANIZATION_ID, SITE_ID],
     ) or {}
     return {
         "presenceSessions": int(sessions.get("total") or 0),
@@ -110,7 +161,41 @@ def summary() -> dict[str, Any]:
         "recognitionEvidence": int(evidence.get("total") or 0),
         "confirmedEvidence": int(evidence.get("confirmed") or 0),
         "rejectedEvidence": int(evidence.get("rejected") or 0),
+        "livenessChallenges": int(challenges.get("total") or 0),
+        "passedLivenessChallenges": int(challenges.get("passed") or 0),
+        "failedLivenessChallenges": int(challenges.get("failed") or 0),
+        "activeLivenessChallenges": int(challenges.get("active") or 0),
     }
+
+
+def list_liveness_challenges(
+    limit: int = 100,
+    entity_id: str | None = None,
+    session_id: int | None = None,
+    challenge_state: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the operational liveness trail without biometric content."""
+    clauses = ["l.organization_id=?", "l.site_id=?"]
+    params: list[Any] = [ORGANIZATION_ID, SITE_ID]
+    if entity_id:
+        clauses.append("l.entity_id=?")
+        params.append(entity_id)
+    if session_id is not None:
+        clauses.append("l.presence_session_id=?")
+        params.append(session_id)
+    if challenge_state:
+        clauses.append("l.challenge_state=?")
+        params.append(challenge_state.upper())
+    where = f"where {' and '.join(clauses)}" if clauses else ""
+    params.append(max(1, min(int(limit), 500)))
+    return [
+        _normalize_liveness(row)
+        for row in fetch_all(
+            f"""select l.* from liveness_challenges l {where}
+                order by l.updated_at desc, l.id desc limit ?""",
+            params,
+        )
+    ]
 
 
 def list_presence_sessions(
@@ -118,8 +203,8 @@ def list_presence_sessions(
     status: str | None = None,
     person_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    clauses = []
-    params: list[Any] = []
+    clauses = ["s.organization_id=?", "s.site_id=?"]
+    params: list[Any] = [ORGANIZATION_ID, SITE_ID]
     if status:
         clauses.append("s.status=?")
         params.append(status)
@@ -147,8 +232,8 @@ def get_presence_session(session_id: int) -> dict[str, Any]:
         """select s.*, count(r.id) as evidence_count
            from presence_sessions s
            left join recognition_evidence r on r.presence_session_id=s.id
-           where s.id=? group by s.id""",
-        [session_id],
+           where s.id=? and s.organization_id=? and s.site_id=? group by s.id""",
+        [session_id, ORGANIZATION_ID, SITE_ID],
     )
     if not row:
         raise HTTPException(status_code=404, detail={"code": "PRESENCE_SESSION_NOT_FOUND", "message": "Presence session was not found."})
@@ -157,11 +242,18 @@ def get_presence_session(session_id: int) -> dict[str, Any]:
     result["events"] = fetch_all(
         """select id, event_type, confidence, details_json, snapshot_path,
                   camera_id, location, severity, timestamp, entity_id,
-                  presence_session_id, source_frame_id, observation_type,
+           presence_session_id, source_frame_id, observation_type,
                   evidence_path
-           from events where presence_session_id=? order by timestamp desc limit 200""",
-        [session_id],
+           from events where presence_session_id=? and organization_id=? and site_id=? order by timestamp desc limit 200""",
+        [session_id, ORGANIZATION_ID, SITE_ID],
     )
+    for event in result["events"]:
+        event_id = event.get("id")
+        has_evidence = bool(event.get("snapshot_path") or event.get("evidence_path"))
+        event["snapshot_available"] = has_evidence
+        event["snapshot_url"] = f"/api/events/{event_id}/snapshot" if has_evidence else None
+        event.pop("snapshot_path", None)
+        event.pop("evidence_path", None)
     return result
 
 
@@ -172,8 +264,8 @@ def list_recognition_evidence(
     person_id: int | None = None,
     decision: str | None = None,
 ) -> list[dict[str, Any]]:
-    clauses = []
-    params: list[Any] = []
+    clauses = ["r.organization_id=?", "r.site_id=?"]
+    params: list[Any] = [ORGANIZATION_ID, SITE_ID]
     if session_id is not None:
         clauses.append("r.presence_session_id=?")
         params.append(session_id)
@@ -208,8 +300,8 @@ def list_attendance_decisions(
     decision: str | None = None,
 ) -> list[dict[str, Any]]:
     """Expose the automatic gate audit trail without exposing biometrics."""
-    clauses = []
-    params: list[Any] = []
+    clauses = ["d.organization_id=?", "d.site_id=?"]
+    params: list[Any] = [ORGANIZATION_ID, SITE_ID]
     if entity_id:
         clauses.append("d.entity_id=?")
         params.append(entity_id)

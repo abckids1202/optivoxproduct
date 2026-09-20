@@ -43,6 +43,7 @@ def test_events_group_by_context_and_stay_out_of_physical_incidents(cyber_db):
     assert grouped["alertCount"] == 1
     assert grouped["ipAddress"] == "10.0.0.5"
     assert grouped["userAgent"] == "test-agent"
+    assert database.fetch_one("select count(*) as count from platform_outbox")["count"] == 3
 
 
 def test_dedupe_key_makes_runtime_events_idempotent(cyber_db):
@@ -54,6 +55,18 @@ def test_dedupe_key_makes_runtime_events_idempotent(cyber_db):
     second = cyber.record_cyber_event("CAMERA_DISCONNECT", **kwargs)
     assert first["id"] == second["id"]
     assert database.fetch_one("select count(*) as count from cybersecurity_events")["count"] == 1
+
+
+def test_cyber_event_and_audit_record_commit_atomically(cyber_db, monkeypatch):
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit storage unavailable")
+
+    monkeypatch.setattr("backend.services.audit_service.append_audit_record", fail_audit)
+    with pytest.raises(RuntimeError, match="audit storage unavailable"):
+        cyber.record_cyber_event("RUNTIME_CRASH", source="runtime", details={"test": True})
+    assert database.fetch_one("select count(*) as count from cybersecurity_events")["count"] == 0
+    assert database.fetch_one("select count(*) as count from cybersecurity_incidents")["count"] == 0
+    assert database.fetch_one("select count(*) as count from platform_outbox")["count"] == 0
 
 
 def test_review_escalation_and_resolution_are_traceable(cyber_db):

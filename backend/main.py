@@ -7,10 +7,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .config import FRONTEND_ORIGINS, MAX_REQUEST_BODY_BYTES, RUNTIME_MODE, validate_runtime_configuration
+from .config import BACKUP_INTERVAL_MINUTES, BACKUP_RETENTION_COUNT, BACKUP_RETENTION_DAYS, BACKUP_SCHEDULER_ENABLED, FRONTEND_ORIGINS, MAX_REQUEST_BODY_BYTES, RUNTIME_MODE, validate_runtime_configuration
 from .platform_schema import ensure_platform_schema
-from .routes import academic, analytics, attendance, auth, commands, cybersecurity, events, health, incidents, live, operations, people, system
+from .routes import academic, analytics, attendance, auth, commands, cybersecurity, events, health, incidents, live, operations, people, system, sync
 from .services.auth_service import bootstrap_configured_users
+from .services.backup_scheduler import BackupScheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("optivox.backend")
@@ -24,9 +25,23 @@ async def lifespan(_app: FastAPI):
     validate_runtime_configuration()
     ensure_platform_schema()
     bootstrap_configured_users()
+    backup_scheduler = None
+    if BACKUP_SCHEDULER_ENABLED:
+        backup_scheduler = BackupScheduler(
+            interval_minutes=BACKUP_INTERVAL_MINUTES,
+            retention_days=BACKUP_RETENTION_DAYS,
+            retention_count=BACKUP_RETENTION_COUNT,
+        )
+        backup_scheduler.start()
+        logger.info("OptiVox backup scheduler started (%s minutes)", BACKUP_INTERVAL_MINUTES)
     logger.info("OptiVox backend started in %s mode", RUNTIME_MODE)
-    yield
-    logger.info("OptiVox backend stopped")
+    try:
+        yield
+    finally:
+        if backup_scheduler is not None:
+            backup_scheduler.stop()
+            backup_scheduler.join(timeout=5)
+        logger.info("OptiVox backend stopped")
 
 
 app = FastAPI(
@@ -45,7 +60,11 @@ app.add_middleware(
     allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Optivox-Key", "X-CSRF-Token", "Idempotency-Key"],
+    allow_headers=[
+        "Authorization", "Content-Type", "X-Optivox-Key", "X-CSRF-Token", "Idempotency-Key",
+        "X-Optivox-Signature", "X-Optivox-Signature-Algorithm", "X-Optivox-Key-Id",
+        "X-Optivox-Device", "X-Optivox-Site", "X-Optivox-Organization",
+    ],
 )
 
 
@@ -97,5 +116,6 @@ for router in [
     system.router,
     academic.router,
     cybersecurity.router,
+    sync.router,
 ]:
     app.include_router(router)

@@ -74,6 +74,29 @@ class LivenessMetrics:
         for row in self.scenarios.values():
             for key in labelled:
                 labelled[key] += int(row[key])
+        scenario_metrics = {}
+        for name, row in self.scenarios.items():
+            negatives = int(row["true_rejects"]) + int(row["false_accepts"])
+            positives = int(row["true_accepts"]) + int(row["false_rejects"])
+            scenario_metrics[name] = {
+                **dict(row),
+                "false_accept_rate": (
+                    int(row["false_accepts"]) / negatives if negatives else None
+                ),
+                "false_reject_rate": (
+                    int(row["false_rejects"]) / positives if positives else None
+                ),
+            }
+        labelled["false_accept_rate"] = (
+            labelled["false_accepts"] /
+            (labelled["true_rejects"] + labelled["false_accepts"])
+            if labelled["true_rejects"] + labelled["false_accepts"] else None
+        )
+        labelled["false_reject_rate"] = (
+            labelled["false_rejects"] /
+            (labelled["true_accepts"] + labelled["false_rejects"])
+            if labelled["true_accepts"] + labelled["false_rejects"] else None
+        )
         return {
             "attempts": self.attempts,
             "completions": self.completions,
@@ -86,7 +109,7 @@ class LivenessMetrics:
                 "max": round(max(durations), 4) if durations else None,
             },
             **labelled,
-            "scenarios": {key: dict(value) for key, value in self.scenarios.items()},
+            "scenarios": scenario_metrics,
         }
 
 
@@ -115,6 +138,7 @@ class LivenessChallenge:
             "attempt_number": self.metrics.attempts,
             "timeout_count": 0,
             "failure_count": 0,
+            "retry_count": 0,
             "completed_at": None,
             "challenge_duration_sec": None,
         }
@@ -155,17 +179,51 @@ class LivenessChallenge:
 
         timeout = float(self.cfg.get("CENTER_MODE_CHALLENGE_TIMEOUT_SEC", 15.0))
         hold_seconds = float(self.cfg.get("CENTER_MODE_TURN_HOLD_SEC", 0.35))
+        max_attempts = max(1, int(self.cfg.get("CENTER_MODE_MAX_LIVENESS_ATTEMPTS", 3)))
         neutral = float(self.cfg.get("CENTER_MODE_NEUTRAL_THRESHOLD", 0.07))
         turn = float(self.cfg.get("CENTER_MODE_YAW_THRESHOLD", 0.12))
         left_sign = 1 if float(self.cfg.get("CENTER_MODE_LEFT_YAW_SIGN", 1)) >= 0 else -1
+        if state.get("phase") == "FAILED":
+            return {
+                **state,
+                "message": "Liveness challenge failed. Restart the attendance flow to retry.",
+                "progress": 0.0,
+                "terminal": True,
+            }
         if now - state["started_at"] > timeout:
             self.metrics.record_timeout()
+            timeout_count = int(state.get("timeout_count") or 0) + 1
+            failure_count = int(state.get("failure_count") or 0) + 1
+            retry_count = int(state.get("retry_count") or 0) + 1
+            if retry_count >= max_attempts:
+                state.update({
+                    "phase": "FAILED",
+                    "status": "SPOOF_SUSPECT",
+                    "timeout_count": timeout_count,
+                    "failure_count": failure_count,
+                    "retry_count": retry_count,
+                    "completed_at": now,
+                    "challenge_duration_sec": max(0.0, now - state["started_at"]),
+                })
+                self.states[key] = state
+                return {
+                    **state,
+                    "message": "Liveness challenge failed after the maximum retries.",
+                    "progress": 0.0,
+                    "timed_out": True,
+                    "terminal": True,
+                }
+            # Keep the replacement state in the per-entity map. Without this
+            # assignment, the next frame silently starts from an untracked
+            # attempt and loses timeout/failure history.
             self.reset(key)
             state = self._new_state(now)
-            state["timeout_count"] = 1
-            state["failure_count"] = 1
+            state["timeout_count"] = timeout_count
+            state["failure_count"] = failure_count
+            state["retry_count"] = retry_count
+            self.states[key] = state
             return {**state, "message": "Challenge timed out. Face forward to restart.",
-                    "progress": 0.0, "timed_out": True}
+                    "progress": 0.0, "timed_out": True, "terminal": False}
 
         def held(condition: bool) -> bool:
             if not condition:
@@ -229,7 +287,7 @@ class LivenessChallenge:
                 message = "Liveness passed."
         progress_map = {
             "CENTER": 0.1, "TURN_LEFT": 0.35, "TURN_RIGHT": 0.6,
-            "RETURN": 0.82, "PASSED": 1.0,
+            "RETURN": 0.82, "PASSED": 1.0, "FAILED": 0.0,
         }
         return {
             **state,

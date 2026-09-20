@@ -1,6 +1,6 @@
 import { AlertTriangle, Ban, CheckCircle2, Loader2, Play, RefreshCcw, Search, Trash2, UserPlus, Users, XCircle } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { cancelEnrollment, confirmEnrollment, deletePerson, disablePerson, fetchEnrollmentStatus, fetchPerson, mergePeople, retrainPerson, sendCommand, updatePerson } from "../services/api";
+import { cancelEnrollment, confirmEnrollment, deletePerson, disablePerson, fetchEnrollmentStatus, fetchPerson, finishEnrollment, mergePeople, retrainPerson, sendCommand, updatePerson } from "../services/api";
 
 export default function People({ state }) {
   const [query, setQuery] = useState("");
@@ -82,6 +82,15 @@ export default function People({ state }) {
     try {
       await confirmEnrollment(overrideDuplicate);
       setEnrollment((current) => ({ ...current, stage: "queued", message: "Saving the verified enrollment to the local roster." }));
+    } catch (error) {
+      setEnrollment((current) => ({ ...current, stage: "failed", message: error.message }));
+    }
+  }
+
+  async function finishCapturedEnrollment() {
+    try {
+      await finishEnrollment();
+      setEnrollment((current) => ({ ...current, stage: "queued", message: "Finishing the captured samples. Review the quality report before saving." }));
     } catch (error) {
       setEnrollment((current) => ({ ...current, stage: "failed", message: error.message }));
     }
@@ -197,6 +206,11 @@ export default function People({ state }) {
             <div className="progress-track"><span style={{ width: `${progress}%` }} /></div>
             <div className="progress-meta"><span>{accepted} accepted</span><span>target {enrollment.minimum || 5}-{maximum}</span>{enrollment.quality_score != null && <span>quality {Math.round(enrollment.quality_score)}</span>}</div>
           </>}
+          {enrollment.stage === "capturing" && accepted >= Number(enrollment.minimum || 5) && <div className="enrollment-warning">
+            <CheckCircle2 size={17} />
+            <span>{accepted} samples are ready. You can finish now or keep collecting more pose variation.</span>
+            <button type="button" onClick={finishCapturedEnrollment}>Finish capture</button>
+          </div>}
           {enrollment.stage === "completed" && <div className="enrollment-warning">
             <CheckCircle2 size={17} />
             <span>Samples passed quality checks. Save this identity to the local roster.</span>

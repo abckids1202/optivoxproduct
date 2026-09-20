@@ -36,6 +36,8 @@ class PerformanceProfiler:
         self._display_times = deque(maxlen=self.window_size)
         self._capture_times = deque(maxlen=self.window_size)
         self._inference_times = deque(maxlen=self.window_size)
+        self._consumed_ages = deque(maxlen=self.window_size)
+        self._stale_ages = deque(maxlen=self.window_size)
         self._counters = {
             "frames_captured": 0,
             "frames_consumed": 0,
@@ -65,6 +67,10 @@ class PerformanceProfiler:
         with self._lock:
             self._counters["frames_consumed"] += 1
             self._counters["frame_ids_skipped"] += max(0, int(skipped or 0))
+            try:
+                self._consumed_ages.append(max(0.0, float(frame_age_ms)))
+            except (TypeError, ValueError, OverflowError):
+                pass
 
     def record_inference(self, frame_id, frame_age_ms, total_ms, stages=None,
                          frame_age_start_ms=None, frame_age_end_ms=None):
@@ -91,8 +97,14 @@ class PerformanceProfiler:
                     self._display_ages = deque(maxlen=self.window_size)
                 self._display_ages.append(float(frame_age_ms))
 
-    def record_stale_drop(self):
-        self._increment("stale_frames_dropped")
+    def record_stale_drop(self, frame_age_ms=None):
+        with self._lock:
+            self._counters["stale_frames_dropped"] += 1
+            if frame_age_ms is not None:
+                try:
+                    self._stale_ages.append(max(0.0, float(frame_age_ms)))
+                except (TypeError, ValueError, OverflowError):
+                    pass
 
     def record_inference_error(self):
         self._increment("inference_errors")
@@ -122,6 +134,8 @@ class PerformanceProfiler:
                     for record in records_with_inference]
             start_ages = [record.get("frame_age_start_ms", record.get("frame_age_ms", 0.0))
                           for record in records_with_inference]
+            consumed_ages = list(self._consumed_ages)
+            stale_ages = list(self._stale_ages)
             display_ages = list(getattr(self, "_display_ages", ()))
             data = {
                 "enabled": self.enabled,
@@ -143,6 +157,14 @@ class PerformanceProfiler:
                     "frame_age_p95": round(_percentile(ages, 0.95), 2) if ages else None,
                     "frame_age_end_avg": round(sum(ages) / len(ages), 2) if ages else None,
                     "frame_age_end_p95": round(_percentile(ages, 0.95), 2) if ages else None,
+                    "frame_age_consumed_avg": round(sum(consumed_ages) / len(consumed_ages), 2)
+                    if consumed_ages else None,
+                    "frame_age_consumed_p95": round(_percentile(consumed_ages, 0.95), 2)
+                    if consumed_ages else None,
+                    "stale_frame_age_avg": round(sum(stale_ages) / len(stale_ages), 2)
+                    if stale_ages else None,
+                    "stale_frame_age_p95": round(_percentile(stale_ages, 0.95), 2)
+                    if stale_ages else None,
                     "display_frame_age_avg": round(sum(display_ages) / len(display_ages), 2)
                     if display_ages else None,
                     "display_frame_age_p95": round(_percentile(display_ages, 0.95), 2) if display_ages else None,

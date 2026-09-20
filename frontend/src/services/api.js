@@ -126,6 +126,11 @@ export async function confirmEnrollment(overrideDuplicate = false) {
   return sendCommand("confirm_enrollment", { override_duplicate: Boolean(overrideDuplicate) });
 }
 
+export async function finishEnrollment() {
+  if (USE_DEMO_DATA) return { stage: "completed", message: "Demo enrollment capture finished." };
+  return sendCommand("finish_enrollment");
+}
+
 export async function retrainPerson(name) {
   return sendCommand("retrain_person", { name });
 }
@@ -160,9 +165,24 @@ export async function fetchAttendanceDecisions(limit = 40) {
   return getJson(`/api/operations/attendance-decisions?limit=${Math.max(1, Math.min(Number(limit) || 40, 500))}`);
 }
 
+export async function fetchLivenessChallenges(limit = 40) {
+  if (USE_DEMO_DATA) return [];
+  return getJson(`/api/operations/liveness-challenges?limit=${Math.max(1, Math.min(Number(limit) || 40, 500))}`);
+}
+
 export async function fetchPerformanceReport() {
   if (USE_DEMO_DATA) return { measurement_status: "NOT_MEASURED" };
   return getJson("/api/system/performance");
+}
+
+export async function fetchSecurityZones() {
+  if (USE_DEMO_DATA) return { source: "demo", zones: [], updated_at: null };
+  return getJson("/api/system/security-zones");
+}
+
+export async function fetchSyncStatus() {
+  if (USE_DEMO_DATA) return { receiver_configured: false, checkpoint: { status: "demo" }, batches_received: 0, events_received: 0 };
+  return getJson("/api/sync/status");
 }
 
 export async function reviewEvent(eventId, action, note = "") {
@@ -385,6 +405,8 @@ function getEmptyState() {
       not_yet_detected: 0,
     },
     visiblePeople: [],
+    attendanceToday: [],
+    vehicles: { active_tracks: [] },
     objects: [],
     people: [],
     attendance: [],
@@ -403,6 +425,19 @@ function getEmptyState() {
       recognitionEvidence: 0,
       confirmedEvidence: 0,
       rejectedEvidence: 0,
+    },
+    crowd: {
+      status: "NOT_MEASURED",
+      people_count: 0,
+      perspective_correction: "NOT_CONFIGURED",
+      physical_density: "NOT_MEASURED",
+    },
+    demographics: {
+      status: "DISABLED",
+      decision_use: "aggregate_only",
+      age_bands: {},
+      samples: 0,
+      exact_age: "NOT_AVAILABLE",
     },
   };
 }

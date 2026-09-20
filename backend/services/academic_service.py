@@ -5,8 +5,8 @@ from calendar import monthrange
 from datetime import date, timedelta
 from typing import Any
 
-from ..database import fetch_all
-from ..config import SCHOOL_DAYS, SCHOOL_HOLIDAYS, local_today
+from ..database import fetch_all, fetch_one
+from ..config import DEVICE_ID, ORGANIZATION_ID, SCHOOL_DAYS, SCHOOL_HOLIDAYS, SITE_ID, local_today
 from ..database import execute
 
 
@@ -15,7 +15,7 @@ def overview(year: int | None = None, month: int | None = None) -> dict[str, Any
     today = local_today()
     year = year or today.year
     month = month or today.month
-    people = fetch_all("select id, name, role, metadata_json from people order by name")
+    people = fetch_all("select id, name, role, metadata_json from people where organization_id=? and site_id=? order by name", [ORGANIZATION_ID, SITE_ID])
     subjects: set[str] = set()
     profiles = []
     for person in people:
@@ -25,11 +25,11 @@ def overview(year: int | None = None, month: int | None = None) -> dict[str, Any
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
     cutoff = min(local_today(), end)
-    recorded = fetch_all("select person_id, date from attendance where date between ? and ? and clock_in is not null", [start.isoformat(), cutoff.isoformat()])
+    recorded = fetch_all("select person_id, date from attendance where date between ? and ? and clock_in is not null and organization_id=? and site_id=?", [start.isoformat(), cutoff.isoformat(), ORGANIZATION_ID, SITE_ID])
     recorded_keys = {(row["person_id"], row["date"]) for row in recorded}
     stored = fetch_all(
-        "select a.*, p.name from absence_records a join people p on p.id=a.person_id where a.absence_date between ? and ?",
-        [start.isoformat(), cutoff.isoformat()],
+        "select a.*, p.name from absence_records a join people p on p.id=a.person_id where a.absence_date between ? and ? and a.organization_id=? and a.site_id=? and p.organization_id=? and p.site_id=?",
+        [start.isoformat(), cutoff.isoformat(), ORGANIZATION_ID, SITE_ID, ORGANIZATION_ID, SITE_ID],
     )
     stored_keys = {(row["person_id"], row["absence_date"]) for row in stored}
     absences = [
@@ -77,8 +77,8 @@ def metadata_subjects(value: Any) -> list[str]:
 
 
 def list_schedules(active_only: bool = False) -> list[dict[str, Any]]:
-    where = " where active=1" if active_only else ""
-    return fetch_all(f"select * from attendance_schedules{where} order by class_name, weekday, start_time", [])
+    where = " and active=1" if active_only else ""
+    return fetch_all(f"select * from attendance_schedules where organization_id=? and site_id=?{where} order by class_name, weekday, start_time", [ORGANIZATION_ID, SITE_ID])
 
 
 def create_schedule(
@@ -97,22 +97,33 @@ def create_schedule(
     if not class_name:
         raise ValueError("class_name is required")
     subject_value = (subject or "").strip()[:120]
-    schedule_id = execute(
-        """
-        insert into attendance_schedules (class_name, subject, weekday, start_time, end_time, grace_minutes)
-        values (?, ?, ?, ?, ?, ?)
-        on conflict(class_name, subject, weekday, start_time) do update set
-          end_time=excluded.end_time, grace_minutes=excluded.grace_minutes, active=1
-        """,
-        [class_name, subject_value, int(weekday), str(start_time).strip(), (end_time or "").strip()[:5] or None, max(0, min(int(grace_minutes), 240))],
+    existing = fetch_one(
+        "select id from attendance_schedules where class_name=? and subject=? and weekday=? and start_time=? and organization_id=? and site_id=?",
+        [class_name, subject_value, int(weekday), str(start_time).strip(), ORGANIZATION_ID, SITE_ID],
     )
-    row = fetch_all("select * from attendance_schedules where class_name=? and weekday=? and start_time=? order by id desc limit 1", [class_name, int(weekday), str(start_time).strip()])[0]
+    schedule_values = [
+        (end_time or "").strip()[:5] or None,
+        max(0, min(int(grace_minutes), 240)),
+    ]
+    if existing:
+        schedule_id = execute(
+            "update attendance_schedules set end_time=?, grace_minutes=?, active=1, device_id=? where id=? and organization_id=? and site_id=?",
+            [*schedule_values, DEVICE_ID, existing["id"], ORGANIZATION_ID, SITE_ID],
+        )
+    else:
+        # The legacy unique key is global. Refuse a cross-site collision
+        # instead of accidentally updating another site's schedule.
+        schedule_id = execute(
+            "insert into attendance_schedules (class_name, subject, weekday, start_time, end_time, grace_minutes, organization_id, site_id, device_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [class_name, subject_value, int(weekday), str(start_time).strip(), *schedule_values, ORGANIZATION_ID, SITE_ID, DEVICE_ID],
+        )
+    row = fetch_all("select * from attendance_schedules where class_name=? and weekday=? and start_time=? and organization_id=? and site_id=? order by id desc limit 1", [class_name, int(weekday), str(start_time).strip(), ORGANIZATION_ID, SITE_ID])[0]
     return row
 
 
 def deactivate_schedule(schedule_id: int) -> dict[str, Any]:
-    row = fetch_all("select * from attendance_schedules where id=?", [schedule_id])
+    row = fetch_all("select * from attendance_schedules where id=? and organization_id=? and site_id=?", [schedule_id, ORGANIZATION_ID, SITE_ID])
     if not row:
         raise ValueError("Schedule was not found")
-    execute("update attendance_schedules set active=0 where id=?", [schedule_id])
-    return fetch_all("select * from attendance_schedules where id=?", [schedule_id])[0]
+    execute("update attendance_schedules set active=0 where id=? and organization_id=? and site_id=?", [schedule_id, ORGANIZATION_ID, SITE_ID])
+    return fetch_all("select * from attendance_schedules where id=? and organization_id=? and site_id=?", [schedule_id, ORGANIZATION_ID, SITE_ID])[0]

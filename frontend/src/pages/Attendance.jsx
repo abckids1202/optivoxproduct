@@ -13,7 +13,7 @@ export default function Attendance({ state }) {
   const [absenceSaving, setAbsenceSaving] = useState(false);
   const [selectedOperatorPerson, setSelectedOperatorPerson] = useState("");
   const [operatorMessage, setOperatorMessage] = useState("");
-  const rows = state.attendance?.length ? state.attendance : [];
+  const rows = state.attendanceToday?.length ? state.attendanceToday : [];
   const filteredRows = useMemo(() => rows.filter((person) => `${person.name} ${person.role} ${person.className}`.toLowerCase().includes(query.toLowerCase())), [rows, query]);
   useEffect(() => {
     const year = monthDate.getFullYear();

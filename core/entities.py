@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -76,6 +77,10 @@ class IdentityState:
     # biometric evidence and must never authorize a new attendance decision.
     current_evidence_fresh: bool = False
     last_cached_observation_monotonic: Optional[float] = None
+    # Bounded voting history prevents one lucky frame from confirming a name.
+    # The reducer still requires the current candidate to be the one with the
+    # required number of votes in this window.
+    candidate_window: deque = field(default_factory=lambda: deque(maxlen=5), repr=False)
 
 
 @dataclass
@@ -126,6 +131,7 @@ class EntityState:
     identity_stale_after_sec: float = 3.0
     identity_expired_after_sec: float = 9.0
     identity_confirmation_observations: int = 1
+    identity_confirmation_window: int = 5
     face_visible_after_sec: float = 1.0
     quality_valid_after_sec: float = 1.5
     liveness_valid_after_sec: float = 2.0
@@ -154,11 +160,20 @@ class EntityState:
         self.motion.last_updated_monotonic = now
 
     def attach(self, observation: Observation) -> None:
+        previous_last_seen = self.last_seen_monotonic
         self.recent_observation_count += 1
         self.last_seen_monotonic = max(self.last_seen_monotonic, observation.observed_at_monotonic)
         if observation.source_frame_id is not None:
-            self.last_source_frame_id = observation.source_frame_id
-        if observation.observed_at_wallclock:
+            if self.last_source_frame_id is None:
+                self.last_source_frame_id = observation.source_frame_id
+            else:
+                self.last_source_frame_id = max(
+                    int(self.last_source_frame_id), int(observation.source_frame_id))
+        # Wall-clock provenance follows the same monotonic ordering as the
+        # entity state. Delayed detector output must not make a live entity
+        # appear to have been seen earlier than its already-recorded evidence.
+        if (observation.observed_at_wallclock
+                and observation.observed_at_monotonic >= previous_last_seen):
             self.last_observed_wallclock = observation.observed_at_wallclock
         if observation.observation_type == ObservationType.FACE_DETECTED:
             self.face_visible = True
@@ -199,6 +214,19 @@ class EntityState:
             ):
                 incoming_state = IdentityDecisionState.CONTRADICTED.value
                 self.identity.contradiction_count += 1
+            elif (
+                self.identity.state == IdentityDecisionState.CONFIRMED.value
+                and not candidate_name
+                and incoming_state in {
+                    IdentityDecisionState.UNRESOLVED.value,
+                    IdentityDecisionState.EXPIRED.value,
+                }
+            ):
+                # A confirmed track receiving a genuine unknown/unresolved
+                # result is contradictory evidence, not a harmless label
+                # change. Attendance is blocked until the identity is rebuilt.
+                incoming_state = IdentityDecisionState.CONTRADICTED.value
+                self.identity.contradiction_count += 1
             self.identity.best_score = observation.confidence
             self.identity.second_score = metadata.get("second_score")
             self.identity.margin = metadata.get("margin")
@@ -221,22 +249,33 @@ class EntityState:
                 }
                 if revalidation_required:
                     self.identity.confirmation_hits = 0
-                self.identity.confirmation_hits = (
-                    self.identity.confirmation_hits + 1 if same_candidate else 1
+                    self.identity.candidate_window.clear()
+                window_size = max(1, int(self.identity_confirmation_window))
+                while len(self.identity.candidate_window) >= window_size:
+                    self.identity.candidate_window.popleft()
+                self.identity.candidate_window.append(candidate_name.casefold())
+                self.identity.confirmation_hits = sum(
+                    1 for item in self.identity.candidate_window
+                    if item == candidate_name.casefold()
                 )
-                if (previous_state == IdentityDecisionState.CONFIRMED.value
-                        and not revalidation_required):
-                    self.identity.confirmation_hits = max(
-                        self.identity.confirmation_hits,
-                        self.identity_confirmation_observations,
-                    )
+                # A currently confirmed, continuously tracked identity is
+                # retained through ordinary refresh evidence. Revalidation
+                # after occlusion/contradiction still requires the full vote.
+                continuously_confirmed = (
+                    previous_state == IdentityDecisionState.CONFIRMED.value
+                    and same_candidate
+                    and not revalidation_required
+                )
                 if self.identity.confirmation_hits >= self.identity_confirmation_observations:
                     self.identity.state = IdentityDecisionState.CONFIRMED.value
                     self.identity.confirmed_name = candidate_name
+                elif continuously_confirmed:
+                    self.identity.state = IdentityDecisionState.CONFIRMED.value
                 else:
                     self.identity.state = IdentityDecisionState.CANDIDATE.value
             else:
                 self.identity.state = incoming_state
+                self.identity.candidate_window.clear()
                 if incoming_state in {
                     IdentityDecisionState.UNRESOLVED.value,
                     IdentityDecisionState.CONTRADICTED.value,
@@ -320,8 +359,18 @@ class EntityState:
                         if identity_age > self.identity_expired_after_sec
                         else IdentityDecisionState.OCCLUDED.value
                     )
-            elif self.identity.state == IdentityDecisionState.CONTRADICTED.value and identity_age > self.identity_expired_after_sec:
+                    # The identity may remain useful as a display continuity
+                    # label, but it is no longer current biometric evidence.
+                    # Keep this distinction explicit for attendance, security
+                    # attribution, and dashboard provenance.
+                    self.identity.current_evidence_fresh = False
+            elif self.identity.state in {
+                    IdentityDecisionState.CANDIDATE.value,
+                    IdentityDecisionState.CONTRADICTED.value,
+            } and identity_age > self.identity_expired_after_sec:
                 self.identity.state = IdentityDecisionState.EXPIRED.value
+                self.identity.candidate_window.clear()
+                self.identity.current_evidence_fresh = False
         self.attendance_eligibility = bool(
             self.lifecycle_state in {EntityLifecycle.NEW, EntityLifecycle.ACTIVE}
             and self.face_visible
@@ -389,6 +438,7 @@ class EntityState:
                 "confirmation_hits": self.identity.confirmation_hits,
                 "current_evidence_fresh": self.identity.current_evidence_fresh,
                 "last_cached_observation_monotonic": self.identity.last_cached_observation_monotonic,
+                "candidate_window": list(self.identity.candidate_window),
             },
             "face": {
                 "visible": self.face_visible,
@@ -423,6 +473,7 @@ class EntityStateStore:
                  quality_valid_after_sec: float = 1.5,
                  liveness_valid_after_sec: float = 2.0,
                  identity_confirmation_observations: int = 1,
+                 identity_confirmation_window: int = 5,
                  track_switch_distance: float = 250.0):
         self.max_entities = max(1, int(max_entities))
         self.occluded_after_updates = max(1, int(occluded_after_updates))
@@ -433,11 +484,14 @@ class EntityStateStore:
         self.liveness_valid_after_sec = max(0.2, float(liveness_valid_after_sec))
         self.identity_confirmation_observations = max(
             1, int(identity_confirmation_observations))
+        self.identity_confirmation_window = max(
+            self.identity_confirmation_observations, int(identity_confirmation_window))
         self.track_switch_distance = max(50.0, float(track_switch_distance))
         self.entities: Dict[int, EntityState] = {}
         self.history = ObservationHistory(max_per_type=max_observations_per_type, max_entities=max_entities)
         self._next_entity_number = 1
         self._track_generations: Dict[int, int] = {}
+        self._last_transitions: List[Dict[str, object]] = []
         self.closed_entities = 0
         self.expired_observations_rejected = 0
 
@@ -457,6 +511,7 @@ class EntityStateStore:
             quality_valid_after_sec=self.quality_valid_after_sec,
             liveness_valid_after_sec=self.liveness_valid_after_sec,
             identity_confirmation_observations=self.identity_confirmation_observations,
+            identity_confirmation_window=self.identity_confirmation_window,
         )
         generation = self._track_generations.get(int(track_id), 0) + 1
         self._track_generations[int(track_id)] = generation
@@ -472,10 +527,29 @@ class EntityStateStore:
         now: Optional[float] = None,
     ) -> List[EntityState]:
         current = time.monotonic() if now is None else now
+        self._last_transitions = []
         active_ids = {int(track_id) for track_id in tracked}
         for track_id, center in tracked.items():
             track_id = int(track_id)
             entity = self.entities.get(track_id)
+            if entity is not None and str(entity.camera_id) != str(camera_id):
+                # Numeric tracker IDs are local to a camera. Never mutate an
+                # existing entity into another camera context, because that
+                # would carry identity, liveness, and attendance evidence
+                # across independent video streams.
+                self._last_transitions.append({
+                    "type": "closed",
+                    "reason": "camera_changed",
+                    "entity_id": entity.entity_id,
+                    "track_id": entity.track_id,
+                    "track_generation": entity.track_generation,
+                    "camera_id": entity.camera_id,
+                    "last_seen_monotonic": entity.last_seen_monotonic,
+                })
+                entity.lifecycle_state = EntityLifecycle.CLOSED
+                self.history.clear_entity(track_id)
+                self.entities.pop(track_id, None)
+                entity = None
             if entity is not None and entity.motion.current_center is not None:
                 jump = math.hypot(
                     float(center[0]) - entity.motion.current_center[0],
@@ -483,31 +557,91 @@ class EntityStateStore:
                 )
                 elapsed = max(0.0, current - entity.last_seen_monotonic)
                 if jump > self.track_switch_distance and (elapsed > 0.5 or entity.missing_updates > 0):
+                    self._last_transitions.append({
+                        "type": "closed",
+                        "reason": "tracker_switch",
+                        "entity_id": entity.entity_id,
+                        "track_id": entity.track_id,
+                        "track_generation": entity.track_generation,
+                        "camera_id": entity.camera_id,
+                        "last_seen_monotonic": entity.last_seen_monotonic,
+                    })
                     entity.lifecycle_state = EntityLifecycle.CLOSED
                     self.history.clear_entity(track_id)
                     self.entities.pop(track_id, None)
                     entity = None
+            was_new = entity is None
             entity = entity or self._new_entity(track_id, camera_id, current)
+            if was_new:
+                self._last_transitions.append({
+                    "type": "opened",
+                    "reason": "first_observation",
+                    "entity_id": entity.entity_id,
+                    "track_id": entity.track_id,
+                    "track_generation": entity.track_generation,
+                    "camera_id": entity.camera_id,
+                    "started_monotonic": entity.first_seen_monotonic,
+                })
+            elif entity.lifecycle_state in {EntityLifecycle.STALE, EntityLifecycle.OCCLUDED}:
+                self._last_transitions.append({
+                    "type": "revalidated",
+                    "reason": "track_visible_again",
+                    "entity_id": entity.entity_id,
+                    "track_id": entity.track_id,
+                    "track_generation": entity.track_generation,
+                    "camera_id": entity.camera_id,
+                })
             entity.camera_id = camera_id
             entity.lifecycle_state = EntityLifecycle.ACTIVE
             entity.missing_updates = 0
-            entity.last_seen_monotonic = current
-            entity.update_center(center, current)
+            # A delayed frame may arrive after a newer frame has already
+            # reduced state. Preserve temporal ordering and avoid deriving a
+            # large backwards-time velocity from stale input.
+            effective_now = max(current, entity.last_seen_monotonic)
+            entity.last_seen_monotonic = effective_now
+            entity.update_center(center, effective_now)
         for track_id, entity in list(self.entities.items()):
             if track_id in active_ids:
                 continue
             entity.missing_updates += 1
             elapsed = max(0.0, current - entity.last_seen_monotonic)
             if elapsed >= self.close_after_sec:
+                self._last_transitions.append({
+                    "type": "closed",
+                    "reason": "timeout",
+                    "entity_id": entity.entity_id,
+                    "track_id": entity.track_id,
+                    "track_generation": entity.track_generation,
+                    "camera_id": entity.camera_id,
+                    "last_seen_monotonic": entity.last_seen_monotonic,
+                })
                 entity.lifecycle_state = EntityLifecycle.CLOSED
                 self.history.clear_entity(track_id)
                 self.entities.pop(track_id, None)
                 self.closed_entities += 1
             elif entity.missing_updates >= self.occluded_after_updates:
+                if entity.lifecycle_state != EntityLifecycle.OCCLUDED:
+                    self._last_transitions.append({
+                        "type": "occluded",
+                        "reason": "temporary_track_loss",
+                        "entity_id": entity.entity_id,
+                        "track_id": entity.track_id,
+                        "track_generation": entity.track_generation,
+                        "camera_id": entity.camera_id,
+                    })
                 entity.lifecycle_state = EntityLifecycle.OCCLUDED
             else:
                 # Preserve the short-gap lifecycle label for compatibility;
                 # both STALE and OCCLUDED are ineligible for attendance.
+                if entity.lifecycle_state == EntityLifecycle.ACTIVE:
+                    self._last_transitions.append({
+                        "type": "occluded",
+                        "reason": "short_detection_gap",
+                        "entity_id": entity.entity_id,
+                        "track_id": entity.track_id,
+                        "track_generation": entity.track_generation,
+                        "camera_id": entity.camera_id,
+                    })
                 entity.lifecycle_state = EntityLifecycle.STALE
         if len(self.entities) > self.max_entities:
             removable = sorted(
@@ -516,11 +650,31 @@ class EntityStateStore:
                                   item.last_seen_monotonic),
             )
             for entity in removable[:len(self.entities) - self.max_entities]:
+                self._last_transitions.append({
+                    "type": "closed",
+                    "reason": "entity_capacity",
+                    "entity_id": entity.entity_id,
+                    "track_id": entity.track_id,
+                    "track_generation": entity.track_generation,
+                    "camera_id": entity.camera_id,
+                    "last_seen_monotonic": entity.last_seen_monotonic,
+                })
                 self.history.clear_entity(entity.track_id)
                 self.entities.pop(entity.track_id, None)
                 self.closed_entities += 1
         self.history.prune(current)
         return [self.entities[track_id] for track_id in sorted(active_ids) if track_id in self.entities]
+
+    def consume_transitions(self) -> List[Dict[str, object]]:
+        """Return and clear lifecycle transitions from the latest update.
+
+        The persistence bridge uses these transitions to close durable
+        sessions immediately. Keeping this queue bounded to one update avoids
+        replaying old lifecycle changes when a worker is delayed.
+        """
+        transitions = list(self._last_transitions)
+        self._last_transitions = []
+        return transitions
 
     def attach(self, observation: Observation) -> Optional[EntityState]:
         if observation.entity_track_id is None:
@@ -542,6 +696,68 @@ class EntityStateStore:
         return [entity for entity in self.entities.values() if entity.lifecycle_state in {
             EntityLifecycle.NEW, EntityLifecycle.ACTIVE, EntityLifecycle.OCCLUDED, EntityLifecycle.STALE
         }]
+
+    def enforce_identity_exclusivity(self) -> List[Dict[str, object]]:
+        """Prevent one roster identity from authorizing two live entities.
+
+        Nearest-centroid tracking can briefly duplicate a track or associate
+        two faces with the same roster match. Preserving both confirmations
+        would allow an identity error to reach attendance. The strongest
+        current entity keeps the confirmation; competing entities are forced
+        through fresh temporal validation. This is intentionally conservative:
+        a false rejection is safer than two simultaneous attendance records.
+        """
+        candidates: Dict[str, List[EntityState]] = {}
+        for entity in self.entities.values():
+            if entity.lifecycle_state not in {EntityLifecycle.NEW, EntityLifecycle.ACTIVE}:
+                continue
+            identity = entity.identity
+            if identity.state != IdentityDecisionState.CONFIRMED.value:
+                continue
+            if not identity.confirmed_name or not identity.current_evidence_fresh:
+                continue
+            key = identity.confirmed_name.strip().casefold()
+            if key:
+                candidates.setdefault(key, []).append(entity)
+
+        conflicts: List[Dict[str, object]] = []
+        for normalized_name, group in candidates.items():
+            if len(group) < 2:
+                continue
+
+            def rank(entity: EntityState):
+                identity = entity.identity
+                return (
+                    bool(entity.face_visible),
+                    bool(entity.quality_ok),
+                    entity.liveness.state == "REAL",
+                    float(identity.best_score) if identity.best_score is not None else -1.0,
+                    -int(entity.track_id),
+                )
+
+            winner = max(group, key=rank)
+            for loser in sorted(group, key=lambda item: item.track_id):
+                if loser is winner:
+                    continue
+                identity = loser.identity
+                identity.state = IdentityDecisionState.CONTRADICTED.value
+                identity.contradiction_count += 1
+                identity.confirmation_hits = 0
+                identity.candidate_window.clear()
+                identity.current_evidence_fresh = False
+                loser.attendance_eligibility = False
+                conflicts.append({
+                    "identity": winner.identity.confirmed_name,
+                    "normalized_identity": normalized_name,
+                    "winner_entity_id": winner.entity_id,
+                    "winner_track_id": winner.track_id,
+                    "winner_track_generation": winner.track_generation,
+                    "loser_entity_id": loser.entity_id,
+                    "loser_track_id": loser.track_id,
+                    "loser_track_generation": loser.track_generation,
+                    "reason": "simultaneous_identity_collision",
+                })
+        return conflicts
 
     def prune(self, now: Optional[float] = None) -> None:
         current = time.monotonic() if now is None else now

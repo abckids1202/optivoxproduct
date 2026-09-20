@@ -17,6 +17,7 @@ ALLOWED_COMMANDS = {
     "manual_clock_in",
     "manual_clock_out",
     "start_enrollment",
+    "finish_enrollment",
     "confirm_enrollment",
     "register_visible_unknown",
     "cancel_enrollment",
@@ -26,6 +27,8 @@ ALLOWED_COMMANDS = {
     "delete_person",
     "test_alert",
     "reset_demo_data",
+    "set_vehicle_calibration",
+    "set_security_zones",
 }
 
 ADMIN_COMMANDS = {
@@ -40,6 +43,7 @@ COMMAND_PERMISSIONS = {
     "manual_clock_in": "attendance.manual",
     "manual_clock_out": "attendance.manual",
     "start_enrollment": "biometric.enroll",
+    "finish_enrollment": "biometric.enroll",
     "register_visible_unknown": "biometric.enroll",
     "cancel_enrollment": "biometric.enroll",
     "confirm_enrollment": "biometric.enroll",
@@ -49,6 +53,8 @@ COMMAND_PERMISSIONS = {
     "delete_person": "biometric.delete",
     "test_alert": "system.manage",
     "reset_demo_data": "system.manage",
+    "set_vehicle_calibration": "system.manage",
+    "set_security_zones": "system.manage",
 }
 
 _COMMAND_LOCK = threading.Lock()

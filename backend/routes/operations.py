@@ -60,3 +60,19 @@ def attendance_decisions(
         person_id=person_id,
         decision=decision,
     )
+
+
+@router.get("/liveness-challenges")
+def liveness_challenges(
+    limit: int = Query(default=100, ge=1, le=500),
+    entity_id: str | None = None,
+    session_id: int | None = Query(default=None, ge=1),
+    challenge_state: str | None = Query(default=None, max_length=24),
+    actor: str = Depends(require_permission("operations.view")),
+):
+    return svc.list_liveness_challenges(
+        limit=limit,
+        entity_id=entity_id,
+        session_id=session_id,
+        challenge_state=challenge_state,
+    )

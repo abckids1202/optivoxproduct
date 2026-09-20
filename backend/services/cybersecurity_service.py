@@ -15,9 +15,10 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from ..config import DEVICE_ID, HEALTH_EVENTS_PATH
-from ..database import fetch_all, fetch_one, get_connection
-from .audit_service import list_actions, record_action
+from ..config import DEVICE_ID, HEALTH_EVENTS_PATH, ORGANIZATION_ID, SITE_ID
+from ..database import fetch_all, fetch_one, get_connection, transaction
+from .audit_service import list_actions, record_action_in_connection
+from .outbox_service import enqueue_in_connection
 
 
 CYBER_EVENT_TYPES = frozenset({
@@ -125,8 +126,8 @@ def _base_group_key(event_type: str, category: str, actor_id: Any, device_id: An
 
 def _existing_open_incident(con, base_key: str, occurred_at: str, window_seconds: int) -> dict[str, Any] | None:
     rows = con.execute(
-        "select * from cybersecurity_incidents where correlation_key=? or correlation_key like ? order by id desc",
-        (base_key, base_key + "|%"),
+        "select * from cybersecurity_incidents where organization_id=? and site_id=? and (correlation_key=? or correlation_key like ?) order by id desc",
+        (ORGANIZATION_ID, SITE_ID, base_key, base_key + "|%"),
     ).fetchall()
     current = datetime.fromisoformat(occurred_at)
     for raw in rows:
@@ -145,7 +146,7 @@ def _existing_open_incident(con, base_key: str, occurred_at: str, window_seconds
 
 
 def _unique_incident_key(con, base_key: str, occurred_at: str) -> str:
-    if not con.execute("select 1 from cybersecurity_incidents where correlation_key=?", (base_key,)).fetchone():
+    if not con.execute("select 1 from cybersecurity_incidents where correlation_key=? and organization_id=? and site_id=?", (base_key, ORGANIZATION_ID, SITE_ID)).fetchone():
         return base_key
     return f"{base_key}|{occurred_at}|{uuid.uuid4().hex[:8]}"
 
@@ -184,7 +185,7 @@ def record_cyber_event(
     log_reference = _text(evidence_ref, 500) or f"audit:cyber.event.recorded:{correlation_id}"
     with get_connection() as con:
         if dedupe:
-            existing = con.execute("select * from cybersecurity_events where dedupe_key=?", (dedupe,)).fetchone()
+            existing = con.execute("select * from cybersecurity_events where dedupe_key=? and organization_id=? and site_id=?", (dedupe, ORGANIZATION_ID, SITE_ID)).fetchone()
             if existing:
                 result = normalize_event(dict(existing))
                 result["deduplicated"] = True
@@ -193,10 +194,11 @@ def record_cyber_event(
             """insert into cybersecurity_events
                (correlation_id, dedupe_key, event_type, category, severity, source,
                 actor_id, actor_type, device_id, ip_address, user_agent, occurred_at,
-                details_json, evidence_ref)
-               values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                details_json, evidence_ref, organization_id, site_id)
+               values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (correlation_id, dedupe, event_type, category, level, source, actor,
-             _text(actor_type, 40), device, ip, ua, occurred, json.dumps(details, sort_keys=True, default=str), log_reference),
+             _text(actor_type, 40), device, ip, ua, occurred, json.dumps(details, sort_keys=True, default=str), log_reference,
+             ORGANIZATION_ID, SITE_ID),
         )
         event_id = int(event_cur.lastrowid)
         base_key = _base_group_key(event_type, category, actor, device, ip, source)
@@ -212,25 +214,44 @@ def record_cyber_event(
             incident_cur = con.execute(
                 """insert into cybersecurity_incidents
                    (correlation_key, category, severity, summary, source, actor_id,
-                    device_id, ip_address, user_agent, first_event_at, last_event_at)
-                   values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    device_id, ip_address, user_agent, first_event_at, last_event_at,
+                    organization_id, site_id)
+                   values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (incident_key, category, level, _summary(event_type, details), source, actor,
-                 device, ip, ua, occurred, occurred),
+                 device, ip, ua, occurred, occurred, ORGANIZATION_ID, SITE_ID),
             )
             incident_id = int(incident_cur.lastrowid)
             con.execute(
-                "insert into cybersecurity_incident_alerts (incident_id, channel, status, correlation_id) values (?, 'local_review_queue', 'recorded', ?)",
-                (incident_id, correlation_id),
+                "insert into cybersecurity_incident_alerts (incident_id, channel, status, correlation_id, organization_id, site_id, device_id) values (?, 'local_review_queue', 'recorded', ?, ?, ?, ?)",
+                (incident_id, correlation_id, ORGANIZATION_ID, SITE_ID, DEVICE_ID),
             )
         con.execute("update cybersecurity_events set incident_id=? where id=?", (incident_id, event_id))
         con.execute("insert into cybersecurity_incident_events (incident_id, cyber_event_id) values (?, ?)", (incident_id, event_id))
+        record_action_in_connection(
+            con,
+            "cyber.event.recorded", "cybersecurity_event", event_id,
+            {"event_type": event_type, "incident_id": incident_id,
+             "correlation_id": correlation_id, "source": source},
+            actor_type=actor_type or "system", actor_id=actor,
+        )
+        enqueue_in_connection(
+            con,
+            "cybersecurity.event.recorded",
+            {
+                "event_id": event_id,
+                "event_type": event_type,
+                "incident_id": incident_id,
+                "correlation_id": correlation_id,
+                "severity": level,
+                "occurred_at": occurred,
+                "source": source,
+            },
+            event_id=f"cyber:{correlation_id}",
+            aggregate_type="cybersecurity_incident",
+            aggregate_id=incident_id,
+        )
         con.commit()
-    record_action(
-        "cyber.event.recorded", "cybersecurity_event", event_id,
-        {"event_type": event_type, "incident_id": incident_id, "correlation_id": correlation_id, "source": source},
-        actor_type=actor_type or "system", actor_id=actor,
-    )
-    result = normalize_event(fetch_one("select * from cybersecurity_events where id=?", [event_id]) or {})
+    result = normalize_event(fetch_one("select * from cybersecurity_events where id=? and organization_id=? and site_id=?", [event_id, ORGANIZATION_ID, SITE_ID]) or {})
     result["deduplicated"] = False
     return result
 
@@ -323,7 +344,7 @@ def _sync_runtime_events() -> int:
 
 
 def _sync_alert_failures() -> int:
-    rows = fetch_all("select * from alert_log where lower(coalesce(status, '')) in ('failed', 'error') order by id desc limit 500")
+    rows = fetch_all("select * from alert_log where lower(coalesce(status, '')) in ('failed', 'error') and organization_id=? and site_id=? order by id desc limit 500", [ORGANIZATION_ID, SITE_ID])
     created = 0
     for row in rows:
         error = str(row.get("error") or "")
@@ -348,7 +369,7 @@ def sync_operational_security_sources() -> dict[str, int]:
 
 def list_cyber_incidents(limit: int = 100, status: str | None = None, category: str | None = None, severity: int | None = None) -> list[dict[str, Any]]:
     sync_operational_security_sources()
-    filters, params = [], []
+    filters, params = ["i.organization_id=?", "i.site_id=?"], [ORGANIZATION_ID, SITE_ID]
     if status and status != "all":
         filters.append("i.status=?"); params.append(status)
     if category and category != "all":
@@ -375,7 +396,7 @@ def get_cyber_incident(incident_id: int) -> dict[str, Any]:
           (select count(*) from cybersecurity_incident_events x where x.incident_id=i.id) as event_count,
           (select count(*) from cybersecurity_incident_alerts x where x.incident_id=i.id) as alert_count,
           (select count(*) from cybersecurity_reviews x where x.incident_id=i.id) as review_count
-          from cybersecurity_incidents i where i.id=?""", [incident_id],
+          from cybersecurity_incidents i where i.id=? and i.organization_id=? and i.site_id=?""", [incident_id, ORGANIZATION_ID, SITE_ID],
     )
     if not row:
         raise HTTPException(status_code=404, detail={"code": "CYBER_INCIDENT_NOT_FOUND", "message": "Cybersecurity incident was not found."})
@@ -390,44 +411,49 @@ def review_cyber_incident(incident_id: int, action: str, note: str | None = None
     status = REVIEW_STATUSES.get(str(action or "").strip().lower())
     if not status:
         raise HTTPException(status_code=400, detail={"code": "INVALID_CYBER_REVIEW_ACTION", "message": "Use acknowledge, confirm, dismiss, escalate, or resolve."})
-    if not fetch_one("select id from cybersecurity_incidents where id=?", [incident_id]):
+    if not fetch_one("select id from cybersecurity_incidents where id=? and organization_id=? and site_id=?", [incident_id, ORGANIZATION_ID, SITE_ID]):
         raise HTTPException(status_code=404, detail={"code": "CYBER_INCIDENT_NOT_FOUND", "message": "Cybersecurity incident was not found."})
     clean_note = _text(note, 500)
-    execute_sql = "update cybersecurity_incidents set status=?, resolution_note=?, resolved_at=case when ? in ('resolved','dismissed') then datetime('now') else resolved_at end, resolved_by=case when ? in ('resolved','dismissed') then ? else resolved_by end, updated_at=datetime('now') where id=?"
-    with get_connection() as con:
-        con.execute(execute_sql, (status, clean_note, status, status, actor_id or "operator", incident_id))
-        con.execute("insert into cybersecurity_reviews (incident_id, action, note, actor_id) values (?, ?, ?, ?)", (incident_id, action, clean_note, actor_id or "operator"))
-        con.commit()
-    record_action("cyber.incident.review", "cybersecurity_incident", incident_id, {"action": action, "status": status, "note": clean_note or ""}, actor_id=actor_id)
+    execute_sql = "update cybersecurity_incidents set status=?, resolution_note=?, resolved_at=case when ? in ('resolved','dismissed') then datetime('now') else resolved_at end, resolved_by=case when ? in ('resolved','dismissed') then ? else resolved_by end, updated_at=datetime('now') where id=? and organization_id=? and site_id=?"
+    with transaction(immediate=True) as con:
+        con.execute(execute_sql, (status, clean_note, status, status, actor_id or "operator", incident_id, ORGANIZATION_ID, SITE_ID))
+        con.execute("insert into cybersecurity_reviews (incident_id, action, note, actor_id, organization_id, site_id, device_id) values (?, ?, ?, ?, ?, ?, ?)", (incident_id, action, clean_note, actor_id or "operator", ORGANIZATION_ID, SITE_ID, DEVICE_ID))
+        record_action_in_connection(
+            con, "cyber.incident.review", "cybersecurity_incident", incident_id,
+            {"action": action, "status": status, "note": clean_note or ""},
+            actor_id=actor_id,
+        )
     return get_cyber_incident(incident_id)
 
 
 def assign_cyber_incident(incident_id: int, assignee: str | None, actor_id: str | None = None) -> dict[str, Any]:
-    if not fetch_one("select id from cybersecurity_incidents where id=?", [incident_id]):
+    if not fetch_one("select id from cybersecurity_incidents where id=? and organization_id=? and site_id=?", [incident_id, ORGANIZATION_ID, SITE_ID]):
         raise HTTPException(status_code=404, detail={"code": "CYBER_INCIDENT_NOT_FOUND", "message": "Cybersecurity incident was not found."})
     assignee = _text(assignee, 120)
-    with get_connection() as con:
-        con.execute("update cybersecurity_incidents set assigned_to=?, status=case when status='open' and ? is not null then 'assigned' else status end, updated_at=datetime('now') where id=?", (assignee, assignee, incident_id))
-        con.execute("insert into cybersecurity_reviews (incident_id, action, note, actor_id) values (?, 'assign', ?, ?)", (incident_id, assignee, actor_id or "operator"))
-        con.commit()
-    record_action("cyber.incident.assign", "cybersecurity_incident", incident_id, {"assignee": assignee}, actor_id=actor_id)
+    with transaction(immediate=True) as con:
+        con.execute("update cybersecurity_incidents set assigned_to=?, status=case when status='open' and ? is not null then 'assigned' else status end, updated_at=datetime('now') where id=? and organization_id=? and site_id=?", (assignee, assignee, incident_id, ORGANIZATION_ID, SITE_ID))
+        con.execute("insert into cybersecurity_reviews (incident_id, action, note, actor_id, organization_id, site_id, device_id) values (?, 'assign', ?, ?, ?, ?, ?)", (incident_id, assignee, actor_id or "operator", ORGANIZATION_ID, SITE_ID, DEVICE_ID))
+        record_action_in_connection(
+            con, "cyber.incident.assign", "cybersecurity_incident", incident_id,
+            {"assignee": assignee}, actor_id=actor_id,
+        )
     return get_cyber_incident(incident_id)
 
 
 def list_cyber_events(limit: int = 200, event_type: str | None = None) -> list[dict[str, Any]]:
     sync_operational_security_sources()
     if event_type:
-        rows = fetch_all("select * from cybersecurity_events where event_type=? order by occurred_at desc, id desc limit ?", [event_type, max(1, min(int(limit), 500))])
+        rows = fetch_all("select * from cybersecurity_events where event_type=? and organization_id=? and site_id=? order by occurred_at desc, id desc limit ?", [event_type, ORGANIZATION_ID, SITE_ID, max(1, min(int(limit), 500))])
     else:
-        rows = fetch_all("select * from cybersecurity_events order by occurred_at desc, id desc limit ?", [max(1, min(int(limit), 500))])
+        rows = fetch_all("select * from cybersecurity_events where organization_id=? and site_id=? order by occurred_at desc, id desc limit ?", [ORGANIZATION_ID, SITE_ID, max(1, min(int(limit), 500))])
     return [normalize_event(row) for row in rows]
 
 
 def cybersecurity_summary() -> dict[str, Any]:
     sync_operational_security_sources()
-    statuses = fetch_all("select status, count(*) as count from cybersecurity_incidents group by status")
-    categories = fetch_all("select category as name, count(*) as value from cybersecurity_incidents group by category order by value desc")
-    types = fetch_all("select event_type as name, count(*) as value from cybersecurity_events group by event_type order by value desc")
+    statuses = fetch_all("select status, count(*) as count from cybersecurity_incidents where organization_id=? and site_id=? group by status", [ORGANIZATION_ID, SITE_ID])
+    categories = fetch_all("select category as name, count(*) as value from cybersecurity_incidents where organization_id=? and site_id=? group by category order by value desc", [ORGANIZATION_ID, SITE_ID])
+    types = fetch_all("select event_type as name, count(*) as value from cybersecurity_events where organization_id=? and site_id=? group by event_type order by value desc", [ORGANIZATION_ID, SITE_ID])
     return {
         "incidentTotal": sum(int(row["count"]) for row in statuses),
         "openIncidents": sum(int(row["count"]) for row in statuses if row["status"] not in {"dismissed", "resolved"}),

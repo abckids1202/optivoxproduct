@@ -127,6 +127,43 @@ def validate_webhook_url(url: str, mode: str = "development", allowed_hosts: Ite
     return {"scheme": parsed.scheme.lower(), "host": host.casefold(), "port": port}
 
 
+def validate_control_plane_url(url: str, mode: str = "development", allowed_hosts: Iterable[str] = ()) -> dict[str, Any]:
+    """Validate an outbound HTTPS synchronization endpoint.
+
+    Control-plane URLs are stricter than local webhooks: credentials, query
+    strings, fragments, and private destinations are never accepted.  In
+    pilot/production the host must be explicitly allowlisted so a corrupted
+    environment variable cannot turn the edge agent into an SSRF client.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise DeploymentSecurityError("control-plane URL is empty")
+    parsed = urlparse(url.strip())
+    host = parsed.hostname
+    if parsed.scheme.lower() != "https":
+        raise DeploymentSecurityError("control-plane URL must use HTTPS")
+    if not host or parsed.username is not None or parsed.password is not None:
+        raise DeploymentSecurityError("control-plane URL must have a host and no embedded credentials")
+    if parsed.query or parsed.fragment:
+        raise DeploymentSecurityError("control-plane URL must not contain query strings or fragments")
+    configured_hosts = tuple(str(item).strip() for item in allowed_hosts if str(item).strip())
+    strict = is_strict_mode(mode)
+    if strict and not configured_hosts:
+        raise DeploymentSecurityError("strict synchronization requires an explicit control-plane host allowlist")
+    if configured_hosts and not _host_allowed(host, configured_hosts):
+        raise DeploymentSecurityError("control-plane host is not in the outbound host allowlist")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and (ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified):
+        raise DeploymentSecurityError("control-plane URL cannot target a private or loopback IP")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise DeploymentSecurityError("control-plane URL port is invalid") from exc
+    return {"scheme": "https", "host": host.casefold(), "port": port, "path": parsed.path or "/"}
+
+
 def validate_alert_config(alert_config: Mapping[str, Any], mode: str = "development") -> list[str]:
     """Return safe configuration issues without exposing credential values."""
     issues: list[str] = []
@@ -265,6 +302,9 @@ def validate_edge_configuration(config: Mapping[str, Any], root: str | os.PathLi
     if danger.get("ENABLED"):
         model_paths += list(danger.get("MODEL_PATHS") or [])
     model_paths = [path for path in model_paths if path]
+    correlation = config.get("CORRELATION_CORE") or {}
+    if is_strict_mode(mode) and correlation.get("ENABLED", True) is not True:
+        issues.append("strict runtime requires CORRELATION_CORE.ENABLED=true")
     try:
         model_result = verify_model_manifest(model_paths, root, manifest_path, required=is_strict_mode(mode))
     except DeploymentSecurityError as exc:
@@ -275,6 +315,23 @@ def validate_edge_configuration(config: Mapping[str, Any], root: str | os.PathLi
     except DeploymentSecurityError as exc:
         face_model_result = {"status": "FAILED", "verified": [], "issues": [str(exc)]}
         issues.extend(face_model_result["issues"])
+    registry_path = Path(root).resolve() / "models" / "model_registry.json"
+    model_registry_result = {"status": "NOT_CONFIGURED", "models": [], "issues": []}
+    if registry_path.exists():
+        try:
+            from core.model_registry import registry_snapshot
+            model_registry_result = registry_snapshot(root, registry_path)
+            if model_registry_result.get("status") == "INVALID":
+                issues.extend(
+                    f"model registry: {item}"
+                    for item in model_registry_result.get("issues", [])
+                )
+        except (OSError, ValueError, TypeError) as exc:
+            model_registry_result = {
+                "status": "INVALID", "models": [],
+                "issues": [f"registry validation failed: {exc}"],
+            }
+            issues.extend(f"model registry: {item}" for item in model_registry_result["issues"])
     if not 0 < float(config.get("YOLO_CONF", 0.4)) <= 1:
         issues.append("YOLO_CONF must be between 0 and 1")
     for key in ("CAPTURE_WIDTH", "CAPTURE_HEIGHT", "PROCESSING_WIDTH", "PROCESSING_HEIGHT"):
@@ -283,7 +340,13 @@ def validate_edge_configuration(config: Mapping[str, Any], root: str | os.PathLi
                 issues.append(f"{key} must be positive")
         except (TypeError, ValueError):
             issues.append(f"{key} must be an integer")
-    return {"status": "VALID" if not issues else "INVALID", "issues": sorted(set(issues), key=str), "models": model_result, "face_model": face_model_result}
+    return {
+        "status": "VALID" if not issues else "INVALID",
+        "issues": sorted(set(issues), key=str),
+        "models": model_result,
+        "face_model": face_model_result,
+        "model_registry": model_registry_result,
+    }
 
 
 def process_identity() -> dict[str, Any]:

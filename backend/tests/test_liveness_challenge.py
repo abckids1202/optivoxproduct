@@ -20,3 +20,24 @@ def test_liveness_challenge_is_deterministic_and_entity_scoped():
 
     other = challenge.update("cam_0:entity:2", 0.0, 0.0)
     assert other["passed"] is False
+
+
+def test_liveness_timeout_retries_are_persisted_per_entity_and_eventually_terminal():
+    challenge = LivenessChallenge({
+        "CENTER_MODE_CHALLENGE_TIMEOUT_SEC": 1,
+        "CENTER_MODE_MAX_LIVENESS_ATTEMPTS": 2,
+    })
+    key = "cam_0:entity:timeout"
+
+    challenge.update(key, 0.0, 0.0)
+    first = challenge.update(key, 0.0, 2.0)
+    assert first["timed_out"] is True
+    assert first["terminal"] is False
+    assert first["retry_count"] == 1
+    assert challenge.state_for(key)["retry_count"] == 1
+
+    second = challenge.update(key, 0.0, 4.0)
+    assert second["timed_out"] is True
+    assert second["terminal"] is True
+    assert second["status"] == "SPOOF_SUSPECT"
+    assert challenge.state_for(key)["failure_count"] == 2

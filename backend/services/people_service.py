@@ -5,10 +5,11 @@ import json
 
 from fastapi import HTTPException
 
-from ..database import execute, fetch_all, fetch_one
-from ..config import local_today
+from ..database import execute, fetch_all, fetch_one, transaction
+from ..config import ORGANIZATION_ID, SITE_ID, local_today
 from .attendance_service import attendance_status
-from .audit_service import record_action
+from .audit_service import record_action_in_connection
+from .outbox_service import enqueue_in_connection
 
 
 def normalize_person(row: dict[str, Any]) -> dict[str, Any]:
@@ -40,13 +41,17 @@ def list_people() -> list[dict[str, Any]]:
     rows = fetch_all(
         """
         select p.*,
-               (select max(e.timestamp) from events e where e.person_id=p.id) as last_seen,
-               (select a.clock_in from attendance a where a.person_id=p.id and a.date=?) as today_clock_in,
-               (select a.clock_out from attendance a where a.person_id=p.id and a.date=?) as today_clock_out,
-               (select a.late_minutes from attendance a where a.person_id=p.id and a.date=?) as today_late
-        from people p order by p.name
+               (select max(e.timestamp) from events e where e.person_id=p.id and e.organization_id=? and e.site_id=?) as last_seen,
+               (select a.clock_in from attendance a where a.person_id=p.id and a.date=? and a.organization_id=? and a.site_id=?) as today_clock_in,
+               (select a.clock_out from attendance a where a.person_id=p.id and a.date=? and a.organization_id=? and a.site_id=?) as today_clock_out,
+               (select a.late_minutes from attendance a where a.person_id=p.id and a.date=? and a.organization_id=? and a.site_id=?) as today_late
+        from people p
+        where p.organization_id=? and p.site_id=?
+        order by p.name
         """,
-        [today, today, today],
+        [ORGANIZATION_ID, SITE_ID, today, ORGANIZATION_ID, SITE_ID,
+         today, ORGANIZATION_ID, SITE_ID, today, ORGANIZATION_ID, SITE_ID,
+         ORGANIZATION_ID, SITE_ID],
     )
     out = []
     for row in rows:
@@ -60,58 +65,58 @@ def list_people() -> list[dict[str, Any]]:
 
 
 def get_person(person_id: int) -> dict[str, Any]:
-    row = fetch_one("select * from people where id=?", [person_id])
+    row = fetch_one("select * from people where id=? and organization_id=? and site_id=?", [person_id, ORGANIZATION_ID, SITE_ID])
     if not row:
         raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
     person = normalize_person(row)
-    person["recent_events"] = fetch_all("select * from events where person_id=? order by timestamp desc limit 50", [person_id])
-    person["attendance_summary"] = fetch_all("select * from attendance where person_id=? order by date desc limit 30", [person_id])
+    person["recent_events"] = fetch_all("select * from events where person_id=? and organization_id=? and site_id=? order by timestamp desc limit 50", [person_id, ORGANIZATION_ID, SITE_ID])
+    person["attendance_summary"] = fetch_all("select * from attendance where person_id=? and organization_id=? and site_id=? order by date desc limit 30", [person_id, ORGANIZATION_ID, SITE_ID])
     person["absence_history"] = fetch_all(
-        "select * from absence_records where person_id=? order by absence_date desc, id desc limit 100",
-        [person_id],
+        "select * from absence_records where person_id=? and organization_id=? and site_id=? order by absence_date desc, id desc limit 100",
+        [person_id, ORGANIZATION_ID, SITE_ID],
     )
     person["corrections"] = fetch_all(
-        "select * from attendance_corrections where person_id=? order by created_at desc limit 50",
-        [person_id],
+        "select * from attendance_corrections where person_id=? and organization_id=? and site_id=? order by created_at desc limit 50",
+        [person_id, ORGANIZATION_ID, SITE_ID],
     )
     person["presence_sessions"] = fetch_all(
         """select s.*, count(r.id) as evidence_count
            from presence_sessions s
            left join recognition_evidence r on r.presence_session_id=s.id
-           where s.person_id=? group by s.id
+           where s.person_id=? and s.organization_id=? and s.site_id=? group by s.id
            order by s.last_seen_at desc limit 30""",
-        [person_id],
+        [person_id, ORGANIZATION_ID, SITE_ID],
     )
     person["recognition_evidence"] = fetch_all(
         """select id, entity_id, presence_session_id, track_id, person_id,
                   candidate_name, decision, similarity, quality_score, quality_ok,
                   liveness_status, identity_state, reason, source_frame_id,
                   observed_at, details_json
-           from recognition_evidence where person_id=?
+           from recognition_evidence where person_id=? and organization_id=? and site_id=?
            order by observed_at desc limit 50""",
-        [person_id],
+        [person_id, ORGANIZATION_ID, SITE_ID],
     )
     person["attendance_decisions"] = fetch_all(
         """select id, decision_key, entity_id, presence_session_id,
                   recognition_evidence_id, decision, reason, identity_state,
                   liveness_status, quality_score, recognition_confidence,
                   source_frame_id, observed_at, details_json, created_at
-           from attendance_decisions where person_id=?
+           from attendance_decisions where person_id=? and organization_id=? and site_id=?
            order by observed_at desc, id desc limit 100""",
-        [person_id],
+        [person_id, ORGANIZATION_ID, SITE_ID],
     )
     person["enrollment_operations"] = fetch_all(
         """select id, person_name, operation, status, sample_count,
                   quality_json, provenance_json, actor_id, created_at
-           from enrollment_operations where person_id=?
+           from enrollment_operations where person_id=? and organization_id=? and site_id=?
            order by created_at desc, id desc limit 20""",
-        [person_id],
+        [person_id, ORGANIZATION_ID, SITE_ID],
     )
     return person
 
 
 def update_person(person_id: int, payload: dict[str, Any], actor_id: str | None = None) -> dict[str, Any]:
-    current = fetch_one("select * from people where id=?", [person_id])
+    current = fetch_one("select * from people where id=? and organization_id=? and site_id=?", [person_id, ORGANIZATION_ID, SITE_ID])
     if not current:
         raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
     allowed = {k: v for k, v in payload.items() if k in {"name", "role"} and v is not None}
@@ -119,7 +124,7 @@ def update_person(person_id: int, payload: dict[str, Any], actor_id: str | None 
         allowed["name"] = str(allowed["name"]).strip()
         if not allowed["name"]:
             raise HTTPException(status_code=422, detail={"code": "INVALID_NAME", "message": "A person name is required."})
-        duplicate = fetch_one("select id from people where lower(name)=lower(?) and id<>?", [allowed["name"], person_id])
+        duplicate = fetch_one("select id from people where lower(name)=lower(?) and id<>? and organization_id=? and site_id=?", [allowed["name"], person_id, ORGANIZATION_ID, SITE_ID])
         if duplicate:
             raise HTTPException(status_code=409, detail={"code": "DUPLICATE_PERSON", "message": "Another person already has this name."})
     metadata = parse_metadata(current.get("metadata_json"))
@@ -145,8 +150,23 @@ def update_person(person_id: int, payload: dict[str, Any], actor_id: str | None 
         sets.append("metadata_json=?")
         params.append(json.dumps(metadata))
     params.append(person_id)
-    execute(f"update people set {', '.join(sets)}, updated_at=datetime('now') where id=?", params)
-    record_action("people.update", "person", person_id, {"fields": sorted(set(allowed) | ({"metadata"} if metadata_changed else set()))}, actor_id=actor_id)
+    fields = sorted(set(allowed) | ({"metadata"} if metadata_changed else set()))
+    with transaction(immediate=True) as con:
+        con.execute(
+            f"update people set {', '.join(sets)}, updated_at=datetime('now') where id=? and organization_id=? and site_id=?",
+            [*params, ORGANIZATION_ID, SITE_ID],
+        )
+        record_action_in_connection(
+            con, "people.update", "person", person_id,
+            {"fields": fields}, actor_id=actor_id,
+        )
+        enqueue_in_connection(
+            con,
+            "person.profile_updated",
+            {"person_id": person_id, "fields": fields},
+            aggregate_type="person",
+            aggregate_id=person_id,
+        )
     return get_person(person_id)
 
 
@@ -164,10 +184,25 @@ def normalized_subjects(value: Any) -> list[str]:
 
 
 def set_enabled(person_id: int, enabled: bool, actor_id: str | None = None) -> dict[str, Any]:
-    if not fetch_one("select id from people where id=?", [person_id]):
+    if not fetch_one("select id from people where id=? and organization_id=? and site_id=?", [person_id, ORGANIZATION_ID, SITE_ID]):
         raise HTTPException(status_code=404, detail={"code": "PERSON_NOT_FOUND", "message": "Person was not found."})
-    metadata = parse_metadata(fetch_one("select metadata_json from people where id=?", [person_id]).get("metadata_json"))
+    metadata = parse_metadata(fetch_one("select metadata_json from people where id=? and organization_id=? and site_id=?", [person_id, ORGANIZATION_ID, SITE_ID]).get("metadata_json"))
     metadata["active"] = enabled
-    execute("update people set metadata_json=?, updated_at=datetime('now') where id=?", [json.dumps(metadata), person_id])
-    record_action("people.enable" if enabled else "people.disable", "person", person_id, {"active": enabled}, actor_id=actor_id)
+    with transaction(immediate=True) as con:
+        con.execute(
+            "update people set metadata_json=?, updated_at=datetime('now') where id=? and organization_id=? and site_id=?",
+            [json.dumps(metadata), person_id, ORGANIZATION_ID, SITE_ID],
+        )
+        record_action_in_connection(
+            con, "people.enable" if enabled else "people.disable", "person", person_id,
+            {"active": enabled}, actor_id=actor_id,
+        )
+        enqueue_in_connection(
+            con,
+            "person.activation_changed",
+            {"person_id": person_id, "active": bool(enabled)},
+            event_id=f"person-active:{person_id}:{int(bool(enabled))}",
+            aggregate_type="person",
+            aggregate_id=person_id,
+        )
     return get_person(person_id)

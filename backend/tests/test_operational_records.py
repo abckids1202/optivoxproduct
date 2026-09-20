@@ -118,3 +118,36 @@ def test_operations_api_exposes_correlated_counts_and_validates_limits(platform_
     assert summary.status_code == 200
     assert summary.json()["activePresenceSessions"] == 0
     assert invalid.status_code == 422
+
+
+def test_liveness_challenge_api_exposes_safe_entity_trace(platform_db):
+    database.execute(
+        """
+        insert into liveness_challenges
+            (entity_id, track_id, track_generation, challenge_state, phase,
+             liveness_status, started_at, updated_at, attempt_number,
+             source_frame_id, failure_reason, metrics_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            "cam_0:entity-1", 4, 2, "PASSED", "RETURN_FORWARD", "REAL",
+            "2026-08-29T09:00:00+00:00", "2026-08-29T09:00:04+00:00", 1,
+            104, None, json.dumps({"forward_frames": 4, "quality": 88, "embedding": "must-not-leak"}),
+        ],
+    )
+
+    result = operational_service.list_liveness_challenges()
+
+    assert result[0]["entityId"] == "cam_0:entity-1"
+    assert result[0]["challengeState"] == "PASSED"
+    assert result[0]["trackGeneration"] == 2
+    assert result[0]["metrics"] == {"forward_frames": 4, "quality": 88}
+    assert "embedding" not in result[0]["metrics"]
+
+    from fastapi.testclient import TestClient
+
+    from backend.main import app
+
+    response = TestClient(app).get("/api/operations/liveness-challenges?limit=1")
+    assert response.status_code == 200
+    assert response.json()[0]["livenessStatus"] == "REAL"

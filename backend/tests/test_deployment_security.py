@@ -12,6 +12,7 @@ from deployment_security import (
     check_required_dependencies,
     safe_local_path,
     validate_camera_source,
+    validate_control_plane_url,
     validate_edge_configuration,
     validate_webhook_url,
     verify_model_manifest,
@@ -54,6 +55,16 @@ def test_unsafe_webhook_urls_are_rejected():
     assert validate_webhook_url("https://alerts.example.com/hook", "production", ["example.com"])["host"] == "alerts.example.com"
 
 
+def test_control_plane_requires_https_allowlist_and_public_destination():
+    with pytest.raises(DeploymentSecurityError):
+        validate_control_plane_url("http://control.example.com/ingest", "production", ["control.example.com"])
+    with pytest.raises(DeploymentSecurityError):
+        validate_control_plane_url("https://control.example.com/ingest?secret=bad", "production", ["control.example.com"])
+    with pytest.raises(DeploymentSecurityError):
+        validate_control_plane_url("https://127.0.0.1/ingest", "production", ["127.0.0.1"])
+    assert validate_control_plane_url("https://control.example.com/ingest", "production", ["example.com"])["host"] == "control.example.com"
+
+
 def test_invalid_paths_and_camera_sources_fail(tmp_path):
     with pytest.raises(DeploymentSecurityError):
         safe_local_path("../outside.mp4", tmp_path)
@@ -79,6 +90,34 @@ def test_invalid_strict_configuration_fails_closed(tmp_path):
     assert result["status"] == "INVALID"
     assert result["issues"]
     assert any("model" in issue.lower() for issue in result["issues"])
+
+
+def test_strict_runtime_cannot_disable_correlation_authority(tmp_path):
+    result = validate_edge_configuration({
+        "CAMERAS": [{"id": "cam-1", "source": 0, "enabled": True}],
+        "MODEL_PATH": None,
+        "CORRELATION_CORE": {"ENABLED": False},
+    }, tmp_path, "pilot")
+    assert result["status"] == "INVALID"
+    assert any("correlation_core" in issue.lower() for issue in result["issues"])
+
+
+def test_invalid_model_registry_is_reported_by_startup_validation(tmp_path):
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "model_registry.json").write_text(json.dumps({
+        "schema_version": 1,
+        "models": [{
+            "name": "unsafe", "task": "test", "version": "1",
+            "path": "../outside.onnx", "sha256": "0" * 64,
+            "source": "test", "license": "test", "evaluation_report": "test",
+        }],
+    }), encoding="utf-8")
+    result = validate_edge_configuration(
+        {"CAMERAS": [{"id": "cam-1", "source": 0}], "MODEL_PATH": None},
+        tmp_path, "development")
+    assert result["model_registry"]["status"] == "INVALID"
+    assert any("model registry" in issue for issue in result["issues"])
 
 
 def test_unknown_runtime_mode_is_invalid(tmp_path):

@@ -25,7 +25,7 @@ def command(req: CommandRequest, request: Request,
     if permission:
         actor = require_permission(permission)(request, x_optivox_key, authorization)
     event_type = None
-    if req.command in {"start_enrollment", "confirm_enrollment", "register_visible_unknown", "cancel_enrollment", "retrain_person", "disable_person", "merge_people", "delete_person"}:
+    if req.command in {"start_enrollment", "finish_enrollment", "confirm_enrollment", "register_visible_unknown", "cancel_enrollment", "retrain_person", "disable_person", "merge_people", "delete_person"}:
         event_type = "BIOMETRIC_CHANGE"
     elif req.command == "reset_demo_data":
         event_type = "CONFIGURATION_CHANGE"
@@ -66,6 +66,11 @@ def cancel_enrollment():
 @router.post("/enrollment/confirm")
 def confirm_enrollment(payload: dict, actor: str = Depends(require_permission("biometric.enroll")), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     return svc.create_command("confirm_enrollment", {**payload, "actor_id": actor}, idempotency_key=idempotency_key)
+
+
+@router.post("/enrollment/finish")
+def finish_enrollment(actor: str = Depends(require_permission("biometric.enroll")), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return svc.create_command("finish_enrollment", {"actor_id": actor}, idempotency_key=idempotency_key)
 
 
 @router.post("/people/{person_name}/retrain")

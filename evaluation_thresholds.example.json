@@ -1,0 +1,27 @@
+{
+  "recognition": {
+    "accuracy_min": 0.95,
+    "false_accept_rate_max": 0.01,
+    "false_reject_rate_max": 0.10,
+    "unknown_rejection_accuracy_min": 0.99
+  },
+  "liveness": {
+    "false_accept_rate_max": 0.01,
+    "false_reject_rate_max": 0.20
+  },
+  "tracking": {
+    "id_switch_rate_max": 0.05
+  },
+  "security": {
+    "false_alerts_per_camera_hour_max": 1.0
+  },
+  "coverage": {
+    "required_tags": [
+      "known",
+      "unknown",
+      "occlusion",
+      "liveness",
+      "intrusion"
+    ]
+  }
+}

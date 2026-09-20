@@ -20,13 +20,18 @@ backend/.pytest-temp/
 *.sqlite
 *.sqlite3
 data/
+!data/
+data/*
+!data/replay_example.json
 models/
 known_faces/
 snapshots/
 reports/
 exports/
+backups/
 runtime/
 logs/
+*.schema.lock
 
 # Model weights and large binaries
 *.pt

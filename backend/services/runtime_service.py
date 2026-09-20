@@ -86,11 +86,15 @@ def live_state() -> dict[str, Any]:
     camera = state.get("camera", {})
     presence = state.get("presence", {})
     objects = state.get("objects", [])
+    vehicles = state.get("vehicles", {})
     security = state.get("security", {})
     performance = state.get("performance", {})
     performance_summary = read_json(PERFORMANCE_SUMMARY_PATH, {}) or {}
     liveness = read_json(LIVENESS_METRICS_PATH, {}) or {}
     correlation = state.get("correlation", {})
+    attendance = state.get("attendance", {})
+    crowd = state.get("crowd", {})
+    demographics = state.get("demographics", {})
     return {
         "generatedAt": now_iso(),
         "device": {"id": DEVICE_ID, "type": "edge-agent", "biometric_owner": "local_engine"},
@@ -120,7 +124,10 @@ def live_state() -> dict[str, Any]:
         "performance": performance,
         "performanceSummary": performance_summary,
         "liveness": liveness,
+        "attendance": attendance,
         "correlation": correlation,
+        "crowd": crowd,
+        "demographics": demographics,
         "security": {
             "level": security.get("level", "normal"),
             "message": security.get("message", "No active warning"),
@@ -135,6 +142,7 @@ def live_state() -> dict[str, Any]:
         },
         "visiblePeople": normalize_people(presence),
         "objects": normalize_objects(objects),
+        "vehicles": vehicles,
         "events": state.get("recent_events", []),
         "healthEvents": health_events(),
     }
@@ -153,12 +161,16 @@ def performance_report() -> dict[str, Any]:
         "yolo_latency_ms": None,
         "pose_latency_ms": None,
         "frame_age_p95_ms": None,
+        "frame_age_consumed_p95_ms": None,
+        "stale_frame_age_p95_ms": None,
         "end_to_end_latency_ms": latency.get("end_to_end_p95"),
         "cpu_percent": None,
         "gpu_percent": None,
         "vram_used_mb": None,
         "recognition_attempts_per_second": None,
         "identity_confirmation_ms": None,
+        "identity_confirmation_p95_ms": None,
+        "recognition_cache_hit_rate_percent": None,
         "frames_replaced": None,
     }
     vision = report.get("vision", {}) if isinstance(report.get("vision", {}), dict) else {}
@@ -173,13 +185,26 @@ def performance_report() -> dict[str, Any]:
         "yolo_latency_ms": (models.get("yolo") or {}).get("average_latency_ms"),
         "pose_latency_ms": (models.get("pose") or {}).get("average_latency_ms"),
         "frame_age_p95_ms": latency.get("frame_age_p95"),
+        "frame_age_consumed_p95_ms": (
+            latency.get("frame_age_consumed_p95")
+            or latency.get("frame_age_p95")
+        ),
+        "stale_frame_age_p95_ms": latency.get("stale_frame_age_p95"),
         "cpu_percent": resources.get("cpu_percent"),
         "gpu_percent": resources.get("gpu_percent"),
         "vram_used_mb": resources.get("vram_used_mb"),
         "recognition_attempts_per_second": matching.get("calls_per_second"),
         "identity_confirmation_ms": round(float(identity_timing.get("mean_time_to_confirm_sec")) * 1000, 2) if identity_timing.get("mean_time_to_confirm_sec") is not None else None,
+        "identity_confirmation_p95_ms": round(float(identity_timing.get("p95_time_to_confirm_sec")) * 1000, 2) if identity_timing.get("p95_time_to_confirm_sec") is not None else None,
+        "recognition_cache_hit_rate_percent": (
+            (report.get("recognition") or {}).get("cache_hit_rate_percent")
+            if isinstance(report.get("recognition"), dict) else None
+        ),
         "frames_replaced": (report.get("counters") or {}).get("frames_replaced"),
-        "end_to_end_latency_ms": None,
+        # Preserve the measured p95 end-to-end latency. This used to be
+        # overwritten after being read from the benchmark summary, causing the
+        # API to report a missing value even when the runtime measured it.
+        "end_to_end_latency_ms": latency.get("end_to_end_p95"),
     })
     ended_at = (report.get("benchmark") or {}).get("ended_at")
     age_seconds = None
@@ -191,7 +216,20 @@ def performance_report() -> dict[str, Any]:
             age_seconds = max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
         except (TypeError, ValueError):
             pass
-    values["measurement_status"] = "NOT_MEASURED" if not report else ("FRESH" if age_seconds is not None and age_seconds <= 86400 else "STALE")
+    # Shutdown summaries from before the benchmark contract predate
+    # measurement_status. Preserve their measured values for compatibility;
+    # explicit PARTIAL/NOT_MEASURED values always take precedence.
+    report_status = str(report.get("measurement_status") or "MEASURED").upper()
+    if not report or report_status == "NOT_MEASURED":
+        measurement_status = "NOT_MEASURED"
+    elif age_seconds is None or age_seconds > 86400:
+        measurement_status = "STALE"
+    elif report_status == "PARTIAL":
+        measurement_status = "PARTIAL"
+    else:
+        measurement_status = "FRESH"
+    values["measurement_status"] = measurement_status
+    values["collection_quality"] = report.get("collection_quality", "NOT_MEASURED")
     values["benchmark_age_seconds"] = round(age_seconds, 1) if age_seconds is not None else None
     values["benchmark"] = report.get("benchmark", {})
     values["source"] = str(PERFORMANCE_SUMMARY_PATH)

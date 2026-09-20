@@ -13,6 +13,7 @@ import traceback
 import queue
 import hashlib
 import textwrap
+from contextlib import contextmanager
 import numpy as np
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -35,7 +36,27 @@ from core.face_augmentation import generate_variants
 from core.security import SecuritySignalEngine
 from core.liveness import LivenessChallenge
 from core.assistant_policy import assistant_tool_allowed
+from core.vehicle_intelligence import VehicleIntelligence
+from core.model_adapters import ModelAdapterRegistry, ModelSpec
+from core.tracking_adapter import TrackingAdapter
+from core.notification_policy import notification_decision
+from core.policy_engine import PolicyEngine
+from core.edge_sync import EdgeEventOutbox, OutboxSecurityError
+from core.sync_transport import EdgeSyncClient, urllib_transport
+from core.device_auth import load_ed25519_private_key
 from biometric_storage import BiometricStorageError, load_face_database, save_face_database
+from core.demographics import age_band
+from core.model_registry import registry_snapshot
+from schema_migrations import append_audit_record, consistency_issues, create_audit_checkpoint, ensure_schema_migrations, migration_issues, record_schema_state, refresh_schema_state_fingerprint, schema_object_issues, schema_state_issues, verify_audit_chain
+from backend.services.outbox_service import enqueue_in_connection
+from backend.services.storage_service import read_evidence_bytes, write_evidence_bytes
+from backend.database import connect_database, database_migration_lock
+from backend.config import (
+    SQLITE_SECURE_DELETE,
+    SQLITE_SYNCHRONOUS,
+    validate_runtime_configuration,
+)
+from backend.platform_schema import ensure_platform_schema
 from deployment_security import (
     CameraHealthMonitor,
     DeploymentSecurityError,
@@ -44,8 +65,10 @@ from deployment_security import (
     process_identity,
     validate_alert_config,
     validate_camera_source,
+    validate_control_plane_url,
     validate_edge_configuration,
     validate_webhook_url,
+    safe_local_path,
     verify_face_model_cache,
     watchdog_status,
 )
@@ -132,6 +155,11 @@ except ImportError:
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def _configured_project_path(name: str, default: str) -> str:
+    value = os.environ.get(name, default).strip()
+    return value if os.path.isabs(value) else os.path.join(_BASE_DIR, value)
+
+
 def _env_int_list(name, default):
     values = []
     for item in os.environ.get(name, "").split(","):
@@ -150,7 +178,7 @@ def _env_string_list(name):
 CONFIG: Dict[str, Any] = {
     #Paths
     "BASE_DIR": _BASE_DIR,
-    "DATABASE_FILE": os.path.join(_BASE_DIR, "security.db"),
+    "DATABASE_FILE": _configured_project_path("OPTIVOX_DATABASE_PATH", "security.db"),
     "FACE_DB_FILE": os.path.join(_BASE_DIR, "data", "face_db.pkl"),
     "SNAPSHOT_DIR": os.path.join(_BASE_DIR, "snapshots"),
     "EXPORT_DIR": os.path.join(_BASE_DIR, "exports"),
@@ -356,6 +384,23 @@ CONFIG: Dict[str, Any] = {
         },
     },
 
+    # Vehicle tracking is safe to enable with the existing detector. Physical
+    # speed and plate reading remain unavailable until explicit calibration or
+    # a licensed plate/OCR adapter is configured.
+    "VEHICLE_INTELLIGENCE": {
+        "ENABLED": True,
+        "MAX_MATCH_DISTANCE_PX": 140.0,
+        "MAX_PREDICTION_SEC": 0.75,
+        "TRACK_TTL_SEC": 2.0,
+        "SPEED_LIMIT_KMH": None,
+        "SPEED_CONFIRM_SECONDS": 0.8,
+        "SPEED_ALERT_COOLDOWN_SECONDS": 30.0,
+        "SPEED_REPORT_INTERVAL_SECONDS": 1.0,
+        "PLATE_MIN_CONFIDENCE": 0.75,
+        "PLATE_MIN_HITS": 3,
+        "CALIBRATION": None,
+    },
+
     "PERFORMANCE": {
     "YOLO_EVERY_N_FRAMES": 8,
     "FACE_DETECT_EVERY_N_FRAMES": 4,
@@ -415,6 +460,7 @@ CONFIG: Dict[str, Any] = {
         "MAX_ENTITIES": 128,
         "MAX_OBSERVATIONS_PER_TYPE": 12,
         "ENTITY_CLOSE_AFTER_SEC": 10.0,
+        "IDENTITY_STALE_AFTER_SEC": 3.0,
         "TTL_MS": {
             "PERSON_DETECTED": 350,
             "FACE_DETECTED": 350,
@@ -451,7 +497,9 @@ CONFIG: Dict[str, Any] = {
         "DAILY_CLOCKOUT_TIMEOUT_MIN": 720,  
         "AUTO_CLOCKOUT_TIMEOUT_MIN": 15,
         "AUTO_CLOCKOUT_ON_SHUTDOWN": True,
-        "PRESENCE_SESSION_CLOSE_AFTER_SEC": 5.0,
+        # Keep durable sessions alive at least as long as the correlation
+        # entity can survive temporary track loss.
+        "PRESENCE_SESSION_CLOSE_AFTER_SEC": 10.0,
         "SCHOOL_DAYS": _env_int_list("OPTIVOX_SCHOOL_DAYS", [0, 1, 2, 3, 4]),
         "HOLIDAYS": _env_string_list("OPTIVOX_SCHOOL_HOLIDAYS"),
         "RECOGNITION_EVIDENCE_MIN_INTERVAL_SEC": 0.75,
@@ -566,24 +614,26 @@ def _today_iso() -> str:
     return _local_datetime().date().isoformat()
 
 
+def _event_datetime(value=None) -> dt_datetime:
+    """Parse an event timestamp for analytics, falling back safely to now."""
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            parsed = dt_datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt_timezone.utc)
+            return parsed.astimezone(dt_timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return _utc_datetime()
+
+
 def _is_school_day(local_now=None) -> bool:
     """Return whether automatic attendance is allowed on this local date."""
     local_now = local_now or _local_datetime()
-    attendance_cfg = CONFIG.get("ATTENDANCE", {})
-    raw_days = attendance_cfg.get("SCHOOL_DAYS", range(5))
-    school_days = set()
-    for day in raw_days:
-        try:
-            day = int(day)
-        except (TypeError, ValueError):
-            continue
-        if 0 <= day <= 6:
-            school_days.add(day)
-    holidays = {
-        str(day).strip() for day in attendance_cfg.get("HOLIDAYS", [])
-        if str(day).strip()
-    }
-    return local_now.weekday() in school_days and local_now.date().isoformat() not in holidays
+    # Calendar eligibility is a policy decision, not a vision decision. The
+    # snapshot also fails closed when the configured calendar is malformed.
+    return PolicyEngine(CONFIG).snapshot.attendance_school_day(local_now)
 
 
 def _parse_timestamp(value: str) -> dt_datetime:
@@ -621,6 +671,25 @@ def _compute_intra_class_variance(embeddings):
             distances.append(d)
     return float(np.mean(distances)), float(np.std(distances))
 
+
+def _enrollment_basis_embeddings(record: dict) -> list:
+    """Return original enrollment evidence for threshold calibration.
+
+    Derived images are useful as bounded matching support, but they are not
+    independent identity evidence. Keeping them out of variance calibration
+    prevents augmentation volume from making a threshold look better than the
+    underlying consented captures justify.
+    """
+    embeddings = list(record.get("embeddings", []) or []) if isinstance(record, dict) else []
+    provenance = record.get("embedding_provenance") if isinstance(record, dict) else None
+    if not isinstance(provenance, list) or not provenance:
+        return embeddings
+    aligned = list(provenance[-len(embeddings):]) if embeddings else []
+    originals = [embedding for embedding, metadata in zip(embeddings, aligned)
+                 if not isinstance(metadata, dict)
+                 or metadata.get("kind") != "augmented"]
+    return originals or embeddings
+
 def _auto_threshold(mean_var, std_var, margin=None):
     if margin is None: margin = CONFIG["AUTO_THRESHOLD_MARGIN"]
     base = 1.0 - (mean_var + 2 * std_var)
@@ -646,9 +715,14 @@ def ensure_dirs():
     os.makedirs(os.path.dirname(CONFIG["FACE_DB_FILE"]), exist_ok=True)
 
 class DatabaseMigrationManager:
-    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock,
+                 organization_id: str = "local-organization",
+                 site_id: str = "local-site", device_id: str = "local-edge"):
         self.conn = conn
         self.lock = lock
+        self.organization_id = str(organization_id or "local-organization")
+        self.site_id = str(site_id or "local-site")
+        self.device_id = str(device_id or "local-edge")
 
     def table_columns(self, table_name: str) -> set:
         rows = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
@@ -658,7 +732,13 @@ class DatabaseMigrationManager:
         if column_name in self.table_columns(table_name):
             return
         print(f"[DB] Migration: adding {table_name}.{column_name}")
-        self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+        try:
+            self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+        except sqlite3.OperationalError as exc:
+            # Another local runtime may have applied this additive migration
+            # after this process inspected the legacy schema.
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
     def run(self):
         with self.lock:
@@ -667,6 +747,9 @@ class DatabaseMigrationManager:
             self.add_column_if_missing("people", "metadata_json", "metadata_json TEXT")
             self.add_column_if_missing("people", "created_at", "created_at TEXT")
             self.add_column_if_missing("people", "updated_at", "updated_at TEXT")
+            self.add_column_if_missing("people", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("people", "site_id", "site_id TEXT")
+            self.add_column_if_missing("people", "device_id", "device_id TEXT")
 
             people_cols = self.table_columns("people")
             if "face_embedding" in people_cols:
@@ -680,11 +763,20 @@ class DatabaseMigrationManager:
             self.add_column_if_missing("events", "source_frame_id", "source_frame_id INTEGER")
             self.add_column_if_missing("events", "observation_type", "observation_type TEXT")
             self.add_column_if_missing("events", "evidence_path", "evidence_path TEXT")
+            self.add_column_if_missing("events", "evidence_checksum", "evidence_checksum TEXT")
+            self.add_column_if_missing("events", "correlation_id", "correlation_id TEXT")
+            self.add_column_if_missing("events", "event_uid", "event_uid TEXT")
             self.add_column_if_missing("events", "review_status", "review_status TEXT DEFAULT 'open'")
             self.add_column_if_missing("events", "review_note", "review_note TEXT")
             self.add_column_if_missing("events", "reviewed_at", "reviewed_at TEXT")
             self.add_column_if_missing("events", "reviewed_by", "reviewed_by TEXT")
+            self.add_column_if_missing("events", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("events", "site_id", "site_id TEXT")
+            self.add_column_if_missing("events", "device_id", "device_id TEXT")
             self.add_column_if_missing("alert_log", "source_event_id", "source_event_id INTEGER")
+            self.add_column_if_missing("alert_log", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("alert_log", "site_id", "site_id TEXT")
+            self.add_column_if_missing("alert_log", "device_id", "device_id TEXT")
 
             self.add_column_if_missing("attendance", "work_minutes", "work_minutes INTEGER DEFAULT 0")
             self.add_column_if_missing("attendance", "late_minutes", "late_minutes INTEGER DEFAULT 0")
@@ -698,6 +790,7 @@ class DatabaseMigrationManager:
             self.add_column_if_missing("attendance", "liveness_status", "liveness_status TEXT")
             self.add_column_if_missing("attendance", "source_frame_id", "source_frame_id INTEGER")
             self.add_column_if_missing("attendance", "recognition_confidence", "recognition_confidence REAL")
+            self.add_column_if_missing("attendance", "policy_version", "policy_version TEXT")
             self.add_column_if_missing("attendance", "evidence_path", "evidence_path TEXT")
             self.add_column_if_missing("attendance", "attendance_status", "attendance_status TEXT DEFAULT 'recorded'")
             self.add_column_if_missing("attendance", "absence_type", "absence_type TEXT")
@@ -711,6 +804,21 @@ class DatabaseMigrationManager:
             self.add_column_if_missing("attendance", "clock_out_source", "clock_out_source TEXT")
             self.add_column_if_missing("presence_sessions", "track_generation", "track_generation INTEGER DEFAULT 1")
             self.add_column_if_missing("presence_sessions", "closed_reason", "closed_reason TEXT")
+            self.add_column_if_missing("presence_sessions", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("presence_sessions", "site_id", "site_id TEXT")
+            self.add_column_if_missing("presence_sessions", "device_id", "device_id TEXT")
+            self.add_column_if_missing("recognition_evidence", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("recognition_evidence", "site_id", "site_id TEXT")
+            self.add_column_if_missing("recognition_evidence", "device_id", "device_id TEXT")
+            self.add_column_if_missing("attendance_decisions", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("attendance_decisions", "site_id", "site_id TEXT")
+            self.add_column_if_missing("attendance_decisions", "device_id", "device_id TEXT")
+            self.add_column_if_missing("attendance", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("attendance", "site_id", "site_id TEXT")
+            self.add_column_if_missing("attendance", "device_id", "device_id TEXT")
+            self.add_column_if_missing("incidents", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("incidents", "site_id", "site_id TEXT")
+            self.add_column_if_missing("incidents", "device_id", "device_id TEXT")
 
             now = _utc_now()
             if "created_at" in self.table_columns("people"):
@@ -719,7 +827,14 @@ class DatabaseMigrationManager:
                 self.conn.execute("UPDATE people SET updated_at=? WHERE updated_at IS NULL", (now,))
             self.conn.execute("UPDATE events SET review_status='open' WHERE review_status IS NULL")
             self.conn.execute("UPDATE attendance SET decision_source='automatic' WHERE decision_source IS NULL")
+            for table in ("events", "attendance", "presence_sessions", "recognition_evidence", "attendance_decisions", "incidents"):
+                self.conn.execute(
+                    f"UPDATE {table} SET organization_id=COALESCE(organization_id, ?), site_id=COALESCE(site_id, ?), device_id=COALESCE(device_id, ?)",
+                    (self.organization_id, self.site_id, self.device_id),
+                )
             self.conn.executescript("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_uid
+                    ON events(event_uid) WHERE event_uid IS NOT NULL;
                 CREATE TABLE IF NOT EXISTS enrollment_operations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     person_id INTEGER,
@@ -780,7 +895,87 @@ class DatabaseMigrationManager:
                     active INTEGER NOT NULL DEFAULT 1,
                     UNIQUE(class_name, subject, weekday, start_time)
                 );
+                CREATE TABLE IF NOT EXISTS liveness_challenges (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id           TEXT NOT NULL,
+                    presence_session_id INTEGER,
+                    track_id            INTEGER,
+                    track_generation    INTEGER NOT NULL DEFAULT 1,
+                    challenge_state     TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                    phase               TEXT NOT NULL DEFAULT 'CENTER',
+                    liveness_status     TEXT NOT NULL DEFAULT 'UNCERTAIN',
+                    started_at          TEXT NOT NULL,
+                    updated_at          TEXT NOT NULL,
+                    completed_at        TEXT,
+                    attempt_number      INTEGER NOT NULL DEFAULT 1,
+                    source_frame_id     INTEGER,
+                    failure_reason      TEXT,
+                    metrics_json        TEXT,
+                    FOREIGN KEY(presence_session_id) REFERENCES presence_sessions(id) ON DELETE SET NULL
+                );
+                CREATE TABLE IF NOT EXISTS platform_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    event_type TEXT NOT NULL,
+                    aggregate_type TEXT,
+                    aggregate_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    payload_checksum TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'processing', 'sent', 'failed', 'dead_letter')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    locked_at TEXT,
+                    locked_by TEXT,
+                    sent_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    organization_id TEXT NOT NULL DEFAULT 'local-organization',
+                    site_id TEXT NOT NULL DEFAULT 'local-site',
+                    device_id TEXT NOT NULL DEFAULT 'local-edge'
+                );
+                CREATE INDEX IF NOT EXISTS idx_platform_outbox_due
+                    ON platform_outbox(organization_id, site_id, status, next_attempt_at, id);
             """)
+            # This table is created by the migration block above, so its
+            # scope columns must be added after creation for legacy databases.
+            self.add_column_if_missing("liveness_challenges", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("liveness_challenges", "site_id", "site_id TEXT")
+            self.add_column_if_missing("liveness_challenges", "device_id", "device_id TEXT")
+            self.add_column_if_missing("platform_outbox", "organization_id", "organization_id TEXT")
+            self.add_column_if_missing("platform_outbox", "site_id", "site_id TEXT")
+            self.add_column_if_missing("platform_outbox", "device_id", "device_id TEXT")
+            for table in ("enrollment_operations", "absence_records", "attendance_schedules",
+                          "incident_events", "incident_alerts", "incident_evidence"):
+                self.add_column_if_missing(table, "organization_id", "organization_id TEXT")
+                self.add_column_if_missing(table, "site_id", "site_id TEXT")
+                self.add_column_if_missing(table, "device_id", "device_id TEXT")
+            self.conn.execute(
+                "UPDATE liveness_challenges SET organization_id=COALESCE(organization_id, ?), site_id=COALESCE(site_id, ?), device_id=COALESCE(device_id, ?)",
+                (self.organization_id, self.site_id, self.device_id),
+            )
+            for table in ("people", "alert_log", "enrollment_operations", "absence_records",
+                          "attendance_schedules", "incident_events", "incident_alerts",
+                          "incident_evidence", "platform_outbox"):
+                self.conn.execute(
+                    f"UPDATE {table} SET organization_id=COALESCE(organization_id, ?), site_id=COALESCE(site_id, ?), device_id=COALESCE(device_id, ?)",
+                    (self.organization_id, self.site_id, self.device_id),
+                )
+            record_schema_state(
+                self.conn,
+                "edge",
+                2,
+                "deployment-scoped edge operational schema",
+                hashlib.sha256(b"optivox-edge-schema-v2-scope").hexdigest(),
+            )
+            record_schema_state(
+                self.conn,
+                "outbox",
+                1,
+                "transactional minimized operational event outbox",
+                hashlib.sha256(b"optivox-outbox-schema-v1").hexdigest(),
+            )
             self.conn.commit()
 
 
@@ -905,17 +1100,35 @@ def voice(text: str, priority: str = "INFO", dedup_key: Optional[str] = None, fo
 class EventDatabase:
     def __init__(self, db_path: str = None):
         self.db_path = db_path or CONFIG["DATABASE_FILE"]
+        self.organization_id = str(os.environ.get("OPTIVOX_ORGANIZATION_ID", "local-organization"))
+        self.site_id = str(os.environ.get("OPTIVOX_SITE_ID", "local-site"))
+        # Use the same deployment identity as the backend so both adapters
+        # address one outbox scope. Runtime ID remains a compatibility alias.
+        self.device_id = str(
+            os.environ.get("OPTIVOX_DEVICE_ID")
+            or os.environ.get("OPTIVOX_RUNTIME_ID")
+            or "local-edge-cam-0"
+        )
+        self.policy_engine = PolicyEngine(
+            CONFIG,
+            organization_id=self.organization_id,
+            site_id=self.site_id,
+            device_id=self.device_id,
+        )
         self.lock = threading.RLock()
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
+        self.conn = connect_database(self.db_path, timeout=30)
         self._configure()
 
     def _configure(self):
         with self.lock:
-            for p in ["PRAGMA journal_mode=WAL",
-                      "PRAGMA synchronous=NORMAL",
+            for p in ["PRAGMA busy_timeout=10000",
+                      "PRAGMA journal_mode=WAL",
+                      f"PRAGMA synchronous={SQLITE_SYNCHRONOUS}",
+                      f"PRAGMA secure_delete={SQLITE_SECURE_DELETE}",
                       "PRAGMA foreign_keys=ON",
-                      "PRAGMA cache_size=-32000"]:
+                      "PRAGMA cache_size=-32000",
+                      "PRAGMA temp_store=MEMORY",
+                      "PRAGMA wal_autocheckpoint=1000"]:
                 self.conn.execute(p)
             self.conn.commit()
 
@@ -926,6 +1139,94 @@ class EventDatabase:
     def _fetchone(self, sql, params=()):
         with self.lock:
             return self.conn.execute(sql, params).fetchone()
+
+    @contextmanager
+    def transaction(self, *, immediate: bool = False):
+        """Run related runtime writes with explicit commit/rollback semantics."""
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield self.conn
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def enqueue_outbox(self, event_type: str, payload: dict, *, event_id: str = None,
+                       aggregate_type: str = None, aggregate_id: Any = None):
+        """Queue a minimized sync event inside the caller's transaction."""
+        return enqueue_in_connection(
+            self.conn,
+            event_type,
+            payload,
+            event_id=event_id,
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            organization_id=self.organization_id,
+            site_id=self.site_id,
+            device_id=self.device_id,
+        )
+
+    def health_report(self) -> dict:
+        """Return bounded integrity and migration state for operator health."""
+        with self.lock:
+            quick = str(self.conn.execute("PRAGMA quick_check").fetchone()[0])
+            foreign_keys = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+            journal_mode = str(self.conn.execute("PRAGMA journal_mode").fetchone()[0])
+            migration_version = None
+            migration_states = []
+            if self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+            ).fetchone():
+                migration_version = self.conn.execute(
+                    "SELECT max(version) FROM schema_migrations"
+                ).fetchone()[0]
+            if self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migration_state'"
+            ).fetchone():
+                state_columns = {
+                    row[1] for row in self.conn.execute(
+                        "PRAGMA table_info(schema_migration_state)"
+                    ).fetchall()
+                }
+                fingerprint_column = ", schema_fingerprint" if "schema_fingerprint" in state_columns else ""
+                migration_states = [dict(row) for row in self.conn.execute(
+                    f"SELECT schema_name, version, description, checksum{fingerprint_column}, applied_at "
+                    "FROM schema_migration_state ORDER BY schema_name"
+                ).fetchall()]
+            audit = verify_audit_chain(self.conn, "audit_log")
+            consistency = consistency_issues(self.conn)
+            schema_object_contract_issues = schema_object_issues(self.conn)
+            migration_ledger_issues = migration_issues(self.conn)
+            migration_state_issues = schema_state_issues(self.conn, ("edge", "outbox", "platform"))
+            outbox = {"status": "unavailable"}
+            if self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='platform_outbox'"
+            ).fetchone():
+                outbox_rows = self.conn.execute(
+                    """SELECT status, count(*) AS count FROM platform_outbox
+                       WHERE organization_id=? AND site_id=? AND device_id=?
+                       GROUP BY status""",
+                    (self.organization_id, self.site_id, self.device_id),
+                ).fetchall()
+                outbox_counts = {str(row["status"]): int(row["count"]) for row in outbox_rows}
+                outbox["status"] = "healthy" if outbox_counts.get("dead_letter", 0) == 0 else "degraded"
+                outbox["counts"] = outbox_counts
+                outbox["pending"] = outbox_counts.get("pending", 0) + outbox_counts.get("failed", 0)
+            return {
+                "status": "healthy" if quick.lower() == "ok" and not foreign_keys and audit.get("ok") and not consistency and not schema_object_contract_issues and not migration_ledger_issues and not migration_state_issues else "degraded",
+                "quick_check": quick,
+                "foreign_key_violations": len(foreign_keys),
+                "journal_mode": journal_mode,
+                "migration_version": migration_version,
+                "migration_states": migration_states,
+                "audit": audit,
+                "consistency_issues": consistency,
+                "schema_object_issues": schema_object_contract_issues,
+                "migration_ledger_issues": migration_ledger_issues,
+                "migration_state_issues": migration_state_issues,
+                "outbox": outbox,
+            }
     
     def _table_columns(self, table_name: str) -> set:
         with self.lock:
@@ -933,6 +1234,12 @@ class EventDatabase:
             return {row[1] for row in rows}
 
     def setup_database(self):
+        # Coordinate the legacy edge schema and backend-owned additive schema
+        # when both processes start against the same SQLite file.
+        with database_migration_lock(self.db_path):
+            return self._setup_database_locked()
+
+    def _setup_database_locked(self):
         with self.lock:
             cur = self.conn.cursor()
             cur.executescript("""
@@ -956,6 +1263,9 @@ class EventDatabase:
                     location        TEXT,
                     severity        INTEGER DEFAULT 0,
                     timestamp       TEXT    NOT NULL,
+                    evidence_checksum TEXT,
+                    event_uid       TEXT,
+                    correlation_id  TEXT,
                     FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
                 );
                 CREATE TABLE IF NOT EXISTS attendance (
@@ -979,9 +1289,38 @@ class EventDatabase:
                     early_departure_minutes INTEGER DEFAULT 0,
                     last_seen_at    TEXT,
                     clock_out_source TEXT,
+                    policy_version TEXT,
                     UNIQUE(person_id, date),
                     FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS policy_snapshots (
+                    policy_version TEXT NOT NULL,
+                    declared_version TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    site_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    document_json TEXT NOT NULL,
+                    issues_json TEXT NOT NULL DEFAULT '[]',
+                    valid INTEGER NOT NULL DEFAULT 1,
+                    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY(policy_version, organization_id, site_id, device_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS trg_policy_snapshots_immutable_update
+                    BEFORE UPDATE ON policy_snapshots
+                    WHEN OLD.policy_version <> NEW.policy_version
+                      OR OLD.declared_version <> NEW.declared_version
+                      OR OLD.organization_id <> NEW.organization_id
+                      OR OLD.site_id <> NEW.site_id
+                      OR OLD.device_id <> NEW.device_id
+                      OR OLD.document_json <> NEW.document_json
+                      OR OLD.issues_json <> NEW.issues_json
+                      OR OLD.valid <> NEW.valid
+                      OR OLD.first_seen_at <> NEW.first_seen_at
+                    BEGIN SELECT RAISE(ABORT, 'policy snapshot content is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS trg_policy_snapshots_immutable_delete
+                    BEFORE DELETE ON policy_snapshots
+                    BEGIN SELECT RAISE(ABORT, 'policy snapshots are append-only'); END;
                 CREATE TABLE IF NOT EXISTS absence_records (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     person_id       INTEGER NOT NULL,
@@ -1096,9 +1435,51 @@ class EventDatabase:
                     checksum        TEXT,
                     status          TEXT NOT NULL DEFAULT 'available',
                     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-                    UNIQUE(incident_id, event_id, path)
-                );
-                CREATE TABLE IF NOT EXISTS enrollment_operations (
+                     UNIQUE(incident_id, event_id, path)
+                 );
+                 CREATE TABLE IF NOT EXISTS incidents (
+                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                     status              TEXT NOT NULL DEFAULT 'open',
+                     category            TEXT NOT NULL,
+                     severity            INTEGER NOT NULL DEFAULT 0,
+                     summary             TEXT NOT NULL,
+                     first_event_at      TEXT NOT NULL,
+                     last_event_at       TEXT NOT NULL,
+                     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                     updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                     resolution_note     TEXT,
+                     resolved_at         TEXT,
+                     resolved_by         TEXT,
+                     entity_id           TEXT,
+                     camera_id           TEXT,
+                     location            TEXT,
+                     zone_id             TEXT,
+                     presence_session_id INTEGER,
+                     correlation_id      TEXT,
+                     assigned_to         TEXT,
+                     false_positive      INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE IF NOT EXISTS incident_events (
+                     incident_id INTEGER NOT NULL,
+                     event_id    INTEGER NOT NULL UNIQUE,
+                     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                     PRIMARY KEY (incident_id, event_id),
+                     FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE,
+                     FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS incident_alerts (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     incident_id     INTEGER NOT NULL,
+                     channel         TEXT NOT NULL,
+                     status          TEXT NOT NULL,
+                     attempted_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                     delivered_at    TEXT,
+                     error           TEXT,
+                     attempt_count   INTEGER NOT NULL DEFAULT 1,
+                     source_alert_id INTEGER,
+                     FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS enrollment_operations (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     person_id       INTEGER,
                     person_name     TEXT NOT NULL,
@@ -1151,11 +1532,24 @@ class EventDatabase:
                 CREATE INDEX IF NOT EXISTS idx_alert_time       ON alert_log(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_attendance_decisions_entity
                     ON attendance_decisions(entity_id, observed_at);
-                CREATE INDEX IF NOT EXISTS idx_attendance_decisions_person
-                    ON attendance_decisions(person_id, observed_at);
-            """)
+                 CREATE INDEX IF NOT EXISTS idx_attendance_decisions_person
+                     ON attendance_decisions(person_id, observed_at);
+                 CREATE INDEX IF NOT EXISTS idx_incidents_status
+                     ON incidents(status, updated_at);
+                 CREATE INDEX IF NOT EXISTS idx_incidents_context
+                     ON incidents(category, camera_id, zone_id, entity_id, presence_session_id);
+                 CREATE INDEX IF NOT EXISTS idx_incident_events_event
+                     ON incident_events(event_id);
+                 CREATE INDEX IF NOT EXISTS idx_incident_alerts_incident
+                     ON incident_alerts(incident_id, attempted_at);
+             """)
             self.conn.commit()
-            DatabaseMigrationManager(self.conn, self.lock).run()
+            DatabaseMigrationManager(
+                self.conn, self.lock,
+                organization_id=self.organization_id,
+                site_id=self.site_id,
+                device_id=self.device_id,
+            ).run()
             self.conn.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_events_entity
                     ON events(entity_id);
@@ -1170,6 +1564,39 @@ class EventDatabase:
                 CREATE INDEX IF NOT EXISTS idx_evidence_person
                     ON recognition_evidence(person_id, observed_at);
             """)
+            # Keep the edge-owned audit table on the same version ledger and
+            # tamper-evident chain as the backend-owned audit table.
+            ensure_schema_migrations(self.conn)
+            self.conn.commit()
+            # The canonical edge runtime and FastAPI backend share one physical
+            # database. Initialize the platform contract against this exact
+            # path instead of relying on whichever process starts first.
+            ensure_platform_schema(self.db_path)
+            snapshot = self.policy_engine.snapshot
+            self.conn.execute(
+                """INSERT INTO policy_snapshots
+                       (policy_version, declared_version, organization_id,
+                        site_id, device_id, document_json, issues_json, valid,
+                        first_seen_at, last_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(policy_version, organization_id, site_id, device_id)
+                    DO UPDATE SET last_seen_at=excluded.last_seen_at""",
+                (
+                    snapshot.policy_id,
+                    snapshot.declared_version,
+                    snapshot.organization_id,
+                    snapshot.site_id,
+                    snapshot.device_id,
+                    json.dumps(snapshot.document, sort_keys=True, separators=(",", ":")),
+                    json.dumps(list(snapshot.issues), sort_keys=True),
+                    1 if snapshot.valid else 0,
+                    _utc_now(),
+                    _utc_now(),
+                ),
+            )
+            # Platform scope triggers are part of the shared outbox contract;
+            # refresh only this explicit cross-adapter fingerprint boundary.
+            refresh_schema_state_fingerprint(self.conn, "outbox")
             self.conn.commit()
             print("[DB] Schema checked and migrations applied.")
 
@@ -1193,6 +1620,9 @@ class EventDatabase:
                 "created_at": now,
                 "updated_at": now,
                 "face_embedding": b"",
+                "organization_id": self.organization_id,
+                "site_id": self.site_id,
+                "device_id": self.device_id,
             }
 
             for col, val in optional_values.items():
@@ -1309,28 +1739,52 @@ class EventDatabase:
     def log_event(self, event_type, person_id=None, confidence=None, details=None,
                   snapshot_path=None, camera_id="cam_0", location=None, severity=0,
                   entity_id=None, presence_session_id=None, source_frame_id=None,
-                  observation_type=None, evidence_path=None):
+                  observation_type=None, evidence_path=None, correlation_id=None,
+                  event_uid=None, occurred_at=None):
         details_json = json.dumps(details) if isinstance(details, dict) else json.dumps(
             {"message": str(details)} if details else {})
+        event_timestamp = str(occurred_at or "").strip()[:80] or _utc_now()
+        analytics_timestamp = _event_datetime(event_timestamp)
+        evidence_checksum = None
+        if snapshot_path:
+            try:
+                with open(snapshot_path, "rb") as evidence_file:
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: evidence_file.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                    evidence_checksum = digest.hexdigest()
+            except (OSError, TypeError):
+                # The event remains durable even when evidence capture failed;
+                # the missing checksum is visible to the review layer.
+                evidence_checksum = None
         with self.lock:
+            if event_uid:
+                existing = self.conn.execute(
+                    "SELECT id FROM events WHERE event_uid=? LIMIT 1",
+                    (str(event_uid),),
+                ).fetchone()
+                if existing:
+                    return int(existing["id"])
             cursor = self.conn.execute("""
-                INSERT INTO events (person_id, event_type, confidence, details_json,
-                    snapshot_path, camera_id, location, severity, timestamp,
+            INSERT INTO events (person_id, event_type, confidence, details_json,
+                    snapshot_path, evidence_checksum, event_uid, camera_id, location, severity, timestamp,
                     entity_id, presence_session_id, source_frame_id,
-                    observation_type, evidence_path, review_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+                    observation_type, evidence_path, correlation_id, review_status,
+                    organization_id, site_id, device_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
             """, (person_id, event_type, confidence, details_json,
-                  snapshot_path, camera_id, location, severity, _utc_now(),
+                  snapshot_path, evidence_checksum, event_uid, camera_id, location, severity, event_timestamp,
                   entity_id, presence_session_id, source_frame_id,
-                  observation_type or event_type, evidence_path))
+                  observation_type or event_type, evidence_path, correlation_id,
+                  self.organization_id, self.site_id, self.device_id))
             self.conn.execute("""
                 INSERT INTO event_stats_daily (date, event_type, count) VALUES (?, ?, 1)
                 ON CONFLICT(date, event_type) DO UPDATE SET count = count + 1
-            """, (_today_iso(), event_type))
+            """, (analytics_timestamp.astimezone(_APP_TIMEZONE).date().isoformat(), event_type))
             self.conn.execute("""
                 INSERT INTO event_stats_hourly (hour, event_type, count) VALUES (?, ?, 1)
                 ON CONFLICT(hour, event_type) DO UPDATE SET count = count + 1
-            """, (_utc_datetime().strftime("%Y-%m-%d %H:00"), event_type))
+            """, (analytics_timestamp.strftime("%Y-%m-%d %H:00"), event_type))
             self.conn.commit()
             return int(cursor.lastrowid)
 
@@ -1371,8 +1825,49 @@ class EventDatabase:
         observed_at = observed_at or _utc_now()
         with self.lock:
             row = self.conn.execute(
-                "SELECT id, person_id, label FROM presence_sessions WHERE entity_id=? AND status IN ('active', 'occluded') "
-                "ORDER BY id DESC LIMIT 1", (str(entity_id),)).fetchone()
+                """SELECT id, person_id, label, track_generation, camera_id,
+                                  last_seen_at
+                   FROM presence_sessions
+                   WHERE entity_id=? AND camera_id=?
+                     AND organization_id=? AND site_id=?
+                     AND status IN ('active', 'occluded')
+                   ORDER BY id DESC LIMIT 1""",
+                (str(entity_id), str(camera_id or "cam_0"),
+                 self.organization_id, self.site_id),
+            ).fetchone()
+            # An occlusion is a continuation signal, never a valid reason to
+            # open a brand-new session. This matters when an operational task
+            # was dropped just before the first visible observation: creating
+            # a session from an occluded-only update would fabricate presence
+            # and weaken the evidence chain.
+            if not row and not visible:
+                return None
+            incoming_generation = int(track_generation or 1)
+            effective_observed_at = observed_at
+            if row and visible and observed_at and row["last_seen_at"]:
+                # Operations tasks can arrive out of order when the critical
+                # queue drains ahead of the regular queue. Never let an older
+                # frame move a presence session's last valid observation
+                # backwards and keep attendance open incorrectly.
+                try:
+                    if _parse_timestamp(observed_at) < _parse_timestamp(row["last_seen_at"]):
+                        effective_observed_at = row["last_seen_at"]
+                except Exception:
+                    effective_observed_at = row["last_seen_at"]
+            # A numeric tracker ID is reusable. A new generation or camera
+            # context must open a new session instead of inheriting the prior
+            # person's identity and evidence.
+            if row and (
+                    int(row["track_generation"] or 1) != incoming_generation
+                    or str(row["camera_id"] or "cam_0") != str(camera_id or "cam_0")):
+                self.conn.execute(
+                    """UPDATE presence_sessions
+                       SET status='closed', ended_at=COALESCE(last_seen_at, ?),
+                           closed_reason='track_generation_changed'
+                       WHERE id=? AND status IN ('active', 'occluded')""",
+                    (_utc_now(), row["id"]),
+                )
+                row = None
             if row:
                 session_id = row["id"]
                 existing_person_id = row["person_id"]
@@ -1389,35 +1884,41 @@ class EventDatabase:
                         """UPDATE presence_sessions
                             SET track_id=?, track_generation=?, person_id=?, label=?, identity_state=?,
                                liveness_status=?, camera_id=?, last_seen_at=?,
-                               status='active', confidence=?, last_frame_id=?
+                               status='active', confidence=?, last_frame_id=?,
+                               organization_id=?, site_id=?, device_id=?
                            WHERE id=?""",
-                         (track_id, int(track_generation or 1), effective_person_id, effective_label,
+                         (track_id, incoming_generation, effective_person_id, effective_label,
                          effective_state, liveness_status,
-                         camera_id, observed_at or _utc_now(), float(confidence or 0.0),
-                         source_frame_id, session_id),
+                         camera_id, effective_observed_at or _utc_now(), float(confidence or 0.0),
+                         source_frame_id, self.organization_id, self.site_id,
+                         self.device_id, session_id),
                     )
                 else:
                     self.conn.execute(
                         """UPDATE presence_sessions
                             SET track_id=?, track_generation=?, person_id=?, label=?, identity_state=?,
                                liveness_status=?, camera_id=?, status='occluded',
-                               confidence=?, last_frame_id=?
+                               confidence=?, last_frame_id=?, organization_id=?, site_id=?, device_id=?
                            WHERE id=?""",
-                         (track_id, int(track_generation or 1), effective_person_id, effective_label,
+                         (track_id, incoming_generation, effective_person_id, effective_label,
                          effective_state, liveness_status, camera_id,
-                         float(confidence or 0.0), source_frame_id, session_id),
+                         float(confidence or 0.0), source_frame_id,
+                         self.organization_id, self.site_id, self.device_id, session_id),
                     )
             else:
                 cur = self.conn.execute(
                     """INSERT INTO presence_sessions
                         (entity_id, track_id, track_generation, person_id, label, identity_state,
                         liveness_status, camera_id, started_at, last_seen_at,
-                        status, confidence, first_frame_id, last_frame_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)""",
-                     (str(entity_id), track_id, int(track_generation or 1), person_id, str(label or "UNKNOWN"),
+                        status, confidence, first_frame_id, last_frame_id,
+                        organization_id, site_id, device_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)""",
+                     (str(entity_id), track_id, incoming_generation, person_id, str(label or "UNKNOWN"),
                      str(identity_state or "UNRESOLVED"), liveness_status,
-                     camera_id, observed_at, observed_at, float(confidence or 0.0),
-                     source_frame_id, source_frame_id),
+                     camera_id, effective_observed_at, effective_observed_at,
+                     float(confidence or 0.0),
+                     source_frame_id, source_frame_id,
+                     self.organization_id, self.site_id, self.device_id),
                 )
                 session_id = cur.lastrowid
             self.conn.commit()
@@ -1430,11 +1931,13 @@ class EventDatabase:
             cur = self.conn.execute(
                 """INSERT INTO enrollment_operations
                    (person_id, person_name, operation, status, sample_count,
-                    quality_json, provenance_json, actor_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    quality_json, provenance_json, actor_id,
+                    organization_id, site_id, device_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (self.get_person_id(person_name), str(person_name), str(operation), str(status),
                  int(sample_count or 0), json.dumps(quality or {}, default=str),
-                 json.dumps(provenance or {}, default=str), actor_id),
+                 json.dumps(provenance or {}, default=str), actor_id,
+                 self.organization_id, self.site_id, self.device_id),
             )
             self.conn.commit()
             return int(cur.lastrowid)
@@ -1460,6 +1963,21 @@ class EventDatabase:
             if closed:
                 self.conn.commit()
         return closed
+
+    def close_presence_session(self, entity_id: str, reason: str = "timeout",
+                               ended_at: str = None) -> bool:
+        """Close one durable session from an authoritative entity transition."""
+        if not entity_id:
+            return False
+        with self.lock:
+            cur = self.conn.execute(
+                """UPDATE presence_sessions
+                   SET status='closed', ended_at=COALESCE(?, last_seen_at, ?), closed_reason=?
+                   WHERE entity_id=? AND status IN ('active', 'occluded')""",
+                (ended_at, _utc_now(), str(reason or "timeout"), str(entity_id)),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
 
     def close_open_presence_sessions(self, reason="runtime_shutdown") -> int:
         """Close sessions left open by a stopped or restarted edge runtime."""
@@ -1487,20 +2005,24 @@ class EventDatabase:
     ):
         if not entity_id:
             return None
+        evidence_details = dict(details or {})
+        evidence_details.setdefault("policy_version", self.policy_engine.snapshot.policy_id)
         with self.lock:
             cur = self.conn.execute(
                 """INSERT INTO recognition_evidence
                    (entity_id, presence_session_id, track_id, person_id,
-                    candidate_name, decision, similarity, quality_score,
-                    quality_ok, liveness_status, identity_state, reason,
-                    source_frame_id, observed_at, details_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   candidate_name, decision, similarity, quality_score,
+                   quality_ok, liveness_status, identity_state, reason,
+                    source_frame_id, observed_at, details_json,
+                    organization_id, site_id, device_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(entity_id), presence_session_id, track_id, person_id,
                  str(candidate_name or "UNKNOWN"), str(decision or "unresolved"),
                  float(similarity or 0.0), float(quality_score or 0.0),
                  1 if quality_ok else 0, liveness_status, identity_state,
                  reason, source_frame_id, observed_at or _utc_now(),
-                 json.dumps(details or {}, default=str)),
+                 json.dumps(evidence_details, default=str),
+                 self.organization_id, self.site_id, self.device_id),
             )
             self.conn.commit()
             return cur.lastrowid
@@ -1521,19 +2043,23 @@ class EventDatabase:
         if not decision_key:
             return None
         observed_at = observed_at or _utc_now()
+        decision_details = dict(details or {})
+        decision_details.setdefault("policy_version", self.policy_engine.snapshot.policy_id)
         with self.lock:
             self.conn.execute(
                 """INSERT OR IGNORE INTO attendance_decisions
                    (decision_key, person_id, entity_id, presence_session_id,
-                    recognition_evidence_id, decision, reason, identity_state,
-                    liveness_status, quality_score, recognition_confidence,
-                    source_frame_id, observed_at, details_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   recognition_evidence_id, decision, reason, identity_state,
+                   liveness_status, quality_score, recognition_confidence,
+                   source_frame_id, observed_at, details_json,
+                   organization_id, site_id, device_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(decision_key), person_id, entity_id, presence_session_id,
                  recognition_evidence_id, str(decision or "rejected"),
                  str(reason or ""), identity_state, liveness_status,
                  quality_score, recognition_confidence, source_frame_id,
-                 observed_at, json.dumps(details or {}, default=str)),
+                 observed_at, json.dumps(decision_details, default=str),
+                 self.organization_id, self.site_id, self.device_id),
             )
             row = self.conn.execute(
                 "SELECT id FROM attendance_decisions WHERE decision_key=?",
@@ -1542,9 +2068,65 @@ class EventDatabase:
             self.conn.commit()
             return int(row["id"]) if row else None
 
+    def start_liveness_challenge(self, entity_id, track_id=None,
+                                 track_generation=1, started_at=None,
+                                 source_frame_id=None, presence_session_id=None,
+                                 attempt_number=1) -> Optional[int]:
+        """Persist a new entity-scoped liveness challenge attempt."""
+        if not entity_id:
+            return None
+        started_at = started_at or _utc_now()
+        with self.lock:
+            cur = self.conn.execute(
+                """INSERT INTO liveness_challenges
+                   (entity_id, presence_session_id, track_id, track_generation,
+                   challenge_state, phase, liveness_status, started_at, updated_at,
+                    attempt_number, source_frame_id, organization_id, site_id, device_id)
+                   VALUES (?, ?, ?, ?, 'IN_PROGRESS', 'CENTER', 'UNCERTAIN', ?, ?, ?, ?, ?, ?, ?)""",
+                (str(entity_id), presence_session_id, track_id,
+                 int(track_generation or 1), started_at, started_at,
+                 max(1, int(attempt_number or 1)), source_frame_id,
+                 self.organization_id, self.site_id, self.device_id),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
+
+    def update_liveness_challenge(self, challenge_id: int, *, phase="CENTER",
+                                  liveness_status="UNCERTAIN",
+                                  challenge_state="IN_PROGRESS", updated_at=None,
+                                  completed_at=None, source_frame_id=None,
+                                  failure_reason=None, metrics=None,
+                                  presence_session_id=None) -> bool:
+        """Update a challenge without storing raw biometric material."""
+        if not challenge_id:
+            return False
+        updated_at = updated_at or _utc_now()
+        final_state = str(challenge_state or "IN_PROGRESS").upper()
+        with self.lock:
+            cur = self.conn.execute(
+                """UPDATE liveness_challenges
+                   SET phase=?, liveness_status=?, challenge_state=?,
+                       updated_at=?, completed_at=COALESCE(?, completed_at),
+                       source_frame_id=COALESCE(?, source_frame_id),
+                       failure_reason=?, metrics_json=?,
+                       presence_session_id=COALESCE(?, presence_session_id)
+                   WHERE id=?""",
+                (str(phase or "CENTER"), str(liveness_status or "UNCERTAIN").upper(),
+                 final_state, updated_at, completed_at, source_frame_id,
+                 str(failure_reason or "").strip()[:240] or None,
+                 json.dumps(metrics or {}, default=str), presence_session_id,
+                 int(challenge_id)),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
     def _schedule_for_person(self, person_id: int, local_now: dt_datetime) -> Optional[dict]:
         """Resolve an optional class schedule, falling back to global policy."""
-        row = self._fetchone("SELECT metadata_json FROM people WHERE id=?", (person_id,))
+        row = self._fetchone(
+            """SELECT metadata_json FROM people
+               WHERE id=? AND organization_id=? AND site_id=?""",
+            (person_id, self.organization_id, self.site_id),
+        )
         metadata = _safe_json_parse(row["metadata_json"] if row else None)
         class_name = metadata.get("class") or metadata.get("class_name") if isinstance(metadata, dict) else None
         if not class_name:
@@ -1552,24 +2134,38 @@ class EventDatabase:
         schedule = self._fetchone(
             """SELECT * FROM attendance_schedules
                WHERE class_name=? AND weekday=? AND active=1
+                 AND organization_id=? AND site_id=?
                ORDER BY CASE WHEN subject IS NULL OR subject='' THEN 0 ELSE 1 END, id
                LIMIT 1""",
-            (str(class_name), local_now.weekday()),
+            (str(class_name), local_now.weekday(), self.organization_id, self.site_id),
         )
         if not schedule:
             return None
         try:
             start_clock = dt_datetime.strptime(str(schedule["start_time"]), "%H:%M").time()
             scheduled = local_now.replace(hour=start_clock.hour, minute=start_clock.minute, second=0, microsecond=0)
-        except (TypeError, ValueError):
-            return None
+            end_time = schedule["end_time"]
+            if end_time:
+                dt_datetime.strptime(str(end_time), "%H:%M")
+            grace_minutes = int(schedule["grace_minutes"] or 0)
+            if grace_minutes < 0:
+                raise ValueError("grace period must not be negative")
+        except (TypeError, ValueError, OverflowError):
+            # A matching but malformed policy must not silently become a
+            # different global policy. Callers fail closed and retain the
+            # invalid schedule details for operator diagnosis.
+            return {
+                "invalid": True,
+                "schedule_key": f"{class_name}:{local_now.weekday()}:invalid",
+                "reason": "invalid_attendance_schedule",
+            }
         return {
             "schedule_key": f"{class_name}:{local_now.weekday()}:{schedule['start_time']}",
             "subject": schedule["subject"],
             "expected_start": str(schedule["start_time"]),
             "expected_end": schedule["end_time"],
             "scheduled": scheduled,
-            "grace_minutes": int(schedule["grace_minutes"] or 0),
+            "grace_minutes": grace_minutes,
         }
 
     def search_events(self, query, days=7, limit=30):
@@ -1589,21 +2185,97 @@ class EventDatabase:
                             location: str = None, confidence: float = None,
                             presence_session_id=None, recognition_evidence_id=None,
                             source_frame_id=None, identity_state="CONFIRMED",
-                            liveness_status="real", decision_source="automatic") -> dict:
+                            liveness_status="real", decision_source="manual") -> dict:
         today = _today_iso()
         now = _utc_now()
         existing = self._fetchone(
             "SELECT * FROM attendance WHERE person_id=? AND date=?", (person_id, today))
         if existing and existing["clock_in"]:
             return {"already_clocked_in": True, "clock_in": existing["clock_in"]}
+        source = str(decision_source or "manual").strip().lower()
         now_local = _local_datetime()
-        if str(decision_source or "").lower().startswith("automatic") and not _is_school_day(now_local):
+        schedule = self._schedule_for_person(person_id, now_local)
+        if schedule and schedule.get("invalid"):
+            return {
+                "schedule_invalid": True,
+                "date": today,
+                "reason": schedule.get("reason", "invalid_attendance_schedule"),
+            }
+        if source.startswith("automatic") and not _is_school_day(now_local):
             return {
                 "not_school_day": True,
                 "date": today,
                 "reason": "Automatic attendance is disabled for this school day.",
             }
-        schedule = self._schedule_for_person(person_id, now_local)
+        # Center-mode verification is also an automatic decision path. Keep
+        # ordinary operator clock-in callers on the manual path, but require
+        # the complete correlated evidence chain for every unattended source.
+        automatic_source = (
+            source.startswith("automatic")
+            or source in {"center_attendance", "verified", "vision"}
+        )
+        if automatic_source:
+            # Official automatic attendance must have a complete provenance
+            # chain. This database boundary protects against legacy callers
+            # bypassing the correlation reducer and writing a row from a name
+            # or a cached label alone.
+            if not presence_session_id or not recognition_evidence_id:
+                return {
+                    "provenance_required": True,
+                    "date": today,
+                    "reason": "Automatic attendance requires a presence session and recognition evidence.",
+                }
+            if str(identity_state or "").upper() != "CONFIRMED":
+                return {
+                    "identity_rejected": True,
+                    "date": today,
+                    "reason": "Automatic attendance requires a CONFIRMED identity.",
+                }
+            if str(liveness_status or "").upper() != "REAL":
+                return {
+                    "liveness_rejected": True,
+                    "date": today,
+                    "reason": "Automatic attendance requires REAL liveness.",
+                }
+            with self.lock:
+                provenance = self.conn.execute(
+                    """SELECT r.entity_id, r.presence_session_id, r.person_id,
+                              r.decision, r.identity_state, r.liveness_status,
+                              r.quality_ok, ps.entity_id AS session_entity_id,
+                              ps.person_id AS session_person_id, ps.status AS session_status,
+                              ps.identity_state AS session_identity_state,
+                              ps.liveness_status AS session_liveness_status
+                       FROM recognition_evidence r
+                       JOIN presence_sessions ps ON ps.id=r.presence_session_id
+                       WHERE r.id=? AND r.presence_session_id=?""",
+                    (int(recognition_evidence_id), int(presence_session_id)),
+                ).fetchone()
+                person_row = self.conn.execute(
+                    "SELECT metadata_json FROM people WHERE id=?", (int(person_id),)
+                ).fetchone()
+            metadata = _safe_json_parse(person_row["metadata_json"]) if person_row else {}
+            valid_provenance = bool(
+                provenance
+                and person_row
+                and not (isinstance(metadata, dict) and metadata.get("active") is False)
+                and int(provenance["person_id"] or -1) == int(person_id)
+                and str(provenance["entity_id"] or "")
+                == str(provenance["session_entity_id"] or "")
+                and int(provenance["session_person_id"] or person_id) == int(person_id)
+                and str(provenance["session_status"] or "").lower() in {"active", "occluded"}
+                and str(provenance["decision"] or "").lower() == "confirmed"
+                and str(provenance["identity_state"] or "").upper() == "CONFIRMED"
+                and str(provenance["liveness_status"] or "").upper() == "REAL"
+                and bool(provenance["quality_ok"])
+                and str(provenance["session_identity_state"] or "").upper() == "CONFIRMED"
+                and str(provenance["session_liveness_status"] or "").upper() == "REAL"
+            )
+            if not valid_provenance:
+                return {
+                    "provenance_invalid": True,
+                    "date": today,
+                    "reason": "Automatic attendance provenance does not match an active confirmed session.",
+                }
         if schedule:
             scheduled = schedule["scheduled"]
             grace = schedule["grace_minutes"]
@@ -1612,16 +2284,21 @@ class EventDatabase:
             grace = CONFIG["ATTENDANCE"]["LATE_GRACE_MIN"]
             scheduled = now_local.replace(hour=work_start, minute=0, second=0, microsecond=0)
         late = max(0, int((now_local - scheduled).total_seconds() / 60) - grace)
-        with self.lock:
-            self.conn.execute("""
+        # Persist the exact policy snapshot that authorized this attendance
+        # row.  This keeps manual and automatic records auditable while the
+        # automatic provenance checks above remain the decision boundary.
+        policy_version = self.policy_engine.snapshot.policy_id
+        with self.transaction(immediate=True) as con:
+            con.execute("""
                 INSERT INTO attendance
                     (person_id, date, clock_in, late_minutes, camera_id, location,
                      presence_session_id, recognition_evidence_id, decision_source,
                      identity_state, liveness_status, source_frame_id,
-                     recognition_confidence, attendance_status, is_official,
-                     subject, schedule_key, expected_start, expected_end,
-                     last_seen_at, clock_out_source)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', 1, ?, ?, ?, ?, ?, NULL)
+                    recognition_confidence, attendance_status, is_official,
+                    subject, schedule_key, expected_start, expected_end,
+                    last_seen_at, clock_out_source, policy_version,
+                    organization_id, site_id, device_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', 1, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
                 ON CONFLICT(person_id, date) DO UPDATE SET
                     clock_in      = COALESCE(attendance.clock_in, excluded.clock_in),
                     late_minutes  = excluded.late_minutes,
@@ -1638,7 +2315,11 @@ class EventDatabase:
                     schedule_key = COALESCE(attendance.schedule_key, excluded.schedule_key),
                     expected_start = COALESCE(attendance.expected_start, excluded.expected_start),
                     expected_end = COALESCE(attendance.expected_end, excluded.expected_end),
-                    last_seen_at = excluded.last_seen_at
+                    last_seen_at = excluded.last_seen_at,
+                    policy_version = COALESCE(attendance.policy_version, excluded.policy_version),
+                    organization_id = excluded.organization_id,
+                    site_id = excluded.site_id,
+                    device_id = excluded.device_id
              """, (person_id, today, now, late, camera_id, location,
                   presence_session_id, recognition_evidence_id, decision_source,
                   identity_state, liveness_status, source_frame_id, confidence,
@@ -1646,8 +2327,26 @@ class EventDatabase:
                    schedule.get("schedule_key") if schedule else None,
                    schedule.get("expected_start") if schedule else None,
                    schedule.get("expected_end") if schedule else None,
-                   now))
-            self.conn.commit()
+                   now, policy_version, self.organization_id, self.site_id, self.device_id))
+            attendance_row = con.execute(
+                "SELECT id FROM attendance WHERE person_id=? AND date=?",
+                (person_id, today),
+            ).fetchone()
+            self.enqueue_outbox(
+                "attendance.clocked_in",
+                {
+                    "person_id": person_id,
+                    "attendance_id": attendance_row["id"] if attendance_row else None,
+                    "date": today,
+                    "method": source,
+                    "identity_state": str(identity_state or "").upper(),
+                    "liveness_status": str(liveness_status or "").upper(),
+                    "policy_version": policy_version,
+                },
+                event_id=f"attendance-in:{self.organization_id}:{self.site_id}:{person_id}:{today}",
+                aggregate_type="attendance",
+                aggregate_id=attendance_row["id"] if attendance_row else person_id,
+            )
         return {"clocked_in_at": now, "late_minutes": late}
 
     def touch_attendance_presence(self, person_id: int, observed_at=None,
@@ -1655,11 +2354,26 @@ class EventDatabase:
         """Refresh the last valid presence used by automatic clock-out."""
         observed_at = observed_at or _utc_now()
         with self.lock:
+            existing = self.conn.execute(
+                """SELECT last_seen_at FROM attendance
+                   WHERE person_id=? AND date=? AND clock_in IS NOT NULL
+                     AND clock_out IS NULL""",
+                (person_id, _today_iso()),
+            ).fetchone()
+            if not existing:
+                return False
+            effective_observed_at = observed_at
+            if existing["last_seen_at"]:
+                try:
+                    if _parse_timestamp(observed_at) < _parse_timestamp(existing["last_seen_at"]):
+                        effective_observed_at = existing["last_seen_at"]
+                except Exception:
+                    effective_observed_at = existing["last_seen_at"]
             cur = self.conn.execute(
                 """UPDATE attendance SET last_seen_at=?,
                           presence_session_id=COALESCE(presence_session_id, ?)
                    WHERE person_id=? AND date=? AND clock_in IS NOT NULL AND clock_out IS NULL""",
-                (observed_at, presence_session_id, person_id, _today_iso()),
+                (effective_observed_at, presence_session_id, person_id, _today_iso()),
             )
             self.conn.commit()
             return cur.rowcount > 0
@@ -1672,9 +2386,19 @@ class EventDatabase:
         if not existing or not existing["clock_in"]:
             return {"error": "Not clocked in today"}
         now = clock_out_at or _utc_now()
+        chronology_adjusted = False
         try:
             ci = _parse_timestamp(existing["clock_in"])
             co = _parse_timestamp(now)
+            # A stale or out-of-order observation must never create an
+            # impossible attendance interval. This can occur when an older
+            # queued presence update is processed after clock-in, or when a
+            # legacy row contains inconsistent timestamps. Preserve the
+            # database invariant and close at the earliest valid instant.
+            if co < ci:
+                now = existing["clock_in"]
+                co = ci
+                chronology_adjusted = True
             work_min = max(0, int((co - ci).total_seconds() / 60))
         except Exception:
             work_min = 0
@@ -1690,8 +2414,8 @@ class EventDatabase:
             early_departure = 0
         status = "early_departure" if early_departure else "completed"
         note = str(reason or "").strip() or None
-        with self.lock:
-            self.conn.execute(
+        with self.transaction(immediate=True) as con:
+            updated = con.execute(
                 """UPDATE attendance SET clock_out=?, work_minutes=?,
                           early_departure_minutes=?, attendance_status=?,
                           clock_out_source=?, notes=COALESCE(?, notes),
@@ -1700,10 +2424,26 @@ class EventDatabase:
                 (now, work_min, early_departure, status, source, note, now,
                  person_id, today),
             )
-            self.conn.commit()
+            if not updated.rowcount:
+                return {"already_clocked_out": True, "clock_out": existing["clock_out"]}
+            self.enqueue_outbox(
+                "attendance.clocked_out",
+                {
+                    "person_id": person_id,
+                    "attendance_id": existing["id"],
+                    "date": today,
+                    "method": str(source or "manual"),
+                    "clock_out_at": now,
+                    "work_minutes": work_min,
+                },
+                event_id=f"attendance-out:{self.organization_id}:{self.site_id}:{person_id}:{today}:{now}",
+                aggregate_type="attendance",
+                aggregate_id=existing["id"],
+            )
         return {"clocked_out_at": now, "work_minutes": work_min,
                 "early_departure_minutes": early_departure,
-                "status": status, "source": source}
+                "status": status, "source": source,
+                "chronology_adjusted": chronology_adjusted}
 
     def close_stale_attendance(self, timeout_min=15, now=None) -> list[dict]:
         """Close today's open rows from their last valid observed presence."""
@@ -1711,7 +2451,8 @@ class EventDatabase:
         timeout_sec = max(1.0, float(timeout_min) * 60.0)
         rows = self._fetchall(
             """SELECT a.person_id, a.clock_in, a.last_seen_at,
-                      a.presence_session_id, p.name,
+                      a.presence_session_id, a.camera_id, a.location,
+                      a.source_frame_id, p.name,
                       ps.last_seen_at AS session_last_seen
                FROM attendance a JOIN people p ON p.id=a.person_id
                LEFT JOIN presence_sessions ps ON ps.id=a.presence_session_id
@@ -1731,15 +2472,23 @@ class EventDatabase:
                 int(row["person_id"]), clock_out_at=last_seen,
                 source="automatic_timeout", reason="No valid presence detected.")
             if "clocked_out_at" in result:
-                closed.append({"person_id": row["person_id"], "name": row["name"], **result})
+                closed.append({
+                    "person_id": row["person_id"], "name": row["name"],
+                    "camera_id": row["camera_id"], "location": row["location"],
+                    "source_frame_id": row["source_frame_id"],
+                    "presence_session_id": row["presence_session_id"], **result,
+                })
         return closed
 
     def close_open_attendance_before(self, before_date=None) -> list[dict]:
         """Reconcile rows left open by a previous runtime/day."""
         before_date = before_date or _today_iso()
         rows = self._fetchall(
-            """SELECT person_id, date, clock_in, last_seen_at
-               FROM attendance WHERE date < ? AND clock_in IS NOT NULL AND clock_out IS NULL""",
+            """SELECT person_id, date, clock_in, last_seen_at,
+                      camera_id, location, source_frame_id, presence_session_id,
+                      p.name
+               FROM attendance a JOIN people p ON p.id=a.person_id
+               WHERE a.date < ? AND a.clock_in IS NOT NULL AND a.clock_out IS NULL""",
             (before_date,),
         )
         closed = []
@@ -1756,7 +2505,14 @@ class EventDatabase:
                        WHERE person_id=? AND date=? AND clock_out IS NULL""",
                     (end, work_min, row["person_id"], row["date"]),
                 )
-                closed.append({"person_id": row["person_id"], "date": row["date"], "clocked_out_at": end})
+                closed.append({
+                    "person_id": row["person_id"], "name": row["name"],
+                    "date": row["date"], "clocked_out_at": end,
+                    "work_minutes": work_min,
+                    "camera_id": row["camera_id"], "location": row["location"],
+                    "source_frame_id": row["source_frame_id"],
+                    "presence_session_id": row["presence_session_id"],
+                })
             if closed:
                 self.conn.commit()
         return closed
@@ -1764,7 +2520,8 @@ class EventDatabase:
     def close_open_attendance_for_shutdown(self) -> list[dict]:
         """Close current open rows when the edge agent is intentionally stopped."""
         rows = self._fetchall(
-            """SELECT person_id, name, last_seen_at, clock_in
+            """SELECT person_id, name, presence_session_id, last_seen_at, clock_in,
+                      camera_id, location, source_frame_id
                FROM attendance a JOIN people p ON p.id=a.person_id
                WHERE a.date=? AND a.clock_in IS NOT NULL AND a.clock_out IS NULL""",
             (_today_iso(),),
@@ -1776,7 +2533,12 @@ class EventDatabase:
                 int(row["person_id"]), clock_out_at=end,
                 source="runtime_shutdown", reason="Runtime stopped.")
             if "clocked_out_at" in result:
-                closed.append({"person_id": row["person_id"], "name": row["name"], **result})
+                closed.append({
+                    "person_id": row["person_id"], "name": row["name"],
+                    "camera_id": row["camera_id"], "location": row["location"],
+                    "source_frame_id": row["source_frame_id"],
+                    "presence_session_id": row["presence_session_id"], **result,
+                })
         return closed
 
     def attendance_report(self, days=7, person_id=None):
@@ -1796,11 +2558,24 @@ class EventDatabase:
     #Audit and alert
     def log_audit(self, action, target=None, details=None):
         with self.lock:
-            self.conn.execute(
-                "INSERT INTO audit_log (action, target, details_json, timestamp) "
-                "VALUES (?, ?, ?, ?)",
-                (action, target, json.dumps(details or {}), _utc_now()))
+            # Reserve the writer lock before reading the previous chain tip.
+            self.conn.execute("BEGIN IMMEDIATE")
+            append_audit_record(
+                self.conn,
+                "audit_log",
+                {
+                    "action": str(action),
+                    "target": target,
+                    "details_json": json.dumps(details or {}, sort_keys=True, default=str),
+                    "timestamp": _utc_now(),
+                },
+            )
+            create_audit_checkpoint(self.conn, "audit_log")
             self.conn.commit()
+
+    def audit_integrity(self):
+        with self.lock:
+            return verify_audit_chain(self.conn, "audit_log")
 
     def get_audit_log(self, action=None, limit=100):
         if action:
@@ -1814,10 +2589,11 @@ class EventDatabase:
                   source_event_id=None):
         with self.lock:
             self.conn.execute("""INSERT INTO alert_log (channel, event_type, target,
-                                 status, error, timestamp, source_event_id)
-                              VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                 status, error, timestamp, source_event_id,
+                                 organization_id, site_id, device_id)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                               (channel, event_type, target, status, error, _utc_now(),
-                               source_event_id))
+                               source_event_id, self.organization_id, self.site_id, self.device_id))
             self.conn.commit()
 
     def get_alert_log(self, limit=50):
@@ -1942,9 +2718,11 @@ class AlertManager:
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "plain"))
             if snapshot_path and os.path.exists(snapshot_path):
-                with open(snapshot_path, "rb") as f:
-                    img = MIMEImage(f.read(), name=os.path.basename(snapshot_path))
-                    msg.attach(img)
+                img = MIMEImage(
+                    read_evidence_bytes(snapshot_path),
+                    name=os.path.basename(snapshot_path),
+                )
+                msg.attach(img)
             with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=20) as srv:
                 srv.starttls(); srv.login(self.smtp_user, self.smtp_pass)
                 srv.send_message(msg)
@@ -1996,12 +2774,14 @@ class AlertManager:
         try:
             if snapshot_path and os.path.exists(snapshot_path):
                 url = f"https://api.telegram.org/bot{self.tg_bot_token}/sendPhoto"
-                with open(snapshot_path, "rb") as f:
-                    r = requests.post(url, data={"chat_id": self.tg_chat_id,
-                                                 "caption": text[:1024]},
-                                      files={"photo": f}, timeout=(3, 15),
-                                      allow_redirects=False,
-                                      headers={"User-Agent": "OptiVox-Edge-Alert/1"})
+                payload = read_evidence_bytes(snapshot_path)
+                r = requests.post(
+                    url,
+                    data={"chat_id": self.tg_chat_id, "caption": text[:1024]},
+                    files={"photo": (os.path.basename(snapshot_path), payload, "image/jpeg")},
+                    timeout=(3, 15), allow_redirects=False,
+                    headers={"User-Agent": "OptiVox-Edge-Alert/1"},
+                )
             else:
                 url = f"https://api.telegram.org/bot{self.tg_bot_token}/sendMessage"
                 r = requests.post(url, data={"chat_id": self.tg_chat_id,
@@ -2044,6 +2824,14 @@ class AlertManager:
     def check_and_alert(self, event_type, name, confidence, details, snapshot_path,
                         source_event_id=None):
         if not self.enabled: return
+        policy = notification_decision(event_type, details)
+        if policy["decision"] != "AUTO_SEND":
+            for channel in ("email", "telegram", "webhook"):
+                if self.db and getattr(self, f"{channel}_enabled", False):
+                    self.db.log_alert(channel, event_type, str(name), "approval_required",
+                                      policy["reason"], source_event_id=source_event_id)
+            print(f"[ALERT] {event_type} held for review: {policy['reason']}")
+            return
         if not self._allowed(event_type, str(name)): return
 
         subject = f"[ALERT] {event_type}"
@@ -2542,6 +3330,7 @@ class FaceAnalyzer:
                     return kps[:, :2]
         return None
     def get_age(self, face): return int(face.age) if getattr(face, "age", None) else None
+    def get_age_band(self, face): return age_band(self.get_age(face))
     def get_gender(self, face): 
         g = getattr(face, "gender", None)
         return "M" if g == 1 else ("F" if g == 0 else "?")
@@ -2689,6 +3478,7 @@ class ObjectDetector:
         self.cfg = cfg or CONFIG
         self.model = None
         self.names: Dict[int, str] = {}
+        self.model_path = None
         if not YOLO_AVAILABLE: return
         try:
             mp_ = self.cfg["MODEL_PATH"]
@@ -2700,6 +3490,7 @@ class ObjectDetector:
                     return
                 print(f"[INFO] YOLO model {mp_} not present; local mode may download it.")
             self.model = YOLO(mp_)
+            self.model_path = mp_
             self.names = self.model.names if hasattr(self.model, "names") else {}
             print(f"[INFO] YOLO loaded: {mp_} ({len(self.names)} classes)")
         except Exception as e:
@@ -2740,6 +3531,10 @@ class ObjectDetector:
                     "class_id": cls_id, "class_name": cls_name,
                     "confidence": conf, "bbox": (x1, y1, x2, y2),
                     "category": cat, "color": color,
+                    "source_model": os.path.basename(str(self.model_path or "yolo")),
+                    "model_version": os.path.basename(str(self.model_path or "yolo")),
+                    "execution_mode": "active",
+                    "event_type": "OBJECT_DETECTED",
                 })
         return dets
 
@@ -2829,6 +3624,8 @@ class DangerDetector:
                         "category": "dangerous",
                         "color": (0, 0, 255),
                         "source_model": os.path.basename(model_path),
+                        "model_version": os.path.basename(model_path),
+                        "execution_mode": "active",
                         "event_type": self._event_type_for_class(cls_name),
                     })
 
@@ -3337,6 +4134,11 @@ class CrowdIntelligence:
         self._track_motion: Dict[int, dict] = {}
         self._evacuation_started = None
         self._last_evacuation_alert = 0.0
+        self._last_people_count = 0
+        self._last_frame_size = (0, 0)
+        self._last_grid_counts = np.zeros((gh, gw), dtype=np.int32)
+        self._count_history = deque(maxlen=120)
+        self._last_average_speed = 0.0
 
     def update(self, tracked: Dict[int, Tuple[int, int]], frame_size=(720, 1280)):
         """frame_size = (h, w) ; returns events list."""
@@ -3344,6 +4146,15 @@ class CrowdIntelligence:
         events = []
         gh, gw = self.density_heatmap.shape
         fh, fw = frame_size
+        now = time.monotonic()
+        self._last_people_count = len(tracked)
+        self._last_frame_size = (int(fh), int(fw))
+        self._last_grid_counts.fill(0)
+        for center in tracked.values():
+            gx = int(np.clip((center[0] / max(1, fw)) * gw, 0, gw - 1))
+            gy = int(np.clip((center[1] / max(1, fh)) * gh, 0, gh - 1))
+            self._last_grid_counts[gy, gx] += 1
+        self._count_history.append((now, len(tracked)))
         self.density_heatmap *= self.cfg.get("HEATMAP_DECAY", 0.998)
         radius = self.cfg.get("HEATMAP_GAUSSIAN_RADIUS", 2.5)
         strength = self.cfg.get("HEATMAP_GAUSSIAN_STRENGTH", 1.0)
@@ -3387,7 +4198,6 @@ class CrowdIntelligence:
         # Evacuation is a sustained crowd-motion signal, not a single fast
         # track. Keep the calculation local so center attendance cannot pause
         # the independent safety pipeline.
-        now = time.monotonic()
         speeds = []
         for track_id, center in tracked.items():
             current = (float(center[0]), float(center[1]))
@@ -3403,6 +4213,7 @@ class CrowdIntelligence:
         evac_min = int(self.cfg.get("EVAC_MIN_PEOPLE", 4))
         evac_threshold = float(self.cfg.get("EVAC_AVG_SPEED_THRESHOLD", 25.0))
         average_speed = sum(speeds) / len(speeds) if speeds else 0.0
+        self._last_average_speed = float(average_speed)
         if len(tracked) >= evac_min and average_speed >= evac_threshold:
             self._evacuation_started = self._evacuation_started or now
             confirm_seconds = float(self.cfg.get("EVAC_CONFIRM_SECONDS", 1.0))
@@ -3416,6 +4227,36 @@ class CrowdIntelligence:
         else:
             self._evacuation_started = None
         return events
+
+    def snapshot(self) -> dict:
+        """Return labelled crowd telemetry without implying calibrated density."""
+        current = time.monotonic()
+        baseline = next(
+            ((at, count) for at, count in reversed(self._count_history)
+             if current - at >= 10.0),
+            None,
+        )
+        growth_per_minute = None
+        if baseline is not None:
+            elapsed_minutes = max(1.0 / 60.0, (current - baseline[0]) / 60.0)
+            growth_per_minute = round((self._last_people_count - baseline[1]) / elapsed_minutes, 2)
+        cells = []
+        for row, column in np.argwhere(self._last_grid_counts > 0):
+            cells.append({
+                "row": int(row), "column": int(column),
+                "people": int(self._last_grid_counts[row, column]),
+            })
+        cells.sort(key=lambda item: (-item["people"], item["row"], item["column"]))
+        return {
+            "status": "EXPERIMENTAL" if self.enabled else "DISABLED",
+            "method": "tracked_person_occupancy",
+            "people_count": int(self._last_people_count),
+            "density_cells": cells[:20],
+            "growth_per_minute": growth_per_minute,
+            "average_speed_px_sec": round(float(self._last_average_speed), 2),
+            "perspective_correction": "NOT_CONFIGURED",
+            "physical_density": "NOT_MEASURED",
+        }
 
     def get_density_overlay(self, frame):
         if not self.enabled: return None
@@ -3432,6 +4273,11 @@ class VisionSystem:
         self.cfg = cfg or CONFIG
         ensure_dirs()
         print("[INFO] Initializing VisionSystem...")
+        # Hash local model artifacts once at startup. Runtime status polling
+        # must not re-read large model files every second.
+        self.model_registry_status = registry_snapshot(
+            _BASE_DIR, os.path.join(_BASE_DIR, "models", "model_registry.json"))
+        self.model_adapters = ModelAdapterRegistry()
         self._init_components()
         self._init_state()
         print("[INFO] VisionSystem ready.")
@@ -3448,8 +4294,57 @@ class VisionSystem:
         self.behavior         = BehaviorAnalyzer(self.cfg)
         self.crowd_intel      = CrowdIntelligence(self.cfg)
         self.security_signals = SecuritySignalEngine(self.cfg)
+        security_zones_path = os.path.join(_BASE_DIR, "runtime", "security_zones.json")
+        try:
+            with open(security_zones_path, "r", encoding="utf-8") as handle:
+                persisted_policy = json.load(handle)
+            persisted_zones = (
+                persisted_policy.get("zones")
+                if isinstance(persisted_policy, dict) and "zones" in persisted_policy
+                else None
+            )
+            if isinstance(persisted_zones, list):
+                replacement = self.security_signals.replace_zones(persisted_zones)
+                if replacement.get("ok"):
+                    self.cfg.setdefault("SECURITY", {})["ZONES"] = replacement["zones"]
+                else:
+                    print(f"[WARN] Ignoring invalid persisted security zones: {replacement.get('issues')}")
+            elif os.path.exists(security_zones_path):
+                print("[WARN] Ignoring malformed persisted security zones: expected a 'zones' list")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            # An optional runtime override must never prevent the camera from
+            # starting; the checked-in startup policy remains the fallback.
+            pass
+        self.policy_engine = PolicyEngine(
+            self.cfg,
+            organization_id=os.environ.get("OPTIVOX_ORGANIZATION_ID", "local-organization"),
+            site_id=os.environ.get("OPTIVOX_SITE_ID", "local-site"),
+            device_id=RUNTIME_ID,
+        )
+        self.security_signals.policy_version = self.policy_engine.snapshot.policy_id
+        self.security_signals.policy_issues = list(self.policy_engine.snapshot.issues)
+        vehicle_cfg = dict(self.cfg.get("VEHICLE_INTELLIGENCE", {}) or {})
+        calibration_path = os.path.join(_BASE_DIR, "runtime", "vehicle_calibration.json")
+        try:
+            with open(calibration_path, "r", encoding="utf-8") as handle:
+                persisted_calibration = json.load(handle)
+            if isinstance(persisted_calibration, dict):
+                persisted_calibration = persisted_calibration.get(
+                    "calibration", persisted_calibration)
+                if isinstance(persisted_calibration, dict):
+                    vehicle_cfg["CALIBRATION"] = persisted_calibration
+        except (OSError, TypeError, ValueError):
+            # A missing or malformed optional profile keeps physical speed
+            # unavailable instead of allowing an unverified estimate.
+            pass
+        self.vehicle_intelligence = VehicleIntelligence(vehicle_cfg)
         self.supplementary    = SupplementaryDetector(self.cfg)
         self.person_tracker   = CentroidTracker(self.cfg["TRACKER_MAX_DISAPPEARED"], self.cfg["TRACKER_MAX_DISTANCE"])
+        self.person_tracker_adapter = TrackingAdapter(
+            "centroid", self.person_tracker.update, version="local-v1")
+        self._register_model_adapters()
+        self.model_adapter_registry_sync = self.model_adapters.apply_registry_snapshot(
+            self.model_registry_status)
         self.face_indexer     = FAISSIndexer(dim=512)
         self.face_db: Dict[str, Dict[str, Any]] = {}
         # Disabled roster identities remain in the local biometric store for
@@ -3465,6 +4360,91 @@ class VisionSystem:
         self.stranger_buffer: Dict[int, Dict[str, Any]] = {}
         self.stranger_counter = 0
         self._load_face_db()
+
+    def _register_model_adapters(self):
+        """Expose existing perception components through one capability boundary."""
+        def component_state(component, enabled=True, experimental=False):
+            if not enabled:
+                return "DISABLED"
+            if component is None:
+                return "NOT_CONFIGURED"
+            return "EXPERIMENTAL" if experimental else "AVAILABLE"
+
+        self.model_adapters.register(ModelSpec(
+            "face_detection", "face_detection_recognition", version="buffalo_l",
+            capability=component_state(self.face_analyzer, INSIGHTFACE_AVAILABLE),
+            cadence="scheduled", roi_policy="face_quality_original_frame",
+            resource_budget="cpu_or_gpu", privacy_class="biometric_local",
+            limitations=("requires_independent_holdout_evaluation",)))
+        self.model_adapters.register(ModelSpec(
+            "yolo", "general_object_detection",
+            version=os.path.basename(str(self.cfg.get("MODEL_PATH", "yolov8n.pt"))),
+            capability=component_state(
+                self.object_detector,
+                bool(self.cfg.get("ENABLE_OBJECT_DETECTION", True)),
+            ),
+            cadence="multi_rate", roi_policy="full_frame", resource_budget="cpu_or_gpu"))
+        self.model_adapters.register(ModelSpec(
+            "danger", "danger_detection", version="configured_local",
+            capability=component_state(
+                self.danger_detector,
+                bool(self.cfg.get("DANGER_DETECTION", {}).get("ENABLED", False)),
+                experimental=True,
+            ),
+            cadence="multi_rate", roi_policy="full_frame", resource_budget="cpu_or_gpu",
+            limitations=("requires_site_holdout_and_adversarial_evaluation",)))
+        self.model_adapters.register(ModelSpec(
+            "pose", "pose_detection", version="mediapipe",
+            capability=component_state(
+                self.pose_detector,
+                bool(self.cfg.get("ENABLE_POSE_INFERENCE", True)) and MEDIAPIPE_AVAILABLE,
+            ),
+            cadence="multi_rate", roi_policy="person_roi", resource_budget="cpu"))
+        self.model_adapters.register(ModelSpec(
+            "hands", "hand_detection", version="mediapipe",
+            capability=component_state(
+                self.hand_detector,
+                bool(self.cfg.get("ENABLE_HAND_INFERENCE", True)) and MEDIAPIPE_AVAILABLE,
+            ),
+            cadence="multi_rate", roi_policy="relevant_roi", resource_budget="cpu"))
+        self.model_adapters.register(ModelSpec(
+            "person_tracking", "entity_tracking", version="centroid-local-v1",
+            capability="AVAILABLE", cadence="every_frame", roi_policy="full_frame",
+            resource_budget="cpu", limitations=("upgrade_to_motion_model_after_id_switch_benchmark",)))
+        self.model_adapters.register(ModelSpec(
+            "vehicle_tracking", "vehicle_tracking", version="local-v1",
+            capability="AVAILABLE" if self.vehicle_intelligence.enabled else "DISABLED",
+            cadence="multi_rate", roi_policy="full_frame", resource_budget="cpu"))
+        self.model_adapters.register(ModelSpec(
+            "custom_objects", "custom_object_matching", version="orb-hsv-local",
+            capability=component_state(
+                self.custom_objects,
+                bool(self.cfg.get("ENABLE_CUSTOM_OBJECT_INFERENCE", True)),
+                experimental=True,
+            ),
+            cadence="multi_rate", roi_policy="hand_roi", resource_budget="cpu",
+            limitations=("requires enrolled object templates",)))
+        self.model_adapters.register(ModelSpec(
+            "plate_detector_ocr", "license_plate_reading", version="not_configured",
+            capability="NOT_CONFIGURED", cadence="on_vehicle_roi", roi_policy="vehicle_roi",
+            resource_budget="cpu_or_gpu", privacy_class="restricted_local",
+            limitations=("no licensed plate detector or OCR model is installed",)))
+        self.model_adapters.register(ModelSpec(
+            "liveness_heuristics", "anti_spoofing", version="heuristic-v1",
+            capability="EXPERIMENTAL", cadence="face_track", roi_policy="face_roi",
+            resource_budget="cpu", privacy_class="biometric_local",
+            limitations=("not security-grade until replay evaluation is measured",)))
+        self.model_adapters.register(ModelSpec(
+            "crowd_occupancy", "crowd_analytics", version="tracked-occupancy-v1",
+            capability="EXPERIMENTAL", cadence="every_frame", roi_policy="full_frame",
+            resource_budget="cpu", limitations=("perspective density is not measured",)))
+        age_enabled = bool(self.cfg.get("ENABLE_AGE_GENDER_INFERENCE", False))
+        self.model_adapters.register(ModelSpec(
+            "demographic_age_band", "aggregate_age_band", version="insightface-genderage",
+            capability="EXPERIMENTAL" if age_enabled else "DISABLED",
+            enabled=age_enabled, cadence="scheduled", roi_policy="face_roi",
+            resource_budget="cpu_or_gpu", privacy_class="sensitive_aggregate",
+            limitations=("aggregate-only; never used for identity, attendance, or security",)))
 
     def _init_state(self):
         self._current_face_labels: Dict[int, Tuple[str, float, np.ndarray]] = {}
@@ -3497,6 +4477,14 @@ class VisionSystem:
         self._last_frame_summary: dict = {}
         self._last_custom_object_detections = []
         self._last_held_objects: List[dict] = []
+        self._last_vehicle_state: dict = {}
+        self._last_crowd_state: dict = self.crowd_intel.snapshot()
+        self._last_demographics_state: dict = {
+            "status": "DISABLED" if not self.cfg.get("ENABLE_AGE_GENDER_INFERENCE", False) else "NOT_MEASURED",
+            "decision_use": "aggregate_only",
+            "age_bands": {},
+            "samples": 0,
+        }
         self._last_hand_dets = []
         self._last_pose_result = {}
         self._last_pose_observation_frame_id = None
@@ -3508,6 +4496,8 @@ class VisionSystem:
             max_observations_per_type=correlation_cfg.get(
                 "MAX_OBSERVATIONS_PER_TYPE", 12),
             close_after_sec=correlation_cfg.get("ENTITY_CLOSE_AFTER_SEC", 10.0),
+            identity_stale_after_sec=correlation_cfg.get(
+                "IDENTITY_STALE_AFTER_SEC", 3.0),
             ttl_overrides_ms=correlation_cfg.get("TTL_MS"),
             face_visible_after_sec=correlation_cfg.get("FACE_VISIBLE_AFTER_SEC", 1.0),
             quality_valid_after_sec=correlation_cfg.get("QUALITY_VALID_AFTER_SEC", 1.5),
@@ -3516,10 +4506,18 @@ class VisionSystem:
                 "IDENTITY_CONFIRMATION_OBSERVATIONS",
                 self.cfg.get("PERFORMANCE", {}).get("FACE_RECOG_STABLE_FRAMES", 3),
             ),
+            identity_confirmation_window=self.cfg.get("PERFORMANCE", {}).get(
+                "IDENTITY_CONFIRMATION_WINDOW", 5),
             track_switch_distance=max(
                 220.0,
                 float(self.cfg.get("TRACKER_MAX_DISTANCE", 150)) * 1.75,
             ),
+            site_id=os.environ.get("OPTIVOX_SITE_ID", "local-site"),
+            organization_id=os.environ.get("OPTIVOX_ORGANIZATION_ID", "local-organization"),
+            device_id=RUNTIME_ID,
+            policy_version=self.policy_engine.snapshot.policy_id,
+            policy_valid=self.policy_engine.snapshot.valid,
+            policy_issues=self.policy_engine.snapshot.issues,
         )
         self._last_correlation_state = {}
         perf_cfg = self.cfg.get("PERFORMANCE", {})
@@ -3552,9 +4550,36 @@ class VisionSystem:
         self._last_enrollment_metadata = {}
 
     def performance_snapshot(self) -> dict:
+        identity_confirmations = list(self._identity_confirmation_times)
+        total_recognition_decisions = (
+            self._recognition_cache_hits + self._recognition_cache_misses)
+        cache_hit_rate = (
+            round(self._recognition_cache_hits / total_recognition_decisions * 100.0, 2)
+            if total_recognition_decisions else None
+        )
+
+        def timing_stats(values):
+            if not values:
+                return {
+                    "count": 0, "mean_sec": None, "p50_sec": None,
+                    "p95_sec": None, "last_sec": None,
+                }
+            ordered = sorted(float(value) for value in values)
+            percentile = lambda fraction: ordered[min(
+                len(ordered) - 1, int(round((len(ordered) - 1) * fraction)))]
+            return {
+                "count": len(ordered),
+                "mean_sec": round(sum(ordered) / len(ordered), 3),
+                "p50_sec": round(percentile(0.50), 3),
+                "p95_sec": round(percentile(0.95), 3),
+                "last_sec": round(ordered[-1], 3),
+            }
+
         return {
             "recognition_cache_hits": self._recognition_cache_hits,
             "recognition_cache_misses": self._recognition_cache_misses,
+            "recognition_decisions": total_recognition_decisions,
+            "recognition_cache_hit_rate_percent": cache_hit_rate,
             "recognition_attempts": self._recognition_attempts,
             "recognition_confirmations": self._recognition_confirmations,
             "embeddings_skipped_due_to_cache": self._embeddings_skipped_due_to_cache,
@@ -3568,14 +4593,14 @@ class VisionSystem:
                 "yolo": "NOT MEASURED",
             },
             "identity_timing": {
-                "confirmed_count": len(self._identity_confirmation_times),
+                **timing_stats(identity_confirmations),
+                "confirmed_count": len(identity_confirmations),
                 "mean_time_to_confirm_sec": round(
-                    sum(self._identity_confirmation_times) /
-                    len(self._identity_confirmation_times), 3
-                ) if self._identity_confirmation_times else None,
+                    sum(identity_confirmations) / len(identity_confirmations), 3
+                ) if identity_confirmations else None,
                 "last_time_to_confirm_sec": round(
-                    self._identity_confirmation_times[-1], 3
-                ) if self._identity_confirmation_times else None,
+                    identity_confirmations[-1], 3
+                ) if identity_confirmations else None,
                 "mean_time_to_first_usable_face_sec": self._mean_timing(
                     "first_usable_face"),
                 "mean_time_to_first_embedding_sec": self._mean_timing(
@@ -3583,8 +4608,12 @@ class VisionSystem:
                 "mean_time_to_candidate_sec": self._mean_timing("candidate"),
             },
             "scheduler": self._scheduler.snapshot(),
+            "model_adapters": self.model_adapters.snapshot(),
+            "model_adapter_registry_sync": dict(self.model_adapter_registry_sync),
+            "tracking": self.person_tracker_adapter.snapshot(self.person_tracker.objects),
             "correlation": self.correlation.snapshot(),
             "security_capabilities": self.security_signals.capability_state(),
+            "vehicle": self.vehicle_intelligence.snapshot(),
         }
 
     def _mean_timing(self, name):
@@ -3593,11 +4622,17 @@ class VisionSystem:
 
     def _profile_call(self, name, callback, *args, **kwargs):
         started = time.perf_counter()
+        failure = None
         try:
             return callback(*args, **kwargs)
+        except Exception as exc:
+            failure = str(exc)[:240]
+            raise
         finally:
-            self._model_metrics.record(
-                name, (time.perf_counter() - started) * 1000.0)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self._model_metrics.record(name, elapsed_ms)
+            self.model_adapters.record_inference(
+                name, elapsed_ms, ok=failure is None, error=failure)
 
     def _face_quality(self, frame, bbox):
         if not self.cfg.get("PERFORMANCE", {}).get("FACE_QUALITY_GATE_ENABLED", True):
@@ -3773,10 +4808,14 @@ class VisionSystem:
                 if source_accepted:
                     added_for_person += 1
                     imported_embeddings += 1
-                    if fingerprint:
-                        fingerprints.add(fingerprint)
+                # A valid source that is already represented is still marked
+                # as processed. This avoids repeating detector work at every
+                # startup, while rejected/low-quality images remain eligible
+                # for a later corrected replacement.
+                if fingerprint and source_embedding is not None:
+                    fingerprints.add(fingerprint)
 
-                if (augment_enabled and source_embedding is not None
+                if (augment_enabled and source_accepted and source_embedding is not None
                         and len(image_paths) < sparse_limit
                         and augmented_for_person < max_augmented):
                     remaining = min(
@@ -3798,9 +4837,10 @@ class VisionSystem:
                             augmented_embeddings += 1
 
             record["source_fingerprints"] = sorted(fingerprints)
-            if len(record["embeddings"]) >= 2:
+            threshold_embeddings = _enrollment_basis_embeddings(record)
+            if len(threshold_embeddings) >= 2:
                 mean_variance, std_variance = _compute_intra_class_variance(
-                    record["embeddings"])
+                    threshold_embeddings)
                 record["threshold"] = _auto_threshold(mean_variance, std_variance)
 
             if added_for_person or augmented_for_person:
@@ -3841,14 +4881,27 @@ class VisionSystem:
             return
         disabled = set()
         roster_roles = {}
+        active_names = []
         try:
+            people = db.get_known_face_names(limit=2000)
             roster_roles = {
                 str(row["name"]): str(row["role"] or "")
-                for row in db.get_known_face_names(limit=2000)
+                for row in people
             }
+            active_names = [
+                str(row["name"])
+                for row in people
+                if db.get_active_person_id(row["name"]) is not None
+            ]
             self.security_signals.set_roster_roles(roster_roles)
+            # Keep authorization at the same boundary as identity state. An
+            # identity removed or disabled in SQLite must stop being eligible
+            # even when a cached model label remains visible for continuity.
+            self.correlation.set_active_roster(active_names)
         except Exception:
-            pass
+            # A roster read failure must fail closed for sensitive decisions;
+            # the next successful sync will restore normal operation.
+            self.correlation.set_active_roster(())
         for name in self.face_db:
             try:
                 if db.get_active_person_id(name) is None:
@@ -4235,15 +5288,36 @@ class VisionSystem:
                     "minimum": state["min_embeddings"], "maximum": state["max_embeddings"],
                     "quality_score": quality_score, "message": state["message"]}
 
+        return self._prepare_web_enrollment_for_commit(state)
+
+    def _prepare_web_enrollment_for_commit(self, state: dict) -> dict:
+        """Move a completed minimum-to-maximum capture into a pending commit."""
+        accepted = len(state.get("embeddings") or [])
+        minimum = int(state.get("min_embeddings", 5))
+        maximum = int(state.get("max_embeddings", 10))
+        if accepted < minimum:
+            return {
+                "active": True,
+                "stage": "capturing",
+                "person_name": state.get("person_name"),
+                "accepted": accepted,
+                "minimum": minimum,
+                "maximum": maximum,
+                "quality_score": state.get("last_score", 0.0),
+                "rejected_samples": int(state.get("rejected_samples", 0)),
+                "can_finish": False,
+                "message": f"Collect at least {minimum} quality-gated samples first.",
+            }
         completed = {
             "active": False,
             "stage": "completed",
             "person_name": state["person_name"],
             "accepted": accepted,
-            "minimum": state["min_embeddings"],
-            "maximum": state["max_embeddings"],
-            "quality_score": quality_score,
+            "minimum": minimum,
+            "maximum": maximum,
+            "quality_score": state.get("last_score", 0.0),
             "quality_scores": list(state.get("quality_scores", [])),
+            "quality_metrics": list(state.get("quality_metrics", [])),
             "pose_yaws": list(state.get("pose_yaws", [])),
             "rejected_samples": int(state.get("rejected_samples", 0)),
             "message": f"Collected {accepted} quality-gated samples.",
@@ -4260,6 +5334,18 @@ class VisionSystem:
             completed["stage"] = "duplicate_warning"
             completed["message"] = "A similar enrolled identity was found. Confirm to override or cancel."
         return completed
+
+    def finish_web_enrollment(self) -> dict:
+        """Allow the operator to finish after the minimum sample count."""
+        state = self._web_enrollment
+        if not state or not state.get("active"):
+            if self._pending_web_enrollment:
+                return dict(self._pending_web_enrollment)
+            return {"ok": False, "stage": "idle", "message": "No active enrollment is collecting samples."}
+        result = self._prepare_web_enrollment_for_commit(state)
+        if result.get("stage") != "capturing":
+            self._web_enrollment = None
+        return result
 
     def find_duplicate_identities(self, embeddings, exclude_name: Optional[str] = None) -> list[dict]:
         """Return existing identities that are too close to new samples."""
@@ -4284,7 +5370,9 @@ class VisionSystem:
         record = self.face_db.get(person_name) or {}
         embeddings = record.get("embeddings", [])
         provenance = record.get("embedding_provenance") or []
-        mean_variance, std_variance = _compute_intra_class_variance(embeddings) if len(embeddings) >= 2 else (0.0, 0.0)
+        threshold_embeddings = _enrollment_basis_embeddings(record)
+        mean_variance, std_variance = (_compute_intra_class_variance(threshold_embeddings)
+                                       if len(threshold_embeddings) >= 2 else (0.0, 0.0))
         source_count = sum(1 for item in provenance if item.get("kind") == "source")
         augmented_count = sum(1 for item in provenance if item.get("kind") == "augmented")
         quality_scores = [float(item["quality_score"]) for item in provenance
@@ -4300,10 +5388,13 @@ class VisionSystem:
             "sample_count": len(embeddings),
             "source_count": source_count,
             "augmented_count": augmented_count,
+            "threshold_basis": "original_evidence" if source_count else "legacy_or_runtime_evidence",
+            "threshold_basis_count": len(threshold_embeddings),
             "mean_variance": round(float(mean_variance), 6),
             "std_variance": round(float(std_variance), 6),
             "threshold": float(record.get("threshold", self.cfg.get("FACE_RECOG_THRESHOLD", 0.6))),
             "provenance_count": len(provenance),
+            "source_fingerprint_count": len(record.get("source_fingerprints") or []),
             "quality_range": {
                 "min": round(min(quality_scores), 2) if quality_scores else None,
                 "max": round(max(quality_scores), 2) if quality_scores else None,
@@ -4354,8 +5445,9 @@ class VisionSystem:
                 })
             record = self.face_db.get(name) or {}
             record["rejected_samples"] = int(pending.get("rejected_samples", 0))
-            if len(record.get("embeddings", [])) >= 2:
-                mean_variance, std_variance = _compute_intra_class_variance(record["embeddings"])
+            threshold_embeddings = _enrollment_basis_embeddings(record)
+            if len(threshold_embeddings) >= 2:
+                mean_variance, std_variance = _compute_intra_class_variance(threshold_embeddings)
                 record["threshold"] = _auto_threshold(mean_variance, std_variance)
             self._rebuild_index()
             if not self.save_face_db():
@@ -4450,8 +5542,9 @@ class VisionSystem:
         if not self._append_face_embedding(person_name, embedding):
             return False
         embs = self.face_db[person_name]["embeddings"]
-        if len(embs) >= 2:
-            mv, sv = _compute_intra_class_variance(embs)
+        threshold_embeddings = _enrollment_basis_embeddings(self.face_db[person_name])
+        if len(threshold_embeddings) >= 2:
+            mv, sv = _compute_intra_class_variance(threshold_embeddings)
             self.face_db[person_name]["threshold"] = _auto_threshold(mv, sv)
         if rebuild:
             self._rebuild_index()
@@ -4505,7 +5598,7 @@ class VisionSystem:
             cv2.rectangle(frame, (x1, y - 12), (x1 + 14, y + 2), (255, 255, 255), 1)
             cv2.putText(frame, "Shirt", (x1 + 18, y), cv2.FONT_HERSHEY_SIMPLEX,
                         0.4, (200, 200, 200), 1); y += 20
-        cv2.putText(frame, f"Age:{age} G:{gender} E:{emotion}", (x1, y),
+        cv2.putText(frame, f"Age band:{age} G:{gender} E:{emotion}", (x1, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1); y += 20
         sus = st.get("suspicion", 0)
         if sus > 5:
@@ -4656,6 +5749,10 @@ class VisionSystem:
             cache_similarity = None
             second_score = float((cached or {}).get("second_score", 0.0))
             margin = float((cached or {}).get("margin", 0.0))
+            # A cached identity may keep the UI stable, but it is never fresh
+            # biometric evidence. Keep this explicit so downstream callers do
+            # not have to infer policy from a display label or reason string.
+            cached_only = False
             evidence_interval = float(perf.get(
                 "RECOGNITION_EVIDENCE_MIN_INTERVAL_SEC", 0.75))
             timing = None
@@ -4728,13 +5825,15 @@ class VisionSystem:
                 conf = float(cached.get("cached_identity_confidence",
                                       cached.get("conf", 0.0)))
                 embedding = cached.get("embedding")
-                reason = "stable_track_cache" if quality_ok else "quality_hold"
+                reason = "stable_track_cache"
+                cached_only = True
                 self._recognition_cache_hits += 1
                 self._embeddings_skipped_due_to_cache += 1
             elif not quality_ok:
                 if quality_hold_valid:
                     name, conf = "UNKNOWN", 0.0
                     reason = "WAITING_FOR_GOOD_FACE"
+                    cached_only = True
                     identity_state = "OCCLUDED" if identity_state == "CONFIRMED" else identity_state
                 else:
                     name, conf, reason = "UNKNOWN", 0.0, (
@@ -4849,6 +5948,7 @@ class VisionSystem:
                 name = cached.get("name", "UNKNOWN")
                 conf = float(cached.get("cached_identity_confidence", 0.0))
                 reason = cached.get("reason", "cached_identity")
+                cached_only = True
                 if self._is_identity_disabled(name):
                     name, conf, reason = "UNKNOWN", 0.0, "identity_disabled"
                 embedding = cached.get("embedding")
@@ -4893,6 +5993,7 @@ class VisionSystem:
             )
             attendance_eligible = (
                 attendance_eligible
+                and not cached_only
                 and identity_state == "CONFIRMED"
                 and identity_age_valid
             )
@@ -4916,7 +6017,7 @@ class VisionSystem:
                     and self.cfg.get("ENABLE_AGE_GENDER_INFERENCE", False)):
                 age, gender = self._profile_call(
                     "age_gender",
-                    lambda: (self.face_analyzer.get_age(recognition_fobj) or "?",
+                    lambda: (self.face_analyzer.get_age_band(recognition_fobj) or "unknown",
                              self.face_analyzer.get_gender(recognition_fobj)))
                 emotion = "neutral"
                 if oid > 0:
@@ -4928,7 +6029,7 @@ class VisionSystem:
                          "quality_score": quality_score,
                          "quality_ok": quality_ok,
                          "quality_metrics": quality_metrics,
-                         "reason": reason, "age": age, "gender": gender,
+                         "reason": reason, "age_band": age, "gender": gender,
                          "yaw": yaw, "liveness_status": spoof_status,
                          "liveness_details": spoof_details,
                          "identity_state": identity_state,
@@ -4941,8 +6042,9 @@ class VisionSystem:
                                       "current_observation_similarity", conf)),
                            "second_score": float((self._recognition_cache.get(oid) or {}).get(
                                "second_score", second_score)),
-                           "margin": float((self._recognition_cache.get(oid) or {}).get(
+                          "margin": float((self._recognition_cache.get(oid) or {}).get(
                                "margin", margin)),
+                           "cached_only": cached_only,
                            "candidate_hits": candidate_hits,
                            "stable_frames": stable_frames,
                            "last_verified_at": last_verified_at,
@@ -4995,7 +6097,8 @@ class VisionSystem:
                     self._object_interaction_last[key] = now
                     events.append(("OBJECT_INTERACTION", f"ID_{oid}", 1.0,
                                    f"ID_{oid} near {d['class_name']}",
-                                   {"track_id": oid, "object_class": d["class_name"]}))
+                                   {"track_id": oid, "object_class": d["class_name"],
+                                    "entity_type": "person"}))
         return events
 
     def _draw_ui(self, frame, events, tracked, obj_dets):
@@ -5240,12 +6343,14 @@ class VisionSystem:
             object_detections.extend(custom_dets)
 
         person_rects = [d["bbox"] for d in object_detections if d["class_name"] == "person"]
-        tracked = self.person_tracker.update(person_rects)
+        tracked = self.person_tracker_adapter.update(
+            person_rects, source_frame_id=source_frame_id)
 
         self._extract_shirt_colors(analysis, object_detections, tracked)
 
         events.extend(self.behavior.update(tracked))
         events.extend(self.crowd_intel.update(tracked, frame_size=(h, w)))
+        self._last_crowd_state = self.crowd_intel.snapshot()
         # SecuritySignalEngine owns debounced operational versions of these
         # signals. Behavior/Crowd still update their internal analytics, but
         # their duplicate tuples must not reach the persistence/alert path.
@@ -5284,12 +6389,21 @@ class VisionSystem:
                         has_signal=bool(self._last_pose_result.get("pose")),
                     )
                 pose_result = self._last_pose_result
+                # MediaPipe returns one pose result for the selected ROI. It
+                # is attributable only when exactly one tracked person is in
+                # that ROI; otherwise keep the safety signal global rather
+                # than assigning it to the wrong student.
+                pose_track_id = next(iter(tracked)) if len(tracked) == 1 else None
+                pose_metadata = ({
+                    "track_id": int(pose_track_id),
+                    "entity_type": "person",
+                } if pose_track_id is not None else {"entity_type": "person"})
                 if pose_result.get("is_fallen"):
                     events.append(("FALL_DETECTED", "PERSON", 0.85,
-                                   "Possible fall: torso horizontal"))
+                                   "Possible fall: torso horizontal", pose_metadata))
                 if pose_result.get("hands_raised"):
                     events.append(("HANDS_RAISED", "PERSON", 0.8,
-                                   "Both hands raised above head"))
+                                   "Both hands raised above head", pose_metadata))
                 if self.cfg.get("SHOW_POSE_LANDMARKS", False):
                     self.pose_detector.draw(display, pose_result)
         except Exception as e:
@@ -5310,7 +6424,9 @@ class VisionSystem:
         mark_stage("recognition_and_liveness")
 
         correlation_state = {}
-        if self.cfg.get("CORRELATION_CORE", {}).get("ENABLED", True):
+        correlation_enabled = bool(
+            self.cfg.get("CORRELATION_CORE", {}).get("ENABLED", True))
+        if correlation_enabled:
             correlation_state = self.correlation.update(
                 tracked=tracked,
                 faces_info=faces_info,
@@ -5343,6 +6459,19 @@ class VisionSystem:
                 security_events=events,
             )
             events = list(correlation_state.get("security_event_tuples") or [])
+        else:
+            # Raw perception tuples are diagnostic output only. They must not
+            # enter the operational queue when the authoritative reducer is
+            # disabled, otherwise attendance, incidents, and alerts could be
+            # created without entity/evidence correlation.
+            correlation_state = {
+                "enabled": False,
+                "decision_boundary": "DISABLED_FAIL_CLOSED",
+                "security_events": [],
+                "entities": [],
+                "attendance_decisions": [],
+            }
+            events = []
         self._last_correlation_state = correlation_state
         entity_by_track = {
             int(entity["track_id"]): entity
@@ -5394,26 +6523,51 @@ class VisionSystem:
             else:
                 fi["name"] = "UNKNOWN"
             fi["identity_state"] = face_state
-            fi["attendance_eligible"] = bool(entity.get("attendance_eligibility", False))
+            if entity and fi.get("oid") is not None:
+                canonical_gate = self.correlation.attendance_decision(
+                    int(fi.get("oid")),
+                    expected_name=canonical_name or None,
+                )
+            else:
+                canonical_gate = {"eligible": False, "reason": "entity_not_found"}
+            fi["attendance_eligible"] = bool(canonical_gate.get("eligible", False))
+            fi["roster_match"] = bool(canonical_gate.get("roster_match", False))
+            fi["track_generation"] = int(entity.get("track_generation", 1) or 1)
+            fi["presence_state"] = entity.get("lifecycle_state", "ACTIVE")
             fi["liveness_status"] = (entity.get("liveness", {}) or {}).get(
                 "state", fi.get("liveness_status", "NOT_EVALUATED"))
             fi["quality_ok"] = bool((entity.get("face", {}) or {}).get(
                 "quality_ok", fi.get("quality_ok", False)))
-            fi["correlation_reason"] = (
-                "authoritative_entity_state" if entity else "entity_not_found")
+            fi["cached_only"] = bool(fi.get("cached_only", False)) or not bool(
+                (entity.get("identity", {}) or {}).get("current_evidence_fresh", False))
+            fi["correlation_reason"] = str(canonical_gate.get("reason") or (
+                "authoritative_entity_state" if entity else "entity_not_found"))
 
         # Security policy consumes canonical entity state. This prevents a
         # stale raw recognition label from authorizing a restricted-zone
         # presence before the correlation reducer has checked continuity,
         # quality, liveness, and contradiction state.
+        vehicle_input = object_detections if self._last_object_observation_frame_id == source_frame_id else []
+        vehicle_events = self.vehicle_intelligence.update(
+            vehicle_input, now=frame_observed_at, source_frame_id=source_frame_id,
+            frame_size=(processing_w, processing_h), camera_id=camera_id)
+        self._last_vehicle_state = self.vehicle_intelligence.snapshot()
         security_events = self.security_signals.update(
             tracked,
             faces_info=faces_info,
             object_detections=object_detections,
             now=frame_observed_at,
             wallclock=frame_observed_wallclock,
+            camera_id=camera_id,
+            track_generations={
+                int(entity.get("track_id")): int(entity.get("track_generation", 1) or 1)
+                for entity in correlation_state.get("entities", [])
+                if entity.get("track_id") is not None
+            },
+            frame_size=(processing_w, processing_h),
         )
-        if self.cfg.get("CORRELATION_CORE", {}).get("ENABLED", True):
+        security_events.extend(vehicle_events)
+        if correlation_enabled:
             correlated_security = self.correlation.correlate_security_events(
                 security_events,
                 source_frame_id=source_frame_id,
@@ -5426,7 +6580,8 @@ class VisionSystem:
                 correlated_security.get("security_events") or [])
             correlation_state["stats"] = self.correlation.stats()
         else:
-            events.extend(security_events)
+            # Do not persist or alert on uncorrelated raw security output.
+            security_events = []
 
         self._last_faces_seen = []
         for fi in faces_info:
@@ -5444,6 +6599,7 @@ class VisionSystem:
             self._last_faces_seen.append({
                 "entity_id": entity.get("entity_id"),
                 "track_id": oid,
+                "track_generation": int(fi.get("track_generation", entity.get("track_generation", 1)) or 1),
                 "name": fi.get("name"),
                 "confidence": float(fi.get("confidence", 0.0)),
                 "is_real": bool(fi.get("is_real", True)),
@@ -5453,6 +6609,8 @@ class VisionSystem:
                 "quality_score": float(fi.get("quality_score", 0.0)),
                 "quality_ok": bool(fi.get("quality_ok", False)),
                 "identity_state": fi.get("identity_state", "UNRESOLVED"),
+                "roster_match": bool(fi.get("roster_match", False)),
+                "presence_state": fi.get("presence_state", entity.get("lifecycle_state", "ACTIVE")),
                 "correlation_reason": fi.get("correlation_reason"),
                 "cached_identity_confidence": float(
                     fi.get("cached_identity_confidence", 0.0)),
@@ -5478,6 +6636,25 @@ class VisionSystem:
             for d in object_detections[:30]
         ]
 
+        # Age is an approximate demographic signal. Publish only aggregate
+        # bands for analytics; never attach it to a person, attendance row,
+        # access decision, or security classification.
+        age_counts = Counter(
+            str(face.get("age_band") or "").strip().casefold()
+            for face in faces_info
+            if str(face.get("age_band") or "").strip()
+            and str(face.get("age_band")).strip().casefold() != "unknown"
+        )
+        age_enabled = bool(self.cfg.get("ENABLE_AGE_GENDER_INFERENCE", False))
+        self._last_demographics_state = {
+            "status": "EXPERIMENTAL" if age_enabled and age_counts else (
+                "NOT_MEASURED" if age_enabled else "DISABLED"),
+            "decision_use": "aggregate_only",
+            "age_bands": dict(sorted(age_counts.items())),
+            "samples": int(sum(age_counts.values())),
+            "exact_age": "NOT_AVAILABLE",
+        }
+
         self._last_held_objects = self._summarize_held_objects(
             analysis,
             hand_dets,
@@ -5490,6 +6667,9 @@ class VisionSystem:
         "faces": self._last_faces_seen,
         "objects": self._last_objects_seen,
         "held_objects": self._last_held_objects,
+        "vehicles": self._last_vehicle_state,
+        "crowd": self._last_crowd_state,
+        "demographics": self._last_demographics_state,
         "correlation": correlation_state,
         "security_capabilities": self.security_signals.capability_state(),
         }
@@ -5512,6 +6692,12 @@ class VisionSystem:
                 "shirt_color": shirt_color,
             }
 
+        # These signals are produced after the first correlation pass because
+        # they depend on the completed object/interaction state. Keep them in
+        # a separate buffer and correlate them before they reach persistence;
+        # otherwise late security tuples could bypass the canonical entity
+        # and evidence boundary.
+        late_security_events = []
         danger_enabled = self.cfg.get("DANGER_DETECTION", {}).get("ENABLED", False)
         dangerous = {x.lower() for x in self.cfg.get("DANGEROUS_OBJECTS", set())}
         for d in object_detections:
@@ -5531,22 +6717,59 @@ class VisionSystem:
                 if not self._event_cooldown.allowed(key, 20.0):
                     continue
 
-            events.append((
+            late_security_events.append((
                 event_type,
                 d["class_name"],
                 d["confidence"],
-                f"Detected {d['class_name']} at {d['bbox']} via {d.get('source_model', 'general')}"
+                f"Detected {d['class_name']} at {d['bbox']} via {d.get('source_model', 'general')}",
+                {
+                    "camera_id": camera_id,
+                    "source_frame_id": source_frame_id,
+                    "object_class": d["class_name"],
+                    "bbox": d.get("bbox"),
+                    "source_model": d.get("source_model", "general"),
+                    "entity_type": "object",
+                },
             ))
 
-        events.extend(self._check_object_interactions(tracked, object_detections))
+        late_security_events.extend(self._check_object_interactions(tracked, object_detections))
 
         for fi in faces_info:
             if not fi.get("is_real", True):
                 oid = fi.get("oid", -1)
                 key = f"spoof_event:{oid}"
                 if self._event_cooldown.allowed(key, 30.0):
-                    events.append(("SPOOF_DETECTED", fi.get("name", "?"), 0.9,
-                                   f"Confirmed repeated spoof suspicion at bbox {fi['bbox']}"))
+                    late_security_events.append((
+                        "SPOOF_DETECTED", fi.get("name", "?"), 0.9,
+                        f"Confirmed repeated spoof suspicion at bbox {fi['bbox']}",
+                        {
+                            "track_id": oid,
+                            "camera_id": camera_id,
+                            "source_frame_id": source_frame_id,
+                            "bbox": fi.get("bbox"),
+                            "identity_state": fi.get("identity_state"),
+                            "entity_type": "person",
+                        },
+                    ))
+
+        if late_security_events:
+            if correlation_enabled:
+                correlated_late = self.correlation.correlate_security_events(
+                    late_security_events,
+                    source_frame_id=source_frame_id,
+                    camera_id=camera_id,
+                    observed_at_monotonic=frame_observed_at,
+                    observed_at_wallclock=frame_observed_wallclock,
+                )
+                events.extend(correlated_late.get("security_event_tuples") or [])
+                correlation_state.setdefault("security_events", []).extend(
+                    correlated_late.get("security_events") or [])
+                correlation_state["stats"] = self.correlation.stats()
+            else:
+                # Raw late signals are deliberately dropped when the
+                # correlation authority is disabled. The capability state
+                # exposes this as a fail-closed diagnostic condition.
+                late_security_events = []
 
         active_ids = set(tracked.keys())
         for fi in faces_info:
@@ -5588,8 +6811,33 @@ class AttendanceManager:
         today = _today_iso()
         if today != self._date:
             try:
-                self.db.close_open_attendance_before(today)
+                closed_attendance = self.db.close_open_attendance_before(today)
                 self.db.close_open_presence_sessions("day_rollover")
+                for row in closed_attendance:
+                    # Rollover closure is an operational decision, so retain
+                    # the prior date and last valid source context rather
+                    # than silently changing an open record.
+                    self.db.log_event(
+                        "ATTENDANCE_CLOCKOUT",
+                        person_id=row.get("person_id"),
+                        confidence=1.0,
+                        details={
+                            "work_min": row.get("work_minutes", 0),
+                            "source": "day_rollover",
+                            "attendance_date": row.get("date"),
+                            "closed_at": row.get("clocked_out_at"),
+                        },
+                        camera_id=row.get("camera_id"),
+                        location=row.get("location"),
+                        severity=0,
+                        observation_type="ATTENDANCE_DECISION",
+                        presence_session_id=row.get("presence_session_id"),
+                        source_frame_id=row.get("source_frame_id"),
+                        event_uid=(
+                            f"attendance:clock_out:{row.get('person_id')}:"
+                            f"{row.get('date')}:day_rollover"
+                        ),
+                    )
             except Exception as exc:
                 print(f"[ATTENDANCE] Rollover reconciliation failed: {exc}")
             self._today_clocked_in.clear()
@@ -5623,65 +6871,44 @@ class AttendanceManager:
                 )
                 self._unregistered_logged.add(person_name)
             return
+        # Attendance decisions must come from the correlation reducer. Keep
+        # the argument for compatibility with older callers, but never allow
+        # a legacy repeated-label path to create an official record.
+        if not authoritative:
+            self.db.log_audit(
+                "ATTENDANCE_REJECTED_NON_AUTHORITATIVE",
+                person_name,
+                {"reason": "attendance requires correlated entity evidence"},
+            )
+            return
         self.db.touch_attendance_presence(pid, _utc_now(), presence_session_id)
         if person_name in self._today_clocked_in:
             return
-        if authoritative:
-            result = self.db.attendance_clock_in(
-                pid, camera_id, location, confidence=confidence,
+        result = self.db.attendance_clock_in(
+            pid, camera_id, location, confidence=confidence,
+            presence_session_id=presence_session_id,
+            recognition_evidence_id=recognition_evidence_id,
+            source_frame_id=source_frame_id,
+            identity_state="CONFIRMED",
+            liveness_status=liveness_status or "REAL",
+            decision_source="automatic_correlated")
+        if "clocked_in_at" in result or result.get("already_clocked_in"):
+            self._today_clocked_in.add(person_name)
+        if "clocked_in_at" in result:
+            late = result.get("late_minutes", 0)
+            if self._announce:
+                message = f"Welcome {person_name}."
+                if late > 0:
+                    message = f"Welcome {person_name}. You are {late} minutes late."
+                voice(message, "INFO", dedup_key=f"clockin:{person_name}")
+            self.db.log_event(
+                "ATTENDANCE_CLOCKIN", person_id=pid, confidence=confidence,
+                details={"late_min": late, "source": "correlation_core"},
+                camera_id=camera_id, location=location, severity=0,
                 presence_session_id=presence_session_id,
-                recognition_evidence_id=recognition_evidence_id,
                 source_frame_id=source_frame_id,
-                identity_state="CONFIRMED",
-                liveness_status=liveness_status or "REAL",
-                decision_source="automatic_correlated")
-            if "clocked_in_at" in result or result.get("already_clocked_in"):
-                self._today_clocked_in.add(person_name)
-            if "clocked_in_at" in result:
-                late = result.get("late_minutes", 0)
-                if self._announce:
-                    message = f"Welcome {person_name}."
-                    if late > 0:
-                        message = f"Welcome {person_name}. You are {late} minutes late."
-                    voice(message, "INFO", dedup_key=f"clockin:{person_name}")
-                self.db.log_event(
-                    "ATTENDANCE_CLOCKIN", person_id=pid, confidence=confidence,
-                    details={"late_min": late, "source": "correlation_core"},
-                    camera_id=camera_id, location=location, severity=0,
-                    presence_session_id=presence_session_id,
-                    source_frame_id=source_frame_id,
-                    observation_type="ATTENDANCE_DECISION")
-            return
-        self._recognitions[person_name].append(now)
-        # purge old
-        win = self.cfg.get("RECOGNITION_WINDOW_SEC", 5.0)
-        while (self._recognitions[person_name]
-               and now - self._recognitions[person_name][0] > win):
-            self._recognitions[person_name].popleft()
-        min_frames = self.cfg.get("MIN_RECOGNITION_FRAMES", 8)
-        if (len(self._recognitions[person_name]) >= min_frames
-                and person_name not in self._today_clocked_in):
-            result = self.db.attendance_clock_in(
-                pid, camera_id, location, confidence=confidence,
-                presence_session_id=presence_session_id,
-                recognition_evidence_id=recognition_evidence_id,
-                source_frame_id=source_frame_id,
-                identity_state="CONFIRMED",
-                liveness_status=liveness_status or "REAL",
-                decision_source="automatic")
-            if "clocked_in_at" in result or result.get("already_clocked_in"):
-                self._today_clocked_in.add(person_name)
-            if "clocked_in_at" in result:
-                late = result.get("late_minutes", 0)
-                msg = f"Welcome {person_name}."
-                if late > 0: msg = f"Welcome {person_name}. You are {late} minutes late."
-                if self._announce: voice(msg, "INFO", dedup_key=f"clockin:{person_name}")
-                self.db.log_event("ATTENDANCE_CLOCKIN", person_id=pid, confidence=1.0,
-                                  details={"late_min": late}, camera_id=camera_id,
-                                  location=location, severity=0,
-                                  presence_session_id=presence_session_id,
-                                  source_frame_id=source_frame_id,
-                                  observation_type="ATTENDANCE_DECISION")
+                observation_type="ATTENDANCE_DECISION",
+                event_uid=f"attendance:clock_in:{pid}:{_today_iso()}")
 
     def clock_in_verified(self, person_name: str, camera_id: str = "cam_0",
                           location: str = None, confidence: float = 1.0,
@@ -5724,7 +6951,8 @@ class AttendanceManager:
                 camera_id=camera_id, location=location, severity=0,
                 presence_session_id=presence_session_id,
                 source_frame_id=source_frame_id,
-                observation_type="ATTENDANCE_DECISION")
+                observation_type="ATTENDANCE_DECISION",
+                event_uid=f"attendance:clock_in:{pid}:{_today_iso()}")
             msg = f"Welcome {person_name}."
             if late > 0:
                 msg = f"Welcome {person_name}. You are {late} minutes late."
@@ -5750,8 +6978,13 @@ class AttendanceManager:
                 person_id=row.get("person_id"),
                 confidence=1.0,
                 details={"work_min": row.get("work_minutes", 0), "source": "automatic_timeout"},
+                camera_id=row.get("camera_id"),
+                location=row.get("location"),
                 severity=0,
                 observation_type="ATTENDANCE_DECISION",
+                presence_session_id=row.get("presence_session_id"),
+                source_frame_id=row.get("source_frame_id"),
+                event_uid=f"attendance:clock_out:{row.get('person_id')}:{_today_iso()}",
             )
             if self._announce and row.get("name"):
                 voice(f"Goodbye {row['name']}.", "INFO", dedup_key=f"clockout:{row['name']}")
@@ -5768,8 +7001,13 @@ class AttendanceManager:
                 person_id=row.get("person_id"),
                 confidence=1.0,
                 details={"work_min": row.get("work_minutes", 0), "source": "runtime_shutdown"},
+                camera_id=row.get("camera_id"),
+                location=row.get("location"),
                 severity=0,
                 observation_type="ATTENDANCE_DECISION",
+                presence_session_id=row.get("presence_session_id"),
+                source_frame_id=row.get("source_frame_id"),
+                event_uid=f"attendance:clock_out:{row.get('person_id')}:{_today_iso()}",
             )
         return closed
 
@@ -5780,7 +7018,8 @@ class AttendanceManager:
         if "clocked_out_at" in r:
             self._today_clocked_in.discard(person_name)
             self.db.log_event("ATTENDANCE_CLOCKOUT", person_id=pid, confidence=1.0,
-                              details={"work_min": r.get("work_minutes", 0)})
+                              details={"work_min": r.get("work_minutes", 0)},
+                              event_uid=f"attendance:clock_out:{pid}:{_today_iso()}")
             if self._announce:
                 voice(f"Goodbye {person_name}.", "INFO", dedup_key=f"clockout:{person_name}")
         return r
@@ -6544,8 +7783,10 @@ def _save_snapshot(snapshot_dir: str, event_type: str, name: str, frame: np.ndar
         ts = dt_datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         safe_name = "".join(c for c in str(name) if c.isalnum() or c in "_-")[:32] or "x"
         fname = os.path.join(snapshot_dir, f"{event_type}_{safe_name}_{ts}.jpg")
-        cv2.imwrite(fname, frame)
-        return fname
+        encoded_ok, encoded = cv2.imencode(".jpg", frame)
+        if not encoded_ok:
+            raise RuntimeError("JPEG encoding failed")
+        return str(write_evidence_bytes(encoded.tobytes(), fname))
     except Exception as e:
         print(f"[ERROR] Snapshot save failed: {e}")
         return None
@@ -6670,7 +7911,8 @@ _SEVERE_EVENT_TYPES = {
     "DANGEROUS_OBJECT", "WEAPON_DETECTED", "SPOOF_DETECTED",
     "FIRE_DETECTED", "SMOKE_DETECTED", "EVACUATION_ALERT",
     "FALL_DETECTED", "HANDS_RAISED", "CONGESTION", "ZONE_INTRUSION",
-    "LOITERING", "RUNNING", "PPE_VIOLATION",
+    "LOITERING", "RUNNING", "PPE_VIOLATION", "SPEED_THRESHOLD_EXCEEDED",
+    "IDENTITY_CONFLICT",
 }
 
 _SEVERITY_MAP = {
@@ -6694,8 +7936,23 @@ _SEVERITY_MAP = {
     "ZONE_EXIT": 0,
     "ZONE_INTRUSION": 2,
     "PPE_VIOLATION": 2,
+    "SPEED_THRESHOLD_EXCEEDED": 2,
+    "IDENTITY_CONFLICT": 1,
     "OBJECT_INTERACTION": 0,
 }
+
+
+def _event_policy_severity(event_type, metadata=None) -> int:
+    """Resolve detector severity without allowing malformed metadata to fail a task."""
+    base = int(_SEVERITY_MAP.get(str(event_type or "").upper(), 0))
+    value = (metadata or {}).get("severity")
+    try:
+        candidate = float(value)
+        if not math.isfinite(candidate):
+            return base
+        return max(base, int(candidate))
+    except (TypeError, ValueError, OverflowError):
+        return base
 
 
 def _panel_wrap(value, width=42, limit=4):
@@ -6890,13 +8147,57 @@ def _runtime_capabilities(vision=None) -> dict:
         "web_enrollment": vision is not None,
         "voice_assistant": bool(STT_AVAILABLE),
         "runtime_bridge": True,
+        "correlation_authority": (
+            "AUTHORITATIVE"
+            if CONFIG.get("CORRELATION_CORE", {}).get("ENABLED", True)
+            else "DISABLED_FAIL_CLOSED"
+        ),
+        "age_estimation": (
+            "EXPERIMENTAL" if CONFIG.get("ENABLE_AGE_GENDER_INFERENCE", False)
+            else "DISABLED"
+        ),
+        "crowd_density": "EXPERIMENTAL",
+        "perspective_density": "NOT_CONFIGURED",
+        "model_registry": (
+            (getattr(vision, "model_registry_status", {}) or {}).get(
+                "status", "NOT_CONFIGURED")
+            if vision is not None else "NOT_CONFIGURED"
+        ),
     }
+    policy_engine = getattr(vision, "policy_engine", None) if vision is not None else None
+    policy_snapshot = getattr(policy_engine, "snapshot", None)
+    if policy_snapshot is None:
+        policy_snapshot = PolicyEngine(CONFIG).snapshot
+    capabilities["policy"] = {
+        "policy_id": policy_snapshot.policy_id,
+        "declared_version": policy_snapshot.declared_version,
+        "valid": bool(policy_snapshot.valid),
+        "issues": list(policy_snapshot.issues),
+        "organization_id": policy_snapshot.organization_id,
+        "site_id": policy_snapshot.site_id,
+        "device_id": policy_snapshot.device_id,
+    }
+    vehicle = getattr(vision, "vehicle_intelligence", None) if vision is not None else None
+    if vehicle is not None:
+        capabilities.update(vehicle.capability_state())
+    else:
+        capabilities.update({
+            "vehicle_tracking": "NOT_STARTED",
+            "vehicle_speed": "NOT_STARTED",
+            "plate_reading": "NOT_STARTED",
+        })
     if vision is not None and getattr(vision, "security_signals", None) is not None:
         security = vision.security_signals.capability_state()
         capabilities.update({f"security_{key}": value for key, value in security.items()})
+    if vision is not None and getattr(vision, "model_adapters", None) is not None:
+        capabilities["model_adapters"] = vision.model_adapters.capability_snapshot()
     capabilities["ml_anti_spoof"] = (
         "AVAILABLE" if CONFIG.get("ANTI_SPOOFING", {}).get("ENABLE_ML_CLASSIFIER", False)
         else "NOT_CONFIGURED"
+    )
+    outbox = getattr(vision, "sync_outbox", None) if vision is not None else None
+    capabilities["edge_sync"] = (
+        outbox.security_mode if outbox is not None else "LOCAL_ONLY_NOT_STARTED"
     )
     return capabilities
 
@@ -6959,6 +8260,8 @@ def _publish_runtime_state(
     last_error=None,
     source_result=None,
     performance=None,
+    camera_status="connected",
+    center_attendance=None,
 ):
     faces = getattr(vision, "_last_faces_seen", []) or []
     registered = []
@@ -6968,6 +8271,7 @@ def _publish_runtime_state(
         item = {
             "entity_id": face.get("entity_id"),
             "track_id": face.get("track_id"),
+            "track_generation": int(face.get("track_generation", 1) or 1),
             "name": name,
             "temporary_name": name,
             "confidence": float(face.get("confidence") or 0),
@@ -6978,6 +8282,8 @@ def _publish_runtime_state(
             "quality_score": float(face.get("quality_score") or 0),
             "quality_ok": bool(face.get("quality_ok", True)),
             "identity_state": str(face.get("identity_state") or "UNRESOLVED"),
+            "presence_state": str(face.get("presence_state") or "ACTIVE"),
+            "correlation_reason": face.get("correlation_reason"),
             "cached_identity_confidence": float(
                 face.get("cached_identity_confidence") or 0),
             "current_observation_similarity": float(
@@ -7031,11 +8337,23 @@ def _publish_runtime_state(
         "Identity unresolved; attendance blocked. Unknown is not danger."
         if unknown else None
     )
+    demographics = getattr(vision, "_last_demographics_state", {}) or {}
+    if not isinstance(demographics, dict):
+        demographics = {}
+    demographics = {
+        "status": str(demographics.get("status") or "NOT_MEASURED"),
+        "decision_use": "aggregate_only",
+        "age_bands": dict(demographics.get("age_bands") or {}),
+        "samples": int(demographics.get("samples") or 0),
+        "exact_age": "NOT_AVAILABLE",
+    }
+    runtime_capabilities = _runtime_capabilities(vision)
     _atomic_json_write(os.path.join(runtime_dir, "live_state.json"), {
         "schema_version": 1,
         "runtime_id": RUNTIME_ID,
         "runtime_version": RUNTIME_VERSION,
         "timestamp": _runtime_now(),
+        "policy": runtime_capabilities.get("policy", {}),
         "source_frame_id": source_result.get("frame_id") if source_result else None,
         "source_capture_timestamp": source_result.get("captured_at") if source_result else None,
         "inference_completed_at": source_result.get("completed_at") if source_result else None,
@@ -7050,7 +8368,7 @@ def _publish_runtime_state(
             "last_error": last_error,
         },
         "camera": {
-            "status": "connected",
+            "status": str(camera_status or "unknown").lower(),
             "id": cam_id,
             "name": cam_id,
             "location": location,
@@ -7065,8 +8383,34 @@ def _publish_runtime_state(
             "unknown_is_not_dangerous": True,
         },
         "presence": {"registered": registered, "unknown": unknown},
+        "attendance": {
+            "center_mode": {
+                "enabled": bool((center_attendance or {}).get("enabled", False)),
+                "phase": str((center_attendance or {}).get("phase") or "READY"),
+                "status": str((center_attendance or {}).get("status") or "Center attendance is OFF."),
+                "candidate": ((center_attendance or {}).get("candidate")
+                              if (center_attendance or {}).get("candidate") not in {"UNKNOWN", "SPOOF"}
+                              else None),
+                "progress": max(0.0, min(1.0, float((center_attendance or {}).get("progress") or 0.0))),
+                "liveness_phase": str((center_attendance or {}).get("liveness_phase") or "CENTER"),
+                "liveness_status": str((center_attendance or {}).get("liveness_status") or "NOT_EVALUATED"),
+                "liveness_attempts": int((center_attendance or {}).get("liveness_attempts") or 0),
+                "liveness_passed": bool((center_attendance or {}).get("liveness_passed", False)),
+                "completed_name": ((center_attendance or {}).get("completed_name")
+                                    if (center_attendance or {}).get("completed_name") not in {"UNKNOWN", "SPOOF"}
+                                    else None),
+            }
+        },
+        "vehicles": getattr(vision, "_last_vehicle_state", {}) or {},
+        "crowd": getattr(vision, "_last_crowd_state", {}) or {},
+        "demographics": demographics,
+        "edge_sync": (
+            vision.sync_outbox.snapshot()
+            if getattr(vision, "sync_outbox", None) is not None
+            else {"security_mode": "LOCAL_ONLY_NOT_STARTED", "integrity": "NOT_STARTED"}
+        ),
         "correlation": getattr(vision, "_last_correlation_state", {}),
-        "capabilities": _runtime_capabilities(vision),
+        "capabilities": runtime_capabilities,
         "objects": list(object_counts.values()),
         "recent_events": active_events,
     })
@@ -7111,6 +8455,8 @@ def _publish_performance_summary(runtime_dir, profiler, vision, started_at,
         current_source_frame_id=(frame_buffer.metrics().get("frame_id")
                                  if frame_buffer else None),
     )
+    if operations is not None:
+        performance["operations"] = operations.metrics_snapshot()
     performance["vision"] = vision.performance_snapshot() if vision else {}
     performance["benchmark"] = {
         "started_at": started_at,
@@ -7211,7 +8557,8 @@ def _process_runtime_commands(
                      "minimum": progress.get("minimum", 5),
                      "maximum": progress.get("maximum", 10),
                      "quality_score": progress.get("quality_score"),
-                     "rejected_samples": progress.get("rejected_samples", 0)},
+                     "rejected_samples": progress.get("rejected_samples", 0),
+                     "can_finish": bool(progress.get("can_finish", False))},
                 )
         except Exception as exc:
             print(f"[ERROR] Web enrollment progress failed: {exc}")
@@ -7238,6 +8585,49 @@ def _process_runtime_commands(
                     raise RuntimeError("No frame is available for a snapshot.")
                 path = _save_snapshot(snapshot_dir, "MANUAL", "web", last_raw_frame)
                 result["result"] = {"message": "Snapshot saved successfully.", "snapshot_path": path}
+            elif command_type == "set_vehicle_calibration":
+                calibration = payload.get("calibration")
+                if not isinstance(calibration, dict):
+                    raise RuntimeError("A calibration object is required.")
+                if not vision.vehicle_intelligence.set_calibration(calibration):
+                    raise RuntimeError("Calibration must contain a finite 3x3 homography and positive image dimensions.")
+                calibration_path = os.path.join(runtime_dir, "vehicle_calibration.json")
+                _atomic_json_write(calibration_path, {
+                    "schema_version": 1,
+                    "calibration": vision.vehicle_intelligence.calibration.to_dict(),
+                    "updated_at": _runtime_now(),
+                    "actor_id": actor_id,
+                })
+                db.log_audit("VEHICLE_CALIBRATION_CHANGE", "vehicle_calibration", {
+                    "version": vision.vehicle_intelligence.calibration.version,
+                    "image_width": vision.vehicle_intelligence.calibration.image_width,
+                    "image_height": vision.vehicle_intelligence.calibration.image_height,
+                    "actor_id": actor_id,
+                })
+                result["result"] = {
+                    "message": "Vehicle calibration saved locally.",
+                    "calibration": vision.vehicle_intelligence.calibration.to_dict(),
+                }
+            elif command_type == "set_security_zones":
+                zones = payload.get("zones")
+                replacement = vision.security_signals.replace_zones(zones)
+                if not replacement.get("ok"):
+                    raise RuntimeError("Invalid security-zone policy: " + "; ".join(replacement.get("issues", [])))
+                vision.cfg.setdefault("SECURITY", {})["ZONES"] = replacement["zones"]
+                zones_path = os.path.join(runtime_dir, "security_zones.json")
+                _atomic_json_write(zones_path, {
+                    "schema_version": 1,
+                    "zones": replacement["zones"],
+                    "updated_at": _runtime_now(),
+                    "actor_id": actor_id,
+                })
+                db.log_audit("SECURITY_ZONES_CHANGE", "security_zones", {
+                    "count": replacement["count"], "actor_id": actor_id,
+                })
+                result["result"] = {
+                    "message": "Security-zone policy saved locally.",
+                    "zones": replacement["zones"],
+                }
             elif command_type == "test_alert":
                 result["result"] = {"message": "Test alert requested.", "channels": alert_mgr.test_alert()}
             elif command_type == "manual_clock_in":
@@ -7285,6 +8675,27 @@ def _process_runtime_commands(
                     "message": f"Guided enrollment started for {name}.",
                     "mode": "web_guided",
                 }
+            elif command_type == "finish_enrollment":
+                progress = vision.finish_web_enrollment()
+                if progress.get("stage") == "capturing":
+                    raise RuntimeError(progress.get("message", "Minimum enrollment samples have not been collected."))
+                if progress.get("stage") == "idle":
+                    raise RuntimeError(progress.get("message", "No active enrollment is available."))
+                _set_enrollment_status(
+                    runtime_dir,
+                    progress.get("stage", "completed"),
+                    progress.get("message", "Enrollment samples are ready for confirmation."),
+                    {"mode": "web_guided", "person_name": progress.get("person_name"),
+                     "accepted": progress.get("accepted", 0),
+                     "minimum": progress.get("minimum", 5),
+                     "maximum": progress.get("maximum", 10),
+                     "quality_scores": progress.get("quality_scores", []),
+                     "rejected_samples": progress.get("rejected_samples", 0),
+                     "duplicate_candidates": progress.get("duplicate_candidates", [])})
+                result["result"] = {
+                    "message": "Enrollment capture is ready for confirmation.",
+                    "stage": progress.get("stage"),
+                }
             elif command_type == "confirm_enrollment":
                 committed = vision.commit_web_enrollment(
                     override_duplicate=bool(payload.get("override_duplicate", False)))
@@ -7304,6 +8715,7 @@ def _process_runtime_commands(
                     "active": True,
                 })
                 db.upsert_person(name, role=metadata.get("role") or None, metadata=metadata)
+                vision.sync_roster_state(db)
                 db.log_audit("ENROLL_PERSON", name, {
                     "embeddings": committed.get("accepted", 0),
                     "mode": "web_guided",
@@ -7337,6 +8749,7 @@ def _process_runtime_commands(
                     raise RuntimeError(f"No roster person found for {name}.")
                 disabled = db.set_person_active(person_id, False)
                 vision.disable_identity(name)
+                vision.sync_roster_state(db)
                 db.log_audit("DISABLE_PERSON", name, {"source": "web_command", "actor_id": actor_id})
                 db.log_enrollment_operation(name, "disable", "completed", actor_id=actor_id)
                 result["result"] = {"message": f"{name} disabled.", "person_id": person_id, "active": disabled}
@@ -7369,6 +8782,7 @@ def _process_runtime_commands(
                 target_id = db.get_person_id(target_name)
                 if source_id and target_id:
                     db.merge_person_records(source_id, target_id)
+                vision.sync_roster_state(db)
                 db.log_audit("MERGE_PERSON", target_name, {"source": source_name, "target": target_name, "actor_id": actor_id})
                 db.log_enrollment_operation(target_name, "merge", "completed",
                                              provenance={"source_name": source_name}, actor_id=actor_id)
@@ -7386,6 +8800,7 @@ def _process_runtime_commands(
                 db.log_enrollment_operation(
                     name, "delete", "completed", actor_id=actor_id)
                 db.delete_person_records(person_id)
+                vision.sync_roster_state(db)
                 db.log_audit("DELETE_PERSON", name, {"source": "web_command", "confirmed": True, "actor_id": actor_id})
                 result["result"] = deleted
             elif command_type == "register_visible_unknown":
@@ -7403,6 +8818,7 @@ def _process_runtime_commands(
                     _set_enrollment_status(runtime_dir, "failed", "No visible unknown face was available.")
                     raise RuntimeError("No visible unknown face was available.")
                 db.upsert_person(name, role=str(payload.get("role") or "").strip())
+                vision.sync_roster_state(db)
                 db.log_audit("ENROLL_VISIBLE_FACE_WEB", name, payload)
                 db.log_enrollment_operation(
                     name, "visible_face", "committed", sample_count=1,
@@ -7500,13 +8916,184 @@ def _compact_inference_result(result):
     """Drop the annotated image before putting a result on side-effect queues."""
     return {
         "frame_id": result.get("frame_id"),
+        "source_frame_id": result.get("source_frame_id", result.get("frame_id")),
         "captured_at": result.get("captured_at"),
         "completed_at": result.get("completed_at"),
+        "frame_age_ms": result.get("frame_age_ms"),
         "faces_info": list(result.get("faces_info") or []),
         "events": list(result.get("events") or []),
         "correlation": result.get("correlation") or {},
+        "presence_transitions": list(
+            (result.get("correlation") or {}).get("presence_transitions") or []),
         "evidence_frame": result.get("evidence_frame"),
     }
+
+
+def _sanitize_event_metadata(metadata):
+    """Remove restricted local identifiers before event persistence.
+
+    A future plate OCR adapter may provide raw text to the edge runtime, but
+    normal event records and sync payloads must carry only a hash, confidence,
+    or uncertainty state. This is a second boundary check beyond the outbox.
+    """
+    safe = dict(metadata or {})
+    removed = False
+    for key in ("plate_text_local", "plate_text", "raw_plate", "plate_crop"):
+        if key in safe:
+            safe.pop(key, None)
+            removed = True
+    if removed:
+        safe["plate_data_redacted"] = True
+    return safe
+
+
+def _runtime_incident_category(event_type):
+    """Keep edge incident buckets aligned with the dashboard taxonomy."""
+    text = str(event_type or "").upper()
+    if any(token in text for token in ("ZONE_", "INTRUS", "LOITER", "RUNNING", "PPE_")):
+        return "Security"
+    if any(token in text for token in ("ATTENDANCE", "RECOGNITION", "IDENTITY", "SPOOF", "UNKNOWN")):
+        return "Identity"
+    if any(token in text for token in ("FALL", "HANDS", "CROWD", "CONGESTION", "EVACUATION")):
+        return "Safety"
+    if any(token in text for token in ("OBJECT", "WEAPON", "FIRE", "SMOKE")):
+        return "Object"
+    return "System"
+
+
+def _sync_runtime_incidents(db, event_ids, snapshot_dir):
+    """Materialize correlated security events into incidents on the edge.
+
+    This runs after event persistence and alert dispatch. It is bounded to the
+    current operations task, idempotent through incident_events, and uses the
+    same context keys as the backend incident service so the edge remains
+    useful while the dashboard is offline.
+    """
+    if not event_ids:
+        return 0
+    placeholders = ",".join("?" for _ in event_ids)
+    root = os.path.realpath(snapshot_dir)
+    created_or_updated = 0
+    with db.lock:
+        rows = db.conn.execute(
+            f"""
+            SELECT id, event_type, severity, timestamp, details_json,
+                   entity_id, presence_session_id, camera_id, location,
+                   snapshot_path, evidence_checksum, source_frame_id,
+                   correlation_id
+            FROM events WHERE id IN ({placeholders}) ORDER BY timestamp, id
+            """,
+            tuple(event_ids),
+        ).fetchall()
+        for row in rows:
+            event_id = int(row["id"])
+            if db.conn.execute(
+                "SELECT 1 FROM incident_events WHERE event_id=?", (event_id,)
+            ).fetchone():
+                continue
+            event_type = str(row["event_type"] or "")
+            severity = int(row["severity"] or 0)
+            if not (severity >= 1 or any(token in event_type.upper() for token in ("SPOOF", "UNKNOWN", "DANGER"))):
+                continue
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except (TypeError, ValueError):
+                details = {}
+            security_metadata = details.get("security_metadata") if isinstance(details, dict) else {}
+            zone_id = security_metadata.get("zone_id") if isinstance(security_metadata, dict) else None
+            category = _runtime_incident_category(event_type)
+            incident = db.conn.execute(
+                """
+                SELECT id, severity FROM incidents
+                WHERE category=?
+                  AND organization_id=? AND site_id=?
+                  AND coalesce(correlation_id, '')=coalesce(?, '')
+                  AND coalesce(entity_id, '')=coalesce(?, '')
+                  AND coalesce(camera_id, '')=coalesce(?, '')
+                  AND coalesce(presence_session_id, 0)=coalesce(?, 0)
+                  AND coalesce(zone_id, '')=coalesce(?, '')
+                  AND coalesce(location, '')=coalesce(?, '')
+                  AND status NOT IN ('dismissed', 'resolved')
+                  AND abs(julianday(last_event_at)-julianday(?)) <= (10.0 / 1440.0)
+                ORDER BY last_event_at DESC LIMIT 1
+                """,
+                (category, db.organization_id, db.site_id, row["correlation_id"], row["entity_id"], row["camera_id"],
+                 row["presence_session_id"], zone_id, row["location"], row["timestamp"]),
+            ).fetchone()
+            if incident:
+                incident_id = int(incident["id"])
+                db.conn.execute(
+                    """
+                    UPDATE incidents SET severity=max(severity, ?),
+                        last_event_at=CASE WHEN julianday(last_event_at) > julianday(?)
+                                           THEN last_event_at ELSE ? END,
+                        updated_at=datetime('now') WHERE id=?
+                    """,
+                    (severity, row["timestamp"], row["timestamp"], incident_id),
+                )
+            else:
+                cursor = db.conn.execute(
+                    """
+                    INSERT INTO incidents
+                        (status, category, severity, summary, first_event_at, last_event_at,
+                         entity_id, camera_id, location, zone_id, presence_session_id, correlation_id,
+                         organization_id, site_id, device_id)
+                    VALUES ('open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (category, severity, f"{category} activity requires review",
+                     row["timestamp"], row["timestamp"], row["entity_id"], row["camera_id"],
+                     row["location"], zone_id, row["presence_session_id"], row["correlation_id"],
+                     db.organization_id, db.site_id, db.device_id),
+                )
+                incident_id = int(cursor.lastrowid)
+            db.conn.execute(
+                "INSERT OR IGNORE INTO incident_events (incident_id, event_id, organization_id, site_id, device_id) VALUES (?, ?, ?, ?, ?)",
+                (incident_id, event_id, db.organization_id, db.site_id, db.device_id),
+            )
+            snapshot_path = row["snapshot_path"]
+            if snapshot_path:
+                candidate = os.path.realpath(str(snapshot_path))
+                if candidate == root or candidate.startswith(root + os.sep):
+                    exists = os.path.isfile(candidate)
+                    checksum = row["evidence_checksum"]
+                    status = "missing"
+                    if exists:
+                        with open(candidate, "rb") as evidence_file:
+                            current_checksum = hashlib.sha256(evidence_file.read()).hexdigest()
+                        checksum = checksum or current_checksum
+                        status = "available" if not row["evidence_checksum"] or checksum == current_checksum else "tampered"
+                    db.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO incident_evidence
+                            (incident_id, event_id, path, evidence_type, source_frame_id,
+                             captured_at, checksum, status, organization_id, site_id, device_id)
+                        VALUES (?, ?, ?, 'snapshot', ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (incident_id, event_id, candidate, row["source_frame_id"],
+                         row["timestamp"], checksum, status, db.organization_id, db.site_id, db.device_id),
+                    )
+            db.conn.execute(
+                """
+                INSERT INTO incident_alerts
+                    (incident_id, channel, status, attempted_at, delivered_at, error, source_alert_id,
+                     organization_id, site_id, device_id)
+                SELECT ?, channel, coalesce(status, 'unknown'), timestamp,
+                       CASE WHEN lower(coalesce(status, '')) IN ('sent','delivered','success')
+                            THEN timestamp ELSE NULL END,
+                       error, id, ?, ?, ?
+                FROM alert_log
+                WHERE source_event_id=?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM incident_alerts x
+                      WHERE x.incident_id=? AND x.source_alert_id=alert_log.id
+                  )
+                """,
+                (incident_id, db.organization_id, db.site_id, db.device_id,
+                 event_id, incident_id),
+            )
+            created_or_updated += 1
+        db.conn.commit()
+    return created_or_updated
 
 
 def _process_runtime_side_effects(
@@ -7519,15 +9106,57 @@ def _process_runtime_side_effects(
     cam_location,
     attendance_lock,
     center_mode_getter,
+    outbox=None,
 ):
     """Persist attendance/events and dispatch alerts outside model inference."""
+    operation_metrics = {
+        "sessions_updated": 0,
+        "attendance_decisions": 0,
+        "attendance_eligible": 0,
+        "attendance_rejected": 0,
+        "events_persisted": 0,
+        "uncorrelated_decisions_rejected": 0,
+        "alert_events": 0,
+        "incidents_synced": 0,
+    }
+    incident_event_ids = []
     correlation = task.get("correlation") or {}
+    correlation_authoritative = bool(
+        correlation.get("enabled") is True
+        and str(correlation.get("decision_boundary") or "")
+        == "CORRELATION_CORE"
+    )
+    # The operations worker is a trust boundary. A queued task without an
+    # explicit correlation marker may still be useful for diagnostics, but it
+    # must not create presence, attendance, security, or alert records.
+    if not correlation_authoritative:
+        rejected = len(task.get("events") or []) + len(task.get("faces_info") or [])
+        operation_metrics["uncorrelated_decisions_rejected"] = rejected
     sessions_by_entity = {}
-    entities = correlation.get("entities") or []
+    entities = correlation.get("entities") or [] if correlation_authoritative else []
     entities_by_id = {
         str(entity.get("entity_id")): entity
         for entity in entities if entity.get("entity_id")
     }
+    # EntityStateStore emits explicit lifecycle transitions when a track is
+    # occluded, revalidated, or closed. Close the durable session from the
+    # transition itself instead of waiting for a broad wall-clock sweep.
+    for transition in (
+        task.get("presence_transitions") or correlation.get("presence_transitions") or []
+        if correlation_authoritative else []
+    ):
+        if str(transition.get("type") or "").lower() != "closed":
+            continue
+        entity_id = transition.get("entity_id")
+        if not entity_id:
+            continue
+        try:
+            db.close_presence_session(
+                entity_id,
+                reason=str(transition.get("reason") or "timeout"),
+            )
+        except Exception as exc:
+            print(f"[ERROR] Presence session close failed: {exc}")
     for entity in entities:
         entity_id = entity.get("entity_id")
         if not entity_id:
@@ -7538,7 +9167,26 @@ def _process_runtime_side_effects(
         visible = lifecycle_state in {"NEW", "ACTIVE"}
         identity_state = normalize_identity_state(identity.get("state"))
         confirmed_name = str(identity.get("confirmed_name") or "").strip()
-        label = confirmed_name if identity_state == "CONFIRMED" and confirmed_name else "UNKNOWN"
+        observed_at = (
+            entity.get("last_observed_wallclock")
+            or task.get("completed_at")
+            or _utc_now()
+        )
+        roster_match = entity.get("roster_match")
+        if roster_match is None:
+            # Compatibility for older queued correlation payloads: validate
+            # the missing field against SQLite rather than trusting the
+            # confirmed model label. Explicit false remains a hard denial.
+            roster_match = bool(
+                confirmed_name and db.get_active_person_id(confirmed_name) is not None
+            )
+        else:
+            roster_match = bool(roster_match)
+        label = (
+            confirmed_name
+            if identity_state == "CONFIRMED" and confirmed_name and roster_match
+            else "UNKNOWN"
+        )
         person_id = db.get_active_person_id(confirmed_name) if label != "UNKNOWN" else None
         try:
             session_id = db.upsert_presence_session(
@@ -7551,21 +9199,46 @@ def _process_runtime_side_effects(
                 camera_id=cam_id,
                 confidence=identity.get("best_score") or 0.0,
                 source_frame_id=task.get("frame_id"),
-                observed_at=_utc_now() if visible else None,
+                observed_at=observed_at if visible else None,
                 visible=visible,
                 track_generation=entity.get("track_generation", 1),
             )
             sessions_by_entity[str(entity_id)] = session_id
+            operation_metrics["sessions_updated"] += 1
+            # A stable recognition cache may suppress a new embedding/evidence
+            # sample, but it must not make an already-open attendance row look
+            # stale while the authoritative entity is still visibly present.
+            # This refresh is deliberately narrower than display continuity:
+            # only a currently eligible correlated entity may keep attendance
+            # open.
+            if (
+                visible
+                and person_id is not None
+                and identity_state == "CONFIRMED"
+                and str(liveness.get("state") or "").upper() == "REAL"
+                and bool(entity.get("attendance_eligibility"))
+                and roster_match
+                and bool(identity.get("current_evidence_fresh", False))
+            ):
+                db.touch_attendance_presence(
+                    person_id,
+                    observed_at,
+                    presence_session_id=session_id,
+                )
         except Exception as exc:
             print(f"[ERROR] Presence session update failed: {exc}")
     try:
+        configured_presence_timeout = float(
+            CONFIG.get("ATTENDANCE", {}).get("PRESENCE_SESSION_CLOSE_AFTER_SEC", 10.0))
+        entity_close_timeout = float(
+            CONFIG.get("CORRELATION_CORE", {}).get("ENTITY_CLOSE_AFTER_SEC", 10.0))
         db.close_stale_presence_sessions(
-            CONFIG.get("ATTENDANCE", {}).get("PRESENCE_SESSION_CLOSE_AFTER_SEC", 5.0))
+            max(1.0, configured_presence_timeout, entity_close_timeout))
     except Exception as exc:
         print(f"[ERROR] Presence session cleanup failed: {exc}")
 
     evidence_by_entity = {}
-    for face in task.get("faces_info") or []:
+    for face in (task.get("faces_info") or [] if correlation_authoritative else []):
         if not face.get("evidence_due"):
             continue
         entity_id = face.get("entity_id")
@@ -7579,10 +9252,19 @@ def _process_runtime_side_effects(
             or face.get("identity_state")
             or "UNRESOLVED"
         )
+        # Older queued payloads may not carry the freshness field. Treat an
+        # explicit false as cache-only, but do not silently downgrade legacy
+        # records merely because the field is absent.
+        evidence_fresh = correlated_identity.get("current_evidence_fresh")
+        cached_only = bool(face.get("cached_only")) or evidence_fresh is False
         if identity_state == "CONFIRMED" and correlated_identity.get("confirmed_name"):
             name = str(correlated_identity["confirmed_name"])
         if identity_state == "SPOOF_SUSPECT" or name == "SPOOF" or str(face.get("liveness_status")) in {"SUSPECT", "UNCERTAIN"}:
             decision = "spoof_or_uncertain"
+        elif cached_only:
+            # A cached label is useful for operator continuity, but it is not
+            # a new biometric decision and must not authorize a person_id.
+            decision = "cached_continuity"
         elif identity_state == "CONFIRMED" and name not in {"UNKNOWN", "SPOOF"} and not name.startswith("STRANGER_"):
             decision = "confirmed"
         elif identity_state in {"CONTRADICTED", "OCCLUDED", "EXPIRED"}:
@@ -7592,6 +9274,12 @@ def _process_runtime_side_effects(
         else:
             decision = "unresolved"
         person_id = db.get_active_person_id(name) if decision == "confirmed" else None
+        if decision == "confirmed" and person_id is None:
+            # Recognition and roster authorization are separate facts. Keep
+            # the evidence, but make an inactive/deleted identity explicit so
+            # reports cannot mistake it for an authorized confirmation.
+            decision = "roster_rejected"
+            name = name or "UNKNOWN"
         try:
             evidence_by_entity[str(entity_id)] = db.record_recognition_evidence(
                 entity_id=entity_id,
@@ -7609,12 +9297,17 @@ def _process_runtime_side_effects(
                 source_frame_id=face.get("source_frame_id") or task.get("frame_id"),
                 observed_at=face.get("observed_at") or task.get("completed_at") or _utc_now(),
                 details={
+                    "cached_only": cached_only,
                     "cached_identity_confidence": face.get("cached_identity_confidence"),
                     "liveness_details": face.get("liveness_details", {}),
+                    "roster_match": correlated_entity.get("roster_match"),
+                    "roster_validation": correlated_entity.get("roster_validation"),
                 },
             )
             active_person_id = db.get_active_person_id(name) if identity_state == "CONFIRMED" else None
             attendance_reasons = []
+            if cached_only:
+                attendance_reasons.append("identity_evidence_cached_or_missing")
             if identity_state != "CONFIRMED":
                 attendance_reasons.append(f"identity_{identity_state.lower()}")
             if not bool(correlated_entity.get("attendance_eligibility")):
@@ -7643,12 +9336,43 @@ def _process_runtime_side_effects(
                 recognition_confidence=face.get("current_observation_similarity", face.get("confidence", 0.0)),
                 source_frame_id=decision_frame_id,
                 observed_at=face.get("observed_at") or task.get("completed_at") or _utc_now(),
-                details={"method": "automatic_gate", "gate_reasons": list(dict.fromkeys(attendance_reasons))},
+                details={
+                    "method": "automatic_gate",
+                    "gate_reasons": list(dict.fromkeys(attendance_reasons)),
+                    "roster_match": correlated_entity.get("roster_match"),
+                    "roster_validation": correlated_entity.get("roster_validation"),
+                },
             )
+            operation_metrics["attendance_decisions"] += 1
+            operation_metrics[
+                "attendance_eligible" if attendance_decision == "eligible" else "attendance_rejected"
+            ] += 1
+            if outbox is not None:
+                try:
+                    # Synchronize decision provenance only. Names, embeddings,
+                    # frames, and local plate text remain on the edge.
+                    outbox.enqueue({
+                        "event_id": f"attendance-decision:{decision_key}",
+                        "event_type": "ATTENDANCE_DECISION",
+                        "occurred_at": face.get("observed_at") or task.get("completed_at") or _utc_now(),
+                        "camera_id": cam_id,
+                        "source_frame_id": decision_frame_id,
+                        "entity_id": entity_id,
+                        "presence_session_id": sessions_by_entity.get(str(entity_id)),
+                        "decision": attendance_decision,
+                        "identity_state": identity_state,
+                        "liveness_status": face.get("liveness_status") or correlated_liveness.get("state"),
+                        "quality_score": face.get("quality_score"),
+                        "recognition_confidence": face.get(
+                            "current_observation_similarity", face.get("confidence", 0.0)),
+                        "privacy_class": "minimized_operational",
+                    })
+                except (OutboxSecurityError, OSError) as exc:
+                    print(f"[SYNC] Attendance decision not queued: {exc}")
         except Exception as exc:
             print(f"[ERROR] Recognition evidence failed: {exc}")
 
-    if not center_mode_getter():
+    if not center_mode_getter() and correlation_authoritative:
         for face in task.get("faces_info") or []:
             name = str(face.get("name") or "UNKNOWN")
             eligible = face.get("attendance_eligible", face.get("is_real", True))
@@ -7707,7 +9431,7 @@ def _process_runtime_side_effects(
                 except Exception as exc:
                     print(f"[ERROR] Attendance update failed: {exc}")
 
-    for evt in task.get("events") or []:
+    for evt in (task.get("events") or [] if correlation_authoritative else []):
         try:
             event_type = evt[0]
             target = evt[1] if len(evt) > 1 else "SYSTEM"
@@ -7723,37 +9447,72 @@ def _process_runtime_side_effects(
             snapshot_path = _save_snapshot(
                 snapshot_dir, event_type, target, evidence_frame)
 
-        pid = None
-        if (target not in ("SYSTEM", "UNKNOWN", "PERSON")
-                and not str(target).startswith(("STRANGER_", "ID_", "AREA_", "ZONE_"))):
-            pid = db.get_person_id(target)
-
         event_entity_id = None
         event_session_id = None
+        event_entity_type = str(metadata.get("entity_type") or "person").casefold()
         track_id = metadata.get("track_id")
-        for face in task.get("faces_info") or []:
-            face_name = str(face.get("name") or "")
-            if ((track_id is not None and int(face.get("oid", -1)) == int(track_id))
-                    or target == "PERSON" or target == face_name):
-                event_entity_id = face.get("entity_id")
-                event_session_id = sessions_by_entity.get(str(event_entity_id))
-                break
-        if event_entity_id is None and track_id is not None:
-            for entity in entities:
-                if str(entity.get("track_id")) == str(track_id):
-                    event_entity_id = entity.get("entity_id")
+        # Only person-scoped signals may inherit a person entity. A global
+        # object/system event must stay global even when exactly one person is
+        # visible; otherwise a weapon or fire alert could be misattributed to
+        # that student in the database and dashboard.
+        if event_entity_type == "person":
+            for face in task.get("faces_info") or []:
+                face_name = str(face.get("name") or "")
+                if ((track_id is not None and int(face.get("oid", -1)) == int(track_id))
+                        or target == "PERSON" or target == face_name):
+                    event_entity_id = face.get("entity_id")
                     event_session_id = sessions_by_entity.get(str(event_entity_id))
                     break
-        if event_entity_id is None and len(entities) == 1:
-            event_entity_id = entities[0].get("entity_id")
-            event_session_id = sessions_by_entity.get(str(event_entity_id))
+            if event_entity_id is None and track_id is not None:
+                for entity in entities:
+                    if str(entity.get("track_id")) == str(track_id):
+                        event_entity_id = entity.get("entity_id")
+                        event_session_id = sessions_by_entity.get(str(event_entity_id))
+                        break
+            if event_entity_id is None and target in {"PERSON", "UNKNOWN"} and len(entities) == 1:
+                event_entity_id = entities[0].get("entity_id")
+                event_session_id = sessions_by_entity.get(str(event_entity_id))
+        else:
+            # Non-person entities (currently vehicles and objects) retain
+            # their own stable namespace. They must never inherit a person's
+            # presence session or biometric identity.
+            event_entity_id = metadata.get("entity_id")
+
+        # Person attribution is a privileged decision. Resolve it only from
+        # the canonical entity snapshot, not from a display target or a raw
+        # queued event label. This keeps legacy events reviewable without
+        # allowing them to attach a disabled, stale, or unknown person.
+        pid = None
+        if event_entity_type == "person" and event_entity_id is not None:
+            correlated_entity = entities_by_id.get(str(event_entity_id), {})
+            correlated_identity = correlated_entity.get("identity") or {}
+            canonical_name = str(
+                correlated_identity.get("confirmed_name") or ""
+            ).strip()
+            canonical_state = normalize_identity_state(
+                correlated_identity.get("state")
+            )
+            roster_match = correlated_entity.get("roster_match")
+            if roster_match is None:
+                roster_match = bool(
+                    canonical_name
+                    and db.get_active_person_id(canonical_name) is not None
+                )
+            target_matches = bool(
+                canonical_name
+                and str(target).casefold() == canonical_name.casefold()
+            )
+            if (canonical_state == "CONFIRMED" and bool(roster_match)
+                    and target_matches):
+                pid = db.get_active_person_id(canonical_name)
 
         event_id = None
         try:
+            safe_metadata = _sanitize_event_metadata(metadata)
             event_details = {
                 "message": str(details),
-                "security_metadata": metadata,
-            } if metadata else details
+                "security_metadata": safe_metadata,
+            } if safe_metadata else details
             event_id = db.log_event(
                 event_type=event_type,
                 person_id=pid,
@@ -7764,20 +9523,48 @@ def _process_runtime_side_effects(
                 location=cam_location,
                 # Zone policy may raise severity above the generic event
                 # default. Preserve that policy value in the durable record.
-                severity=max(
-                    _SEVERITY_MAP.get(event_type, 0),
-                    int(metadata.get("severity", 0) or 0),
-                ),
+                severity=_event_policy_severity(event_type, metadata),
                 entity_id=event_entity_id,
                 presence_session_id=event_session_id,
                 source_frame_id=metadata.get("source_frame_id") or task.get("frame_id"),
                 observation_type=event_type,
                 evidence_path=snapshot_path,
+                correlation_id=metadata.get("correlation_id"),
+                event_uid=metadata.get("event_id"),
+                occurred_at=metadata.get("occurred_at") or task.get("completed_at"),
             )
+            operation_metrics["events_persisted"] += 1
+            if event_id is not None:
+                incident_event_ids.append(int(event_id))
         except Exception as exc:
             print(f"[ERROR] log_event failed: {exc}")
 
+        if outbox is not None:
+            try:
+                # Synchronization receives minimized operational metadata;
+                # raw frames, embeddings, local plate text, and passwords are
+                # rejected by EdgeEventOutbox itself.
+                outbox.enqueue({
+                    "event_id": metadata.get("event_id") or f"db-event:{event_id}",
+                    "event_type": event_type,
+                    "occurred_at": task.get("completed_at") or _utc_now(),
+                    "camera_id": cam_id,
+                    "source_frame_id": metadata.get("source_frame_id") or task.get("frame_id"),
+                    "entity_id": event_entity_id,
+                    "presence_session_id": event_session_id,
+                    "correlation_id": metadata.get("correlation_id"),
+                    "confidence": confidence,
+                    "severity": _event_policy_severity(event_type, metadata),
+                    "privacy_class": "minimized_operational",
+                    "evidence_available": bool(snapshot_path),
+                })
+            except OutboxSecurityError as exc:
+                print(f"[SYNC] Event refused by local outbox policy: {exc}")
+            except OSError as exc:
+                print(f"[SYNC] Event outbox unavailable: {exc}")
+
         if event_type in _SEVERE_EVENT_TYPES:
+            operation_metrics["alert_events"] += 1
             try:
                 alert_mgr.check_and_alert(
                     event_type=event_type,
@@ -7812,6 +9599,14 @@ def _process_runtime_side_effects(
         elif event_type == "CONGESTION":
             voice(f"Notice. Crowd congestion at {target}.",
                   "WARN", dedup_key=f"cong:{target}")
+    try:
+        operation_metrics["incidents_synced"] = _sync_runtime_incidents(
+            db, incident_event_ids, snapshot_dir
+        )
+    except Exception as exc:
+        # Incident materialization must not stop attendance or the camera loop.
+        print(f"[ERROR] Incident correlation failed: {exc}")
+    return operation_metrics
 
 
 class CameraCaptureWorker(threading.Thread):
@@ -7929,7 +9724,7 @@ class InferenceWorker(threading.Thread):
                     packet["frame_id"], packet["age_ms"],
                     skipped=packet.get("frames_skipped", 0))
                 if packet["age_ms"] > self.max_age_ms:
-                    self.profiler.record_stale_drop()
+                    self.profiler.record_stale_drop(packet["age_ms"])
                     continue
                 started = time.perf_counter()
                 try:
@@ -7996,7 +9791,7 @@ class InferenceWorker(threading.Thread):
 class OperationalWorker(threading.Thread):
     def __init__(self, db, attendance, alert_mgr, snapshot_dir, cam_id,
                  cam_location, attendance_lock, center_mode_getter, profiler,
-                 regular_size=256, critical_size=64):
+                 regular_size=256, critical_size=64, outbox=None):
         super().__init__(name="optivox-operations", daemon=True)
         self.db = db
         self.attendance = attendance
@@ -8007,10 +9802,21 @@ class OperationalWorker(threading.Thread):
         self.attendance_lock = attendance_lock
         self.center_mode_getter = center_mode_getter
         self.profiler = profiler
+        self.outbox = outbox
         self.regular_queue = queue.Queue(maxsize=max(8, int(regular_size)))
         self.critical_queue = queue.Queue(maxsize=max(4, int(critical_size)))
         self.stop_event = threading.Event()
         self.last_error = None
+        self._metrics_lock = threading.RLock()
+        self._metrics = {
+            "tasks_processed": 0,
+            "sessions_updated": 0,
+            "attendance_decisions": 0,
+            "attendance_eligible": 0,
+            "attendance_rejected": 0,
+            "events_persisted": 0,
+            "alert_events": 0,
+        }
 
     def _is_critical(self, task):
         return any(
@@ -8044,6 +9850,10 @@ class OperationalWorker(threading.Thread):
             "critical_side_effects": self.critical_queue.qsize(),
         }
 
+    def metrics_snapshot(self):
+        with self._metrics_lock:
+            return dict(self._metrics)
+
     def run(self):
         last_maintenance = 0.0
         while not self.stop_event.is_set() or not self.critical_queue.empty() or not self.regular_queue.empty():
@@ -8064,11 +9874,16 @@ class OperationalWorker(threading.Thread):
                 except queue.Empty:
                     continue
             try:
-                _process_runtime_side_effects(
+                operation_metrics = _process_runtime_side_effects(
                     task, self.db, self.attendance, self.alert_mgr,
                     self.snapshot_dir, self.cam_id, self.cam_location,
                     self.attendance_lock, self.center_mode_getter,
+                    self.outbox,
                 )
+                with self._metrics_lock:
+                    self._metrics["tasks_processed"] += 1
+                    for key, value in (operation_metrics or {}).items():
+                        self._metrics[key] = self._metrics.get(key, 0) + int(value or 0)
                 self.last_error = None
             except Exception as exc:
                 self.last_error = str(exc)
@@ -8081,12 +9896,52 @@ class OperationalWorker(threading.Thread):
         self.stop_event.set()
 
 
+class EdgeSyncWorker(threading.Thread):
+    """Optional, isolated sender for minimized edge events.
+
+    Synchronization never runs in the camera, inference, rendering, or
+    attendance worker. A slow or unavailable control plane therefore cannot
+    freeze local safety and attendance processing.
+    """
+
+    def __init__(self, client, interval_seconds: float = 1.0):
+        super().__init__(name="optivox-edge-sync", daemon=True)
+        self.client = client
+        self.interval_seconds = max(0.5, min(float(interval_seconds), 60.0))
+        self.stop_event = threading.Event()
+        self._metrics_lock = threading.RLock()
+        self._metrics = {"attempts": 0, "sent": 0, "failures": 0, "blocked": 0}
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                result = self.client.sync_once()
+                with self._metrics_lock:
+                    self._metrics["attempts"] += 1
+                    self._metrics["sent"] += int(result.get("sent", 0) or 0)
+                    if result.get("status") in {"FAILED", "REJECTED"}:
+                        self._metrics["failures"] += 1
+                    if result.get("status") == "BLOCKED":
+                        self._metrics["blocked"] += 1
+            except Exception:
+                with self._metrics_lock:
+                    self._metrics["failures"] += 1
+            self.stop_event.wait(self.interval_seconds)
+
+    def snapshot(self):
+        with self._metrics_lock:
+            return dict(self._metrics)
+
+    def stop(self):
+        self.stop_event.set()
+
+
 class RuntimeWorker(threading.Thread):
     def __init__(self, runtime_dir, vision, db, attendance, alert_mgr,
                  frame_buffer, inference_state, profiler, operations,
                  vision_lock, stop_event, started_epoch, started_at,
                  cam_id, cam_location, snapshot_dir, capture_worker,
-                 inference_worker):
+                 inference_worker, ui=None):
         super().__init__(name="optivox-runtime", daemon=True)
         self.runtime_dir = runtime_dir
         self.vision = vision
@@ -8106,6 +9961,7 @@ class RuntimeWorker(threading.Thread):
         self.snapshot_dir = snapshot_dir
         self.capture_worker = capture_worker
         self.inference_worker = inference_worker
+        self.ui = ui
         self.last_error = None
         self._last_state = 0.0
         self._last_frame = 0.0
@@ -8134,6 +9990,7 @@ class RuntimeWorker(threading.Thread):
                 current_source_frame_id=packet.get("frame_id") if packet else None,
                 current_inference_frame_id=result.get("frame_id") if result else None,
             )
+            performance["operations"] = self.operations.metrics_snapshot()
             with self.vision_lock:
                 performance["vision"] = self.vision.performance_snapshot()
             fps = performance.get("inference_fps", 0.0)
@@ -8158,6 +10015,8 @@ class RuntimeWorker(threading.Thread):
                             self.started_epoch, self.started_at, events,
                             worker_error, source_result=result,
                             performance=performance,
+                            camera_status=str(camera_health.get("state", "UNKNOWN")).lower(),
+                            center_attendance=(self.ui or {}).get("center_attendance", {}),
                         )
                     self._last_state = now
                 if display_for_output is not None and now - self._last_frame >= 0.16:
@@ -8188,6 +10047,23 @@ def main():
     started_at_epoch = time.time()
     started_at = _runtime_now()
     runtime_mode = os.environ.get("OPTIVOX_RUNTIME_MODE", "development").strip().lower()
+    try:
+        validate_runtime_configuration()
+    except RuntimeError as exc:
+        print(f"[CONFIG] {exc}")
+        _publish_runtime_heartbeat(
+            runtime_dir, "offline", "configuration_error", 0.0,
+            started_at, "Unsafe runtime configuration.",
+        )
+        try:
+            append_runtime_health_event(runtime_dir, {
+                "type": "CONFIGURATION_REJECTED",
+                "process": process_identity(),
+                "runtime_mode": runtime_mode,
+            })
+        except Exception:
+            pass
+        return
     edge_validation = validate_edge_configuration(
         CONFIG, _BASE_DIR, runtime_mode, manifest_path=CONFIG["MODEL_MANIFEST_PATH"])
     if edge_validation.get("issues"):
@@ -8295,6 +10171,51 @@ def main():
     snapshot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "snapshots")
     os.makedirs(snapshot_dir, exist_ok=True)
+    sync_outbox = EdgeEventOutbox(
+        os.path.join(runtime_dir, "sync_outbox.ndjson"),
+        device_id=RUNTIME_ID,
+        signing_secret=os.environ.get("OPTIVOX_SYNC_SECRET"),
+        site_id=os.environ.get("OPTIVOX_SITE_ID", "local-site"),
+        organization_id=os.environ.get("OPTIVOX_ORGANIZATION_ID", "local-organization"),
+    )
+    vision.sync_outbox = sync_outbox
+    _publish_runtime_capabilities(runtime_dir, started_at, vision)
+    print(f"[SYNC] Edge outbox ready ({sync_outbox.security_mode}).")
+    sync_worker = None
+    if os.environ.get("OPTIVOX_SYNC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        sync_endpoint = os.environ.get("OPTIVOX_SYNC_ENDPOINT", "").strip()
+        sync_hosts = [item.strip() for item in os.environ.get("OPTIVOX_SYNC_ALLOWED_HOSTS", "").split(",") if item.strip()]
+        try:
+            runtime_mode = os.environ.get("OPTIVOX_RUNTIME_MODE", "development")
+            validate_control_plane_url(sync_endpoint, runtime_mode, sync_hosts)
+            private_key = None
+            sync_key_id = os.environ.get("OPTIVOX_SYNC_KEY_ID", "").strip()
+            private_key_path = os.environ.get("OPTIVOX_SYNC_PRIVATE_KEY_PATH", "").strip()
+            if private_key_path:
+                key_path = safe_local_path(
+                    private_key_path,
+                    os.path.dirname(os.path.abspath(__file__)),
+                    must_exist=True,
+                )
+                if key_path.stat().st_size > 16 * 1024:
+                    raise DeploymentSecurityError("synchronization private key file is too large")
+                private_key = load_ed25519_private_key(key_path.read_bytes())
+            sync_client = EdgeSyncClient(
+                sync_outbox,
+                sync_endpoint,
+                os.environ.get("OPTIVOX_SYNC_SECRET"),
+                batch_size=int(os.environ.get("OPTIVOX_SYNC_BATCH_SIZE", "50")),
+                timeout_seconds=float(os.environ.get("OPTIVOX_SYNC_TIMEOUT_SECONDS", "10")),
+                transport=urllib_transport,
+                private_key=private_key,
+                key_id=sync_key_id,
+                signature_algorithm="ed25519" if private_key is not None else "hmac-sha256",
+            )
+            sync_worker = EdgeSyncWorker(sync_client)
+            sync_worker.start()
+            print("[SYNC] Authenticated edge synchronization worker started.")
+        except Exception as exc:
+            print(f"[SYNC] Synchronization disabled: {exc}")
     _set_enrollment_status(runtime_dir, "idle", "No enrollment in progress.")
 
     print()
@@ -8344,6 +10265,7 @@ def main():
             "liveness_passed": False,
             "liveness_first_turn": None,
             "liveness_yaw": None,
+            "entity_key": None,
             "last_gate_key": None,
         },
         "show_details": True,
@@ -8405,6 +10327,9 @@ def main():
             "liveness_passed": False,
             "liveness_first_turn": None,
             "liveness_yaw": None,
+            "entity_key": None,
+            "liveness_challenge_id": None,
+            "liveness_persisted_signature": None,
         })
         ui["message"] = ("Center Attendance ON: one person, centered, hold still."
                           if state["enabled"] else "Center Attendance OFF.")
@@ -8414,6 +10339,19 @@ def main():
         state = ui["center_attendance"]
         if not state.get("enabled"):
             return
+
+        def abandon_liveness_challenge(reason: str) -> None:
+            challenge_id = state.get("liveness_challenge_id")
+            if challenge_id:
+                db.update_liveness_challenge(
+                    challenge_id,
+                    phase=state.get("liveness_phase", "CENTER"),
+                    liveness_status=state.get("liveness_status", "UNCERTAIN"),
+                    challenge_state="FAILED", updated_at=_utc_now(),
+                    completed_at=_utc_now(), failure_reason=reason,
+                    metrics=state.get("liveness_metrics") or {},
+                )
+            liveness_challenge.reset_all()
 
         now = time.time()
         cfg = CONFIG["ATTENDANCE"]
@@ -8439,7 +10377,8 @@ def main():
         # Focus mode is deliberately singular: do not guess if another face
         # is visible, even if one of the faces is known.
         if total_faces != 1 or len(valid) != 1:
-            liveness_challenge.reset_all()
+            abandon_liveness_challenge(
+                "multiple_faces" if total_faces > 1 else "no_single_valid_face")
             state.update({
                 "phase": "BLOCKED" if total_faces > 1 else "WAITING",
                 "status": ("Only one person may be visible."
@@ -8458,6 +10397,8 @@ def main():
                 "liveness_passed": False,
                 "liveness_first_turn": None,
                 "liveness_yaw": None,
+                "liveness_challenge_id": None,
+                "liveness_persisted_signature": None,
                 "last_gate_key": None,
             })
             ui["message"] = state["status"]
@@ -8473,7 +10414,7 @@ def main():
             state["completed_name"] = None
 
         if state.get("candidate") != name:
-            liveness_challenge.reset_all()
+            abandon_liveness_challenge("candidate_changed")
             state.update({
                 "candidate": name,
                 "stable_frames": 1,
@@ -8488,12 +10429,55 @@ def main():
                 "liveness_passed": not cfg.get("CENTER_MODE_REQUIRE_LIVENESS", True),
                 "liveness_first_turn": None,
                 "last_gate_key": None,
+                "liveness_challenge_id": None,
+                "liveness_persisted_signature": None,
             })
         else:
             state["stable_frames"] += 1
 
         require_liveness = bool(cfg.get("CENTER_MODE_REQUIRE_LIVENESS", True))
+        entity_id = face.get("entity_id")
+        track_id = face.get("oid")
+        entity_state = vision.correlation.entities.get(int(track_id or -1))
+        track_generation = entity_state.track_generation if entity_state else 1
+        entity_key = f"{entity_id or f'track:{track_id}'}:generation-{track_generation}"
+        if state.get("entity_key") != entity_key:
+            # A tracker ID can be reused, and the same name may be visible on
+            # both sides of that reuse. Never carry a completed or in-flight
+            # liveness challenge across entity generations.
+            if state.get("entity_key") is not None:
+                abandon_liveness_challenge("entity_generation_changed")
+            state.update({
+                "entity_key": entity_key,
+                "candidate": name,
+                "stable_frames": 1,
+                "started_at": now,
+                "liveness_phase": "CENTER",
+                "liveness_status": "NOT_EVALUATED",
+                "liveness_attempts": 0,
+                "liveness_timeout_count": 0,
+                "liveness_failure_count": 0,
+                "liveness_started_at": now,
+                "liveness_hold_started_at": None,
+                "liveness_passed": not cfg.get("CENTER_MODE_REQUIRE_LIVENESS", True),
+                "liveness_first_turn": None,
+                "liveness_yaw": None,
+                "liveness_challenge_id": None,
+                "liveness_persisted_signature": None,
+                "last_gate_key": None,
+                "completed_name": None,
+            })
         challenge_key = face.get("entity_id") or f"track:{face.get('oid')}"
+        challenge_id = state.get("liveness_challenge_id")
+        if entity_id and challenge_id is None:
+            challenge_id = db.start_liveness_challenge(
+                entity_id=entity_id,
+                track_id=face.get("oid"),
+                track_generation=track_generation,
+                started_at=face.get("observed_at") or _utc_now(),
+                source_frame_id=face.get("source_frame_id"),
+            )
+            state["liveness_challenge_id"] = challenge_id
         challenge = liveness_challenge.update(
             challenge_key, face.get("yaw"), now, enabled=require_liveness)
         state.update({
@@ -8509,6 +10493,32 @@ def main():
             "liveness_yaw": challenge.get("yaw"),
             "liveness_metrics": liveness_challenge.metrics_snapshot(),
         })
+        if challenge_id:
+            if challenge.get("timed_out"):
+                db.update_liveness_challenge(
+                    challenge_id, phase=challenge.get("phase", "CENTER"),
+                    liveness_status=challenge.get("status", "UNCERTAIN"),
+                    challenge_state="TIMED_OUT", updated_at=_utc_now(),
+                    completed_at=_utc_now(), source_frame_id=face.get("source_frame_id"),
+                    failure_reason=challenge.get("message"),
+                    metrics=challenge,
+                )
+                state["liveness_challenge_id"] = None
+                state["liveness_persisted_signature"] = None
+            else:
+                challenge_state = "PASSED" if challenge.get("passed") else "IN_PROGRESS"
+                signature = (challenge.get("phase"), challenge.get("status"), challenge_state)
+                if state.get("liveness_persisted_signature") != signature or challenge.get("passed"):
+                    db.update_liveness_challenge(
+                        challenge_id, phase=challenge.get("phase", "CENTER"),
+                        liveness_status=challenge.get("status", "UNCERTAIN"),
+                        challenge_state=challenge_state, updated_at=_utc_now(),
+                        completed_at=_utc_now() if challenge.get("passed") else None,
+                        source_frame_id=face.get("source_frame_id"),
+                        failure_reason=challenge.get("message") if challenge_state != "PASSED" else None,
+                        metrics=challenge,
+                    )
+                    state["liveness_persisted_signature"] = signature
         if require_liveness and not challenge.get("passed"):
             state["status"] = challenge.get("message", "Complete the liveness challenge.")
             state["progress"] = min(0.9, float(challenge.get("progress", 0.0)))
@@ -8536,15 +10546,34 @@ def main():
         )
         session_id = None
         evidence_id = None
-        entity_id = face.get("entity_id")
-        track_id = face.get("oid")
-        entity_state = vision.correlation.entities.get(int(track_id or -1))
-        track_generation = entity_state.track_generation if entity_state else 1
         observed_at = face.get("observed_at") or _utc_now()
         gate_eligible = bool(correlation_gate.get("eligible"))
         gate_reason = str(correlation_gate.get("reason") or (
             "eligible" if gate_eligible else "not_eligible"))
         gate_key = f"center:{entity_id or f'track:{track_id}'}:{'eligible' if gate_eligible else gate_reason}"
+
+        def queue_center_decision(decision_key, decision, reason, evidence_ref):
+            if sync_outbox is None:
+                return
+            try:
+                sync_outbox.enqueue({
+                    "event_id": f"attendance-decision:{decision_key}",
+                    "event_type": "ATTENDANCE_DECISION",
+                    "occurred_at": observed_at,
+                    "camera_id": cam_id,
+                    "source_frame_id": face.get("source_frame_id"),
+                    "entity_id": entity_id,
+                    "presence_session_id": evidence_ref or state.get("presence_session_id"),
+                    "decision": decision,
+                    "reason": reason,
+                    "identity_state": correlation_gate.get("identity_state"),
+                    "liveness_status": correlation_gate.get("liveness_state"),
+                    "quality_score": face.get("quality_score"),
+                    "recognition_confidence": face.get("current_observation_similarity", confidence),
+                    "privacy_class": "minimized_operational",
+                })
+            except (OutboxSecurityError, OSError) as exc:
+                print(f"[SYNC] Center attendance decision not queued: {exc}")
 
         # Center mode has its own focused path, so persist the same evidence
         # chain as normal automatic attendance without writing one row per
@@ -8566,6 +10595,17 @@ def main():
                 observed_at=observed_at,
                 track_generation=track_generation,
             )
+            state["presence_session_id"] = session_id
+            if state.get("liveness_challenge_id"):
+                db.update_liveness_challenge(
+                    state["liveness_challenge_id"],
+                    phase=state.get("liveness_phase", "CENTER"),
+                    liveness_status=state.get("liveness_status", "UNCERTAIN"),
+                    challenge_state="PASSED" if state.get("liveness_passed") else "IN_PROGRESS",
+                    updated_at=_utc_now(), source_frame_id=face.get("source_frame_id"),
+                    presence_session_id=session_id,
+                    metrics=state.get("liveness_metrics") or {},
+                )
             evidence_decision = (
                 "confirmed" if gate_eligible else
                 "spoof_or_uncertain" if str(correlation_gate.get("liveness_state") or "").upper() != "REAL"
@@ -8609,6 +10649,9 @@ def main():
                     "gate": correlation_gate,
                 },
             )
+            queue_center_decision(
+                gate_key, "eligible" if gate_eligible else "rejected",
+                gate_reason, session_id)
             state["last_gate_key"] = gate_key
 
         if not gate_eligible:
@@ -8648,6 +10691,9 @@ def main():
                     observed_at=observed_at,
                     details={"method": "center_attendance", "policy_result": result},
                 )
+                queue_center_decision(
+                    f"{gate_key}:policy", "rejected",
+                    f"attendance_policy:{result['error']}", session_id)
             state.update({"phase": "BLOCKED", "status": result["error"], "progress": 0.0})
             return
         state.update({
@@ -8785,6 +10831,7 @@ def main():
         profiler,
         regular_size=performance_cfg.get("SIDE_EFFECT_QUEUE_SIZE", 256),
         critical_size=performance_cfg.get("CRITICAL_QUEUE_SIZE", 64),
+        outbox=sync_outbox,
     )
     inference_worker = InferenceWorker(
         vision, frame_buffer, inference_state, profiler, operations,
@@ -8801,7 +10848,7 @@ def main():
         frame_buffer, inference_state, profiler, operations,
         vision_lock, stop_event, started_at_epoch, started_at,
         cam_id, cam_location, snapshot_dir, capture_worker,
-        inference_worker,
+        inference_worker, ui,
     )
     operations.start()
     capture_worker.start()
@@ -9175,9 +11222,14 @@ def main():
         print("[INFO] Shutting down...")
         try:
             stop_event.set()
+            if sync_worker is not None:
+                sync_worker.stop()
             operations.stop()
             frame_buffer.close()
-            for worker in (capture_worker, inference_worker, runtime_worker, operations):
+            workers = [capture_worker, inference_worker, runtime_worker, operations]
+            if sync_worker is not None:
+                workers.append(sync_worker)
+            for worker in workers:
                 worker.join(timeout=5.0)
             print("[PERF] Workers stopped cleanly.")
         except Exception as exc:

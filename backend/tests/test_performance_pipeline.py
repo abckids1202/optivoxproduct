@@ -59,7 +59,7 @@ def test_profiler_reports_latency_percentiles_and_counters():
                               frame_age_start_ms=10.0,
                               frame_age_end_ms=14.0)
     profiler.record_display(frame_id=7, frame_age_ms=31.0)
-    profiler.record_stale_drop()
+    profiler.record_stale_drop(410.0)
     profiler.record_queue_drop(critical=True)
 
     snapshot = profiler.snapshot(
@@ -72,6 +72,8 @@ def test_profiler_reports_latency_percentiles_and_counters():
     assert snapshot["latency_ms"]["frame_age_start_avg"] == 10.0
     assert snapshot["latency_ms"]["inference_min"] == 20.0
     assert snapshot["latency_ms"]["end_to_end_p95"] == 31.0
+    assert snapshot["latency_ms"]["frame_age_consumed_p95"] == 10.0
+    assert snapshot["latency_ms"]["stale_frame_age_p95"] == 410.0
     assert snapshot["counters"]["stale_frames_dropped"] == 1
     assert snapshot["counters"]["frames_consumed"] == 1
     assert snapshot["counters"]["frame_ids_skipped"] == 2

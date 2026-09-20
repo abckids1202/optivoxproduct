@@ -47,6 +47,38 @@ def test_cookie_login_rotates_sessions_and_returns_no_token(auth_db):
     assert client.get("/api/auth/me").status_code == 200
 
 
+def test_login_state_and_audit_commit_atomically(auth_db, monkeypatch):
+    add_user("operator", "operator")
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(auth_service, "record_action_in_connection", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        auth_service.login("operator", "correct horse")
+    assert database.fetch_one("select count(*) as count from platform_sessions")["count"] == 0
+    user = database.fetch_one(
+        "select failed_login_count, last_login_at from platform_users where username='operator'"
+    )
+    assert user["failed_login_count"] == 0
+    assert user["last_login_at"] is None
+
+
+def test_failed_login_counter_and_audit_commit_atomically(auth_db, monkeypatch):
+    add_user("operator", "operator")
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(auth_service, "record_action_in_connection", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        auth_service.login("operator", "wrong password")
+    user = database.fetch_one(
+        "select failed_login_count from platform_users where username='operator'"
+    )
+    assert user["failed_login_count"] == 0
+
+
 def test_cookie_authenticated_writes_require_csrf(auth_db):
     add_user("reviewer", "security-reviewer")
     client = login_client("reviewer")
@@ -108,6 +140,13 @@ def test_sensitive_routes_have_permission_dependencies():
         ("POST", "/api/events/{event_id}/review"),
         ("POST", "/api/incidents/{incident_id}/review"),
         ("GET", "/api/system/performance"),
+        ("GET", "/api/system/policy"),
+        ("POST", "/api/system/database/maintenance"),
+        ("POST", "/api/system/database/retention"),
+        ("POST", "/api/system/backups/retention"),
+        ("POST", "/api/system/backups/recovery-drill"),
+        ("GET", "/api/sync/status"),
+        ("POST", "/api/sync/devices/{device_id}/status"),
     }
     found = {(method, route.path): route for route in app.routes for method in getattr(route, "methods", set())}
     for key in expected:

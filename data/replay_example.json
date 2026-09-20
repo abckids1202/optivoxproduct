@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "camera_id": "cam_0",
+  "active_roster": ["Ada"],
+  "policy": {
+    "identity_confirmation_observations": 3,
+    "identity_confirmation_window": 5,
+    "presence_close_after_sec": 2
+  },
+  "config": {
+    "SECURITY": {
+      "ENABLED": true,
+      "ZONES": [
+        {
+          "id": "restricted-lab",
+          "name": "Restricted Lab",
+          "bounds": [0, 0, 100, 100],
+          "restricted": true,
+          "allowed_names": ["Ada"],
+          "loitering_seconds": 5
+        }
+      ]
+    }
+  },
+  "frames": [
+    {
+      "frame_id": 1,
+      "time": 0.0,
+      "tracks": [{"id": 1, "center": [160, 160]}],
+      "faces": [{"oid": 1, "name": "Ada", "identity_state": "CANDIDATE", "confidence": 0.92, "quality_ok": true, "quality_score": 92, "liveness_status": "REAL"}]
+    },
+    {
+      "frame_id": 2,
+      "time": 0.1,
+      "tracks": [{"id": 1, "center": [160, 160]}],
+      "faces": [{"oid": 1, "name": "Ada", "identity_state": "CANDIDATE", "confidence": 0.93, "quality_ok": true, "quality_score": 93, "liveness_status": "REAL"}]
+    },
+    {
+      "frame_id": 3,
+      "time": 0.2,
+      "tracks": [{"id": 1, "center": [50, 50]}],
+      "faces": [{"oid": 1, "name": "Ada", "identity_state": "CANDIDATE", "confidence": 0.94, "quality_ok": true, "quality_score": 94, "liveness_status": "REAL"}]
+    },
+    {
+      "frame_id": 4,
+      "time": 0.3,
+      "tracks": [{"id": 1, "center": [50, 50]}],
+      "faces": [{"oid": 1, "name": "UNKNOWN", "identity_state": "UNRESOLVED", "confidence": 0.1, "quality_ok": true, "quality_score": 88, "liveness_status": "REAL"}]
+    }
+  ]
+}

@@ -55,6 +55,37 @@ def test_cached_identity_is_displayable_but_cannot_authorize_attendance():
     assert correlated["security_event_tuples"][0][1] == "UNKNOWN"
 
 
+def test_explicit_cached_only_flag_blocks_attendance_even_with_a_new_reason():
+    now = time.monotonic()
+    core = CorrelationCore(identity_confirmation_observations=1)
+    core.update(tracked={1: (40, 40)}, faces_info=[_face()], observed_at_monotonic=now)
+
+    state = core.update(
+        tracked={1: (40, 40)},
+        faces_info=[_face(reason="diagnostic_continuity") | {"cached_only": True}],
+        observed_at_monotonic=now + 0.1,
+    )
+    entity = state["entities"][0]
+    assert entity["identity"]["current_evidence_fresh"] is False
+    assert core.attendance_decision(1, expected_name="Ada")["eligible"] is False
+
+
+def test_cached_only_evidence_flag_is_preserved_as_non_authoritative_metadata():
+    now = time.monotonic()
+    core = CorrelationCore(identity_confirmation_observations=1)
+    result = core.update(
+        tracked={1: (40, 40)},
+        faces_info=[_face(reason="diagnostic_continuity") | {"cached_only": True}],
+        observed_at_monotonic=now,
+    )
+    identity_event = core.entities.history.latest(
+        1, ObservationType.FACE_IDENTITY_RESULT, now
+    )
+    assert identity_event is not None
+    assert identity_event.metadata["cached_only"] is True
+    assert result["entities"][0]["attendance_eligibility"] is False
+
+
 def test_unknown_and_poor_quality_faces_remain_ineligible_without_danger_label():
     now = time.monotonic()
     core = CorrelationCore(identity_confirmation_observations=1)
@@ -157,6 +188,9 @@ def test_liveness_challenge_enforces_direction_and_records_outcomes():
     assert metrics["true_rejects"] == 1
     assert metrics["false_accepts"] == 1
     assert metrics["false_rejects"] == 1
+    assert metrics["false_accept_rate"] == 0.5
+    assert metrics["false_reject_rate"] == 0.5
+    assert metrics["scenarios"]["phone_screen"]["false_accept_rate"] == 1.0
 
 
 def test_liveness_timeout_is_counted_and_entity_states_are_isolated():

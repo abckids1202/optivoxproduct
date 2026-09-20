@@ -6,7 +6,7 @@ import hashlib
 from datetime import datetime, timedelta
 import numpy as np
 from biometric_storage import decode_embedding_blob, encode_embedding_blob
-from schema_migrations import append_audit_record, ensure_schema_migrations, verify_audit_chain
+from schema_migrations import append_audit_record, create_audit_checkpoint, ensure_schema_migrations, verify_audit_chain
 
 
 def _utc_now() -> str:
@@ -17,12 +17,10 @@ class EventDatabase:
     def __init__(self, db_path: str = "security.db"):
         self.db_path = db_path
         self.lock = threading.RLock()
-        self.conn = sqlite3.connect(
-            self.db_path,
-            check_same_thread=False,
-            timeout=30,
-        )
-        self.conn.row_factory = sqlite3.Row
+        # Keep the legacy adapter aligned with the canonical connection
+        # boundary, including optional SQLCipher fail-closed behavior.
+        from backend.database import connect_database
+        self.conn = connect_database(self.db_path, timeout=30)
         self._configure()
 
         self.retention_policies = {
@@ -34,9 +32,23 @@ class EventDatabase:
         }
 
     def _configure(self):
+        runtime_mode = os.getenv("OPTIVOX_RUNTIME_MODE", "development").strip().lower()
+        synchronous = os.getenv(
+            "OPTIVOX_SQLITE_SYNCHRONOUS",
+            "FULL" if runtime_mode in {"pilot", "production"} else "NORMAL",
+        ).strip().upper()
+        if synchronous not in {"FULL", "NORMAL", "OFF"}:
+            synchronous = "FULL" if runtime_mode in {"pilot", "production"} else "NORMAL"
+        secure_delete = os.getenv(
+            "OPTIVOX_SQLITE_SECURE_DELETE",
+            "ON" if runtime_mode in {"pilot", "production"} else "OFF",
+        ).strip().upper()
+        if secure_delete not in {"ON", "OFF", "FAST"}:
+            secure_delete = "ON" if runtime_mode in {"pilot", "production"} else "OFF"
         pragmas = [
             "PRAGMA journal_mode=WAL;",
-            "PRAGMA synchronous=NORMAL;",
+            f"PRAGMA synchronous={synchronous};",
+            f"PRAGMA secure_delete={secure_delete};",
             "PRAGMA foreign_keys=ON;",
             "PRAGMA temp_store=MEMORY;",
             "PRAGMA cache_size=-32000;",
@@ -216,6 +228,11 @@ class EventDatabase:
                 cur.execute(idx_sql)
 
             self.conn.commit()
+            # The root adapter remains for compatibility with older modules,
+            # but it must leave the same versioned platform contract as the
+            # canonical FastAPI and edge adapters.
+            from backend.platform_schema import ensure_platform_schema
+            ensure_platform_schema(self.db_path)
 
     def enroll_person(self, name: str, embedding: np.ndarray,
                       thumbnail_path: str = None) -> int:
@@ -263,6 +280,7 @@ class EventDatabase:
                     "timestamp": _utc_now(),
                 },
             )
+            create_audit_checkpoint(self.conn, "audit_log")
             self.conn.commit()
 
     def get_audit_log(self, action: str = None, limit: int = 100):

@@ -169,9 +169,27 @@ class ObservationHistory:
             if not bucket:
                 self._buckets.pop(key, None)
                 self._last_touched.pop(key, None)
-        while len(self._last_touched) > self.max_entities:
-            oldest, _ = self._last_touched.popitem(last=False)
-            self._buckets.pop(oldest, None)
+        # ``max_entities`` limits tracked entity IDs, not the number of
+        # observation-type buckets. Each entity legitimately owns several
+        # buckets (face, quality, identity, liveness, motion, and so on);
+        # evicting individual buckets could remove identity evidence while
+        # retaining the corresponding face evidence and create false state.
+        entity_ids = {
+            key[0] for key in self._buckets
+            if key[0] is not None
+        }
+        while len(entity_ids) > self.max_entities:
+            oldest_entity = next(
+                (key[0] for key in self._last_touched if key[0] is not None),
+                None,
+            )
+            if oldest_entity is None:
+                break
+            for key in list(self._buckets):
+                if key[0] == oldest_entity:
+                    self._buckets.pop(key, None)
+                    self._last_touched.pop(key, None)
+            entity_ids.discard(oldest_entity)
 
     def clear_entity(self, entity_track_id: Optional[int]) -> None:
         for key in list(self._buckets):

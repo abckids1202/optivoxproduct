@@ -1,4 +1,4 @@
-import { AlertCircle, Bell, ClipboardCheck, Gauge, ShieldCheck, UserCheck, UserPlus, UserRoundX, Users } from "lucide-react";
+import { Activity, AlertCircle, Bell, ClipboardCheck, Gauge, ShieldCheck, UserCheck, UserPlus, UserRoundX, Users } from "lucide-react";
 import EventList from "../components/EventList";
 import LiveFrame from "../components/LiveFrame";
 import PersonCard from "../components/PersonCard";
@@ -7,6 +7,9 @@ import StatCard from "../components/StatCard";
 export default function Overview({ state, connection, onNavigate }) {
   const summary = state.summary;
   const attention = state.events.filter((event) => event.reviewed === false || event.severity === "Critical");
+  const vehicles = state.vehicles?.active_tracks || [];
+  const crowd = state.crowd || {};
+  const demographics = state.demographics || {};
 
   return (
     <div className="page-stack">
@@ -91,6 +94,56 @@ export default function Overview({ state, connection, onNavigate }) {
             </div>
           </div>
           <EventList events={state.events.slice(0, 4)} compact />
+        </section>
+
+        <section className="panel">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Vehicle intelligence</p>
+              <h2>Tracked vehicles</h2>
+            </div>
+          </div>
+          {vehicles.length ? vehicles.slice(0, 6).map((vehicle) => (
+            <div className="system-row" key={vehicle.track_id}>
+              <span>{vehicle.class_name} · #{vehicle.track_id}</span>
+              <strong>{vehicle.speed_kmh == null ? "Speed unavailable" : `${vehicle.speed_kmh} km/h`}</strong>
+            </div>
+          )) : <p className="empty-copy">No vehicle tracks in the latest fresh detection.</p>}
+          <p className="panel-note">Physical speed requires camera calibration. Plate reading is not configured.</p>
+        </section>
+
+        <section className="panel">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Crowd intelligence</p>
+              <h2>Occupancy and movement</h2>
+            </div>
+            <Activity size={19} />
+          </div>
+          <div className="system-grid">
+            <div className="system-row"><span>Tracked people</span><strong>{crowd.people_count ?? state.visiblePeople.length}</strong></div>
+            <div className="system-row"><span>Movement</span><strong>{crowd.average_speed_px_s == null ? "Not measured" : `${crowd.average_speed_px_s} px/s`}</strong></div>
+            <div className="system-row"><span>Growth rate</span><strong>{crowd.growth_per_minute == null ? "Not measured" : `${crowd.growth_per_minute} / min`}</strong></div>
+            <div className="system-row"><span>Capability</span><strong>{crowd.status || "Not reported"}</strong></div>
+          </div>
+          <p className="panel-note">Current density uses tracked occupancy. Perspective-correct physical density is not configured.</p>
+        </section>
+
+        <section className="panel">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Demographic signal</p>
+              <h2>Age bands, aggregate only</h2>
+            </div>
+          </div>
+          <div className="system-grid">
+            <div className="system-row"><span>Capability</span><strong>{demographics.status || "Not reported"}</strong></div>
+            <div className="system-row"><span>Samples</span><strong>{demographics.samples ?? 0}</strong></div>
+            {Object.entries(demographics.age_bands || {}).map(([band, count]) => (
+              <div className="system-row" key={band}><span>{band}</span><strong>{count}</strong></div>
+            ))}
+          </div>
+          <p className="panel-note">Approximate age bands are for aggregate analytics only. They do not affect attendance, access, or security decisions.</p>
         </section>
       </div>
     </div>

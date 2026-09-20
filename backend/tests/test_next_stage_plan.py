@@ -70,9 +70,28 @@ def test_profile_update_and_absence_are_auditable(platform_db):
     )
     assert absence["official"] is True
     assert attendance_service.list_absences(person_id=person_id)[0]["status"] == "excused"
+    assert database.fetch_one(
+        "select count(*) as count from platform_outbox where event_type='attendance.absence_recorded'"
+    )["count"] == 1
     profile = people_service.get_person(person_id)
     assert profile["absence_history"][0]["reason"] == "Medical appointment"
     assert database.fetch_one("select actor_id from platform_audit_log where action='people.update'")["actor_id"] == "admin-test"
+
+
+def test_attendance_and_audit_commit_atomically(platform_db, monkeypatch):
+    person_id = add_person()
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit storage unavailable")
+
+    monkeypatch.setattr("backend.services.audit_service.append_audit_record", fail_audit)
+    with pytest.raises(RuntimeError, match="audit storage unavailable"):
+        attendance_service.clock_in(person_id, actor_id="operator-test")
+    assert database.fetch_one(
+        "select count(*) as count from attendance where person_id=?",
+        [person_id],
+    )["count"] == 0
+    assert database.fetch_one("select count(*) as count from platform_outbox")["count"] == 0
 
 
 def test_schedule_is_available_for_class_operations(platform_db):
@@ -125,6 +144,83 @@ def test_incident_evidence_and_alert_are_linked_to_source_event(platform_db, tmp
     assert detail["alerts"][0]["status"] == "delivered"
     assert detail["evidence_count"] == 1
     assert detail["alert_count"] == 1
+    assert detail["alerts"][0]["delivered_at"] == "2026-09-02T09:00:01"
+
+
+def _create_evidence_incident(tmp_path, monkeypatch):
+    monkeypatch.setattr(incident_service, "SNAPSHOTS_DIR", tmp_path)
+    evidence_path = tmp_path / "incident.jpg"
+    evidence_path.write_bytes(b"trusted-evidence")
+    event_id = database.execute(
+        """insert into events
+           (event_type, severity, details_json, timestamp, entity_id,
+            camera_id, location, snapshot_path, source_frame_id)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ["ZONE_INTRUSION", 2,
+         json.dumps({"security_metadata": {"zone_id": "gate"}}),
+         "2026-09-02T09:00:00", "cam_0:entity:9", "cam_0", "Gate",
+         str(evidence_path), 901],
+    )
+    incident = incident_service.list_incidents()[0]
+    assert incident_service.get_incident(incident["id"])["evidence"][0]["status"] == "available"
+    return incident["id"], event_id, evidence_path
+
+
+def test_incident_detail_revalidates_tampered_evidence_once(platform_db, tmp_path, monkeypatch):
+    incident_id, event_id, evidence_path = _create_evidence_incident(tmp_path, monkeypatch)
+    evidence_path.write_bytes(b"replacement-evidence")
+
+    detail = incident_service.get_incident(incident_id)
+    assert detail["evidence"][0]["status"] == "tampered"
+    assert database.fetch_one(
+        "select status from incident_evidence where incident_id=?", [incident_id]
+    )["status"] == "tampered"
+    assert database.fetch_one(
+        "select count(*) as count from platform_audit_log where action='evidence.integrity_failure' and entity_id=?",
+        [str(detail["evidence"][0]["id"])],
+    )["count"] == 1
+
+    # Re-opening the same incident must not create an unbounded audit storm.
+    incident_service.get_incident(incident_id)
+    assert database.fetch_one(
+        "select count(*) as count from platform_audit_log where action='evidence.integrity_failure' and entity_id=?",
+        [str(detail["evidence"][0]["id"])],
+    )["count"] == 1
+    assert database.fetch_one("select id from events where id=?", [event_id])["id"] == event_id
+
+
+def test_incident_detail_marks_missing_and_unsafe_evidence(platform_db, tmp_path, monkeypatch):
+    incident_id, _, evidence_path = _create_evidence_incident(tmp_path, monkeypatch)
+    evidence_path.unlink()
+    assert incident_service.get_incident(incident_id)["evidence"][0]["status"] == "missing"
+
+    unsafe_path = tmp_path / ".." / ".." / ".." / ".." / "outside-evidence.jpg"
+    database.execute(
+        "update incident_evidence set path=? where incident_id=?",
+        [str(unsafe_path), incident_id],
+    )
+    assert incident_service.get_incident(incident_id)["evidence"][0]["status"] == "invalid_path"
+    assert database.fetch_one(
+        "select count(*) as count from platform_audit_log where action='evidence.integrity_failure'"
+    )["count"] == 1
+
+
+def test_incident_grouping_keeps_same_correlation_id_separate_by_camera(platform_db):
+    shared = "correlation-reused-by-fixture"
+    for camera, entity in (("cam_0", "cam_0:entity:1"), ("cam_1", "cam_1:entity:1")):
+        database.execute(
+            """insert into events
+               (event_type, severity, details_json, timestamp, entity_id,
+                camera_id, location, correlation_id)
+               values (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ["ZONE_INTRUSION", 2, "{}", "2026-09-02T09:00:00", entity,
+             camera, "Gate", shared],
+        )
+
+    incidents = incident_service.list_incidents()
+
+    assert len(incidents) == 2
+    assert {item["cameraId"] for item in incidents} == {"cam_0", "cam_1"}
 
 
 def test_password_sessions_store_only_hashes(platform_db):
